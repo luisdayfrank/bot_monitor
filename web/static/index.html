@@ -1,0 +1,1131 @@
+<!DOCTYPE html>
+<html lang="es" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crypto Monitor V5.1 — Multi-Timeframe Sniper</title>
+    <link rel="icon" href="data:,">
+
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = { darkMode: 'class' }
+    </script>
+
+    <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+
+    <style>
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #1f2937; }
+        ::-webkit-scrollbar-thumb { background: #374151; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #4b5563; }
+
+        .toast-enter { animation: slideInRight 0.3s cubic-bezier(0.4, 0, 0.2, 1) forwards; }
+        .toast-exit { animation: fadeOutRight 0.4s ease-in forwards; }
+
+        @keyframes slideInRight {
+            from { opacity: 0; transform: translateX(100%); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+        @keyframes fadeOutRight {
+            from { opacity: 1; transform: translateX(0); }
+            to { opacity: 0; transform: translateX(100%); }
+        }
+
+        .pulse-dot {
+            box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7);
+            animation: pulse-green 2s infinite;
+        }
+        .pulse-dot-armed {
+            box-shadow: 0 0 0 0 rgba(234, 179, 8, 0.7);
+            animation: pulse-yellow 1.2s infinite;
+        }
+        .pulse-dot-fire {
+            box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
+            animation: pulse-red 0.6s infinite;
+        }
+        .pulse-dot-cooldown {
+            box-shadow: 0 0 0 0 rgba(249, 115, 22, 0.7);
+            animation: pulse-orange 1.5s infinite;
+        }
+        .pulse-dot-circuit {
+            box-shadow: 0 0 0 0 rgba(168, 85, 247, 0.7);
+            animation: pulse-purple 1.0s infinite;
+        }
+
+        @keyframes pulse-green {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7); }
+            70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(34, 197, 94, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+        }
+        @keyframes pulse-yellow {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(234, 179, 8, 0.7); }
+            70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(234, 179, 8, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(234, 179, 8, 0); }
+        }
+        @keyframes pulse-red {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+            50% { transform: scale(1.1); box-shadow: 0 0 0 12px rgba(239, 68, 68, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+        }
+        @keyframes pulse-orange {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(249, 115, 22, 0.7); }
+            70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(249, 115, 22, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(249, 115, 22, 0); }
+        }
+        @keyframes pulse-purple {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(168, 85, 247, 0.7); }
+            70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(168, 85, 247, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(168, 85, 247, 0); }
+        }
+
+        .state-badge {
+            font-size: 9px;
+            font-weight: 800;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+        .state-badge-monitoreo { background: #374151; color: #9ca3af; }
+        .state-badge-armed { background: #78350f; color: #fbbf24; border: 1px solid #fbbf24; }
+        .state-badge-fire { background: #7f1d1d; color: #fca5a5; border: 1px solid #ef4444; animation: shake 0.5s infinite; }
+        .state-badge-cooldown { background: #431407; color: #fdba74; border: 1px solid #f97316; }
+        .state-badge-circuit { background: #581c87; color: #e9d5ff; border: 1px solid #a855f7; }
+
+        @keyframes shake {
+            0%, 100% { transform: translateX(0); }
+            25% { transform: translateX(-1px); }
+            75% { transform: translateX(1px); }
+        }
+
+        .coin-item {
+            transition: all 0.15s ease;
+        }
+        .coin-item:hover {
+            background: rgba(59, 130, 246, 0.08);
+        }
+        .coin-item.active {
+            background: rgba(59, 130, 246, 0.15);
+            border-left: 3px solid #3b82f6;
+        }
+
+        #tvchart { min-height: 400px; position: relative; }
+    </style>
+<base target="_blank">
+</head>
+<body class="bg-gray-900 text-white font-sans h-screen flex overflow-hidden">
+
+    <!-- SIDEBAR -->
+    <aside class="w-80 bg-gray-800 border-r border-gray-700 flex flex-col h-full z-10 shrink-0">
+        <div class="p-4 border-b border-gray-700 flex justify-between items-center bg-gray-900">
+            <h1 class="text-lg font-bold flex items-center gap-2">
+                <span id="status-dot" class="w-3 h-3 rounded-full bg-yellow-500"></span>
+                Sniper V5.1
+            </h1>
+            <div class="flex flex-col items-end gap-0.5">
+                <span id="ws-status" class="text-xs text-yellow-500 font-mono">Conectando...</span>
+                <span id="conn-quality" class="text-[9px] text-gray-600 font-mono">--ms</span>
+            </div>
+        </div>
+
+        <div class="p-3 text-xs text-gray-400 font-semibold uppercase tracking-wider bg-gray-800/50 flex justify-between">
+            <span>Activos</span>
+            <span id="coin-count" class="text-gray-500">0</span>
+        </div>
+
+        <div id="coin-list" class="flex-1 overflow-y-auto p-2 space-y-1">
+            <div class="text-center text-gray-500 text-sm mt-10 flex flex-col items-center gap-2">
+                <svg class="animate-spin h-5 w-5 text-blue-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                Esperando datos de Binance...
+            </div>
+        </div>
+
+        <div class="p-3 border-t border-gray-700 text-xs text-gray-500 text-center">
+            <span id="conn-attempts" class="hidden">Reconexión en <span id="reconnect-timer">3</span>s...</span>
+            <div id="last-update" class="text-gray-600 mt-1">--:--:--</div>
+        </div>
+    </aside>
+
+    <!-- MAIN -->
+    <main class="flex-1 flex flex-col h-full relative min-w-0">
+
+        <!-- HEADER -->
+        <header class="h-24 bg-gray-900 border-b border-gray-700 p-4 flex items-center justify-between shrink-0 z-20">
+            <div class="flex items-end gap-4 min-w-0">
+                <h2 id="active-coin-title" class="text-3xl font-bold text-blue-400 truncate">SELECCIONA MONEDA</h2>
+                <span id="active-coin-price" class="text-2xl font-mono text-gray-300 whitespace-nowrap">--.----</span>
+                <span id="active-coin-state" class="text-xs font-bold px-2 py-1 rounded bg-gray-700 text-gray-400">MONITOREO</span>
+                <span id="active-coin-dir" class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-gray-800 text-gray-500 hidden">DIR</span>
+                <span id="active-coin-cb" class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-purple-900 text-purple-400 hidden">🔒CB</span>
+            </div>
+
+            <div class="flex items-center gap-4 shrink-0">
+                <div class="flex gap-3 bg-gray-800 p-2 rounded-lg border border-gray-700">
+                    <div class="text-center px-2">
+                        <div class="text-[10px] text-gray-400 uppercase tracking-wider">RSI 1M</div>
+                        <div id="ind-rsi-1m" class="font-bold font-mono text-lg">--.-</div>
+                    </div>
+                    <div class="text-center px-2 border-l border-gray-700">
+                        <div class="text-[10px] text-gray-400 uppercase tracking-wider">RSI 15M</div>
+                        <div id="ind-rsi-15m" class="font-bold font-mono text-lg">--.-</div>
+                    </div>
+                    <div class="text-center px-2 border-l border-gray-700">
+                        <div class="text-[10px] text-gray-400 uppercase tracking-wider">ADX</div>
+                        <div id="ind-adx" class="font-bold font-mono text-lg">--.-</div>
+                    </div>
+                    <div class="text-center px-2 border-l border-gray-700">
+                        <div class="text-[10px] text-gray-400 uppercase tracking-wider">Mecha</div>
+                        <div id="ind-wick" class="font-bold font-mono text-lg">--.--</div>
+                    </div>
+                    <div class="text-center px-2 border-l border-gray-700">
+                        <div class="text-[10px] text-gray-400 uppercase tracking-wider">EMA 300</div>
+                        <div id="ind-ema300" class="font-bold font-mono text-sm">--.----</div>
+                    </div>
+                    <div class="text-center px-2 border-l border-gray-700">
+                        <div class="text-[10px] text-gray-400 uppercase tracking-wider">Dist EMA</div>
+                        <div id="ind-ema-dist" class="font-bold font-mono text-sm">--.--%</div>
+                    </div>
+                    <div class="text-center px-2 border-l border-gray-700">
+                        <div class="text-[10px] text-gray-400 uppercase tracking-wider">ATR 1m</div>
+                        <div id="ind-atr-1m" class="font-bold font-mono text-sm">--.--</div>
+                    </div>
+                    <div class="text-center px-2 border-l border-gray-700">
+                        <div class="text-[10px] text-gray-400 uppercase tracking-wider">4H Trend</div>
+                        <div id="ind-macro" class="font-bold text-sm mt-1 px-2 py-0.5 rounded bg-gray-700 text-gray-400 border border-transparent">ESPERANDO</div>
+                    </div>
+                </div>
+
+                <div class="relative">
+                    <button onclick="toggleAlertMenu()" class="relative p-2 bg-gray-800 hover:bg-gray-700 rounded-lg border border-gray-700 transition">
+                        <svg class="w-6 h-6 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"></path>
+                        </svg>
+                        <span id="alert-badge" class="hidden absolute -top-1 -right-1 bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full border-2 border-gray-900">0</span>
+                    </button>
+
+                    <div id="alert-dropdown" class="hidden absolute right-0 mt-2 w-96 bg-gray-800 rounded-xl border border-gray-700 shadow-2xl flex flex-col z-50">
+                        <div class="p-3 border-b border-gray-700 font-semibold text-sm flex justify-between items-center">
+                            <span>Registro de Disparos</span>
+                            <button onclick="clearAlerts()" class="text-xs text-gray-400 hover:text-red-400 transition">Limpiar</button>
+                        </div>
+                        <div id="alerts-log" class="p-3 space-y-2 overflow-y-auto max-h-96">
+                            <div class="text-xs text-gray-500 italic text-center py-4">Sin alertas recientes</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Selector de Timeframe -->
+        <div class="flex gap-2 p-2 bg-gray-800 border-b border-gray-700">
+            <button onclick="switchTimeframe('1m')" id="btn-1m" class="px-3 py-1 text-xs font-bold rounded bg-blue-600 text-white">1M</button>
+            <button onclick="switchTimeframe('15m')" id="btn-15m" class="px-3 py-1 text-xs font-bold rounded bg-gray-700 text-gray-400 hover:bg-gray-600">15M</button>
+            <button onclick="switchTimeframe('4h')" id="btn-4h" class="px-3 py-1 text-xs font-bold rounded bg-gray-700 text-gray-400 hover:bg-gray-600">4H</button>
+            <div class="flex-1"></div>
+            <span id="chart-info" class="text-[10px] text-gray-500 font-mono self-center mr-2">-- velas cargadas</span>
+        </div>
+
+        <div id="tvchart" class="flex-1 w-full bg-gray-900 relative min-h-0"></div>
+
+        <div id="toast-container" class="absolute top-28 right-6 z-50 flex flex-col gap-3 pointer-events-none"></div>
+
+    </main>
+
+    <script>
+        // ============================================
+        // ESTADO GLOBAL V5.1
+        // ============================================
+        let activeSymbol = null;
+        let activeTimeframe = '1m';
+        let marketData = {};
+        let ws = null;
+        let reconnectTimer = null;
+        let reconnectDelay = 3000;
+        let lastPing = Date.now();
+        let connectionQuality = 'unknown';
+        let isFirstConnect = true;
+
+        const MAX_ALERTS = 50;
+        const ALERTS_KEY = 'crypto_monitor_v5_alerts';
+        let unreadAlerts = 0;
+
+        // ============================================
+        // GRÁFICO
+        // ============================================
+        const chartContainer = document.getElementById('tvchart');
+
+        const chartOptions = {
+            layout: { textColor: '#d1d5db', background: { type: 'solid', color: '#111827' } },
+            grid: { vertLines: { color: '#374151' }, horzLines: { color: '#374151' } },
+            crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+            timeScale: {
+                timeVisible: true,
+                secondsVisible: false,
+                borderColor: '#4b5563',
+                tickMarkFormatter: (time, tickMarkType, locale) => {
+                    const date = new Date(time * 1000);
+                    return date.toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' });
+                }
+            },
+            rightPriceScale: { borderColor: '#4b5563' }
+        };
+
+        const chart = LightweightCharts.createChart(chartContainer, chartOptions);
+
+        const candleSeries = chart.addCandlestickSeries({
+            upColor: '#22c55e', downColor: '#ef4444',
+            borderVisible: false, wickUpColor: '#22c55e', wickDownColor: '#ef4444'
+        });
+
+        const emaSeries = chart.addLineSeries({
+            color: '#3b82f6', lineWidth: 2, title: 'EMA 300', priceLineVisible: false
+        });
+
+        const ema200Series = chart.addLineSeries({
+            color: '#a855f7', lineWidth: 1, title: 'EMA 200 15m', priceLineVisible: false, visible: false
+        });
+
+        window.addEventListener('resize', () => {
+            if (chartContainer.clientWidth > 0 && chartContainer.clientHeight > 0) {
+                chart.applyOptions({
+                    width: chartContainer.clientWidth,
+                    height: chartContainer.clientHeight
+                });
+            }
+        });
+
+        function calcularEMA300(velas) {
+            const period = 300;
+            const k = 2 / (period + 1);
+            if (!velas || velas.length < period) return [];
+
+            let ema = 0;
+            for (let i = 0; i < period; i++) {
+                ema += velas[i].close;
+            }
+            ema /= period;
+
+            const result = [];
+            result.push({ time: velas[period - 1].time, value: ema });
+
+            for (let i = period; i < velas.length; i++) {
+                ema = velas[i].close * k + ema * (1 - k);
+                result.push({ time: velas[i].time, value: ema });
+            }
+            return result;
+        }
+
+        // ============================================
+        // SISTEMA DE ALERTAS
+        // ============================================
+        function toggleAlertMenu() {
+            const dropdown = document.getElementById('alert-dropdown');
+            dropdown.classList.toggle('hidden');
+            if (!dropdown.classList.contains('hidden')) {
+                unreadAlerts = 0;
+                updateBadge();
+            }
+        }
+
+        document.addEventListener('click', (event) => {
+            const dropdown = document.getElementById('alert-dropdown');
+            const button = dropdown.previousElementSibling;
+            if (!dropdown.contains(event.target) && !button.contains(event.target)) {
+                dropdown.classList.add('hidden');
+            }
+        });
+
+        function updateBadge() {
+            const badge = document.getElementById('alert-badge');
+            if (unreadAlerts > 0) {
+                badge.innerText = unreadAlerts > 99 ? '99+' : unreadAlerts;
+                badge.classList.remove('hidden');
+            } else {
+                badge.classList.add('hidden');
+            }
+        }
+
+        function showToast(alertData) {
+            const container = document.getElementById('toast-container');
+            const isFire = alertData.tipo === 'FIRE';
+            const isRechazado = alertData.tipo === 'RECHAZADO';
+            const isCB = alertData.tipo === 'CIRCUIT_BREAKER';
+
+            let bgColor, borderColor, textColor;
+            if (isFire) {
+                bgColor = 'bg-red-900/90'; borderColor = 'border-red-500'; textColor = 'text-red-400';
+            } else if (isRechazado) {
+                bgColor = 'bg-orange-900/90'; borderColor = 'border-orange-500'; textColor = 'text-orange-400';
+            } else if (isCB) {
+                bgColor = 'bg-purple-900/90'; borderColor = 'border-purple-500'; textColor = 'text-purple-400';
+            } else {
+                bgColor = 'bg-yellow-900/90'; borderColor = 'border-yellow-500'; textColor = 'text-yellow-400';
+            }
+
+            const toast = document.createElement('div');
+            toast.className = `pointer-events-auto w-80 p-4 rounded-xl border ${borderColor} ${bgColor} backdrop-blur shadow-2xl toast-enter flex flex-col gap-1 cursor-pointer`;
+
+            toast.onclick = () => {
+                document.getElementById('alert-dropdown').classList.remove('hidden');
+                unreadAlerts = 0;
+                updateBadge();
+                toast.remove();
+            };
+
+            let msg;
+            if (isFire) {
+                msg = `🔥 DISPARO <b>${alertData.direction}</b> | Score: ${alertData.score}`;
+                if (alertData.params && alertData.params.auto_compressed) {
+                    msg += ' <span class="text-yellow-400">[AUTO-COMPRIMIDO]</span>';
+                }
+            } else if (isRechazado) {
+                msg = `❌ RECHAZADO <b>${alertData.direction}</b> | ${alertData.rechazos[0]}`;
+            } else if (isCB) {
+                msg = `🔒 CIRCUIT BREAKER | ${alertData.rechazos[0]}`;
+            } else {
+                msg = alertData.tipo;
+            }
+
+            toast.innerHTML = `
+                <div class="flex justify-between items-start">
+                    <span class="font-bold text-lg ${textColor}">${alertData.symbol}</span>
+                    <span class="text-xs text-gray-400 mt-1">${new Date().toLocaleTimeString()}</span>
+                </div>
+                <div class="text-white text-sm">${msg}</div>
+                ${alertData.params ? `
+                <div class="mt-1 text-[10px] text-gray-500 font-mono">
+                    Grid: ${alertData.params.grid_count} líneas | ${alertData.params.direction} | L:${alertData.params.lower_limit} U:${alertData.params.upper_limit}
+                </div>` : ''}
+            `;
+
+            container.appendChild(toast);
+            setTimeout(() => {
+                if (document.body.contains(toast)) {
+                    toast.classList.remove('toast-enter');
+                    toast.classList.add('toast-exit');
+                    setTimeout(() => toast.remove(), 400);
+                }
+            }, 8000);
+        }
+
+        function loadAlerts() {
+            try {
+                const saved = localStorage.getItem(ALERTS_KEY);
+                return saved ? JSON.parse(saved) : [];
+            } catch { return []; }
+        }
+
+        function saveAlerts(alerts) {
+            try { localStorage.setItem(ALERTS_KEY, JSON.stringify(alerts.slice(0, MAX_ALERTS))); } catch(e) {}
+        }
+
+        function renderAlertsFromStorage() {
+            const alerts = loadAlerts();
+            const container = document.getElementById('alerts-log');
+            if (alerts.length === 0) {
+                container.innerHTML = '<div class="text-xs text-gray-500 italic text-center py-4">Sin alertas recientes</div>';
+                return;
+            }
+            container.innerHTML = '';
+            alerts.forEach(a => appendAlertHTML(a));
+        }
+
+        function clearAlerts() {
+            localStorage.removeItem(ALERTS_KEY);
+            document.getElementById('alerts-log').innerHTML = '<div class="text-xs text-gray-500 italic text-center py-4">Sin alertas recientes</div>';
+            unreadAlerts = 0;
+            updateBadge();
+            document.getElementById('alert-dropdown').classList.add('hidden');
+        }
+
+        function appendAlertHTML(alertData) {
+            const container = document.getElementById('alerts-log');
+            if (container.innerHTML.includes('Sin alertas recientes')) container.innerHTML = '';
+
+            const isFire = alertData.tipo === 'FIRE';
+            const isRechazado = alertData.tipo === 'RECHAZADO';
+            const isCB = alertData.tipo === 'CIRCUIT_BREAKER';
+
+            let color, borderColor, bgColor;
+            if (isFire) { color = 'text-red-400'; borderColor = 'border-red-800'; bgColor = 'bg-red-900/20'; }
+            else if (isRechazado) { color = 'text-orange-400'; borderColor = 'border-orange-800'; bgColor = 'bg-orange-900/20'; }
+            else if (isCB) { color = 'text-purple-400'; borderColor = 'border-purple-800'; bgColor = 'bg-purple-900/20'; }
+            else { color = 'text-yellow-400'; borderColor = 'border-yellow-800'; bgColor = 'bg-yellow-900/20'; }
+
+            let msg;
+            if (isFire) {
+                msg = `🔥 DISPARO <span class="font-bold">${alertData.direction}</span> (Score: ${alertData.score})`;
+                if (alertData.params && alertData.params.auto_compressed) {
+                    msg += ' <span class="text-yellow-400">[AUTO-COMPRIMIDO]</span>';
+                }
+            } else if (isRechazado) {
+                msg = `❌ RECHAZADO <span class="font-bold">${alertData.direction}</span> | ${alertData.rechazos[0]}`;
+            } else if (isCB) {
+                msg = `🔒 CIRCUIT BREAKER | ${alertData.rechazos[0]}`;
+            } else {
+                msg = `Estado: ${alertData.tipo}`;
+            }
+
+            const div = document.createElement('div');
+            div.className = `text-sm p-2 rounded border ${borderColor} ${bgColor} shrink-0`;
+            div.innerHTML = `
+                <div class="flex justify-between items-center mb-1">
+                    <span class="font-bold ${color}">${alertData.symbol}</span>
+                    <span class="text-[10px] text-gray-500 font-mono">${alertData.time}</span>
+                </div>
+                <div class="text-gray-300 text-xs">${msg}</div>
+                ${alertData.params ? `
+                <div class="mt-1 text-[10px] text-gray-500 font-mono">
+                    Grid: ${alertData.params.grid_count} líneas | ${alertData.params.direction} | L:${alertData.params.lower_limit} U:${alertData.params.upper_limit}
+                </div>` : ''}
+            `;
+
+            container.insertBefore(div, container.firstChild);
+            while (container.children.length > MAX_ALERTS) container.removeChild(container.lastChild);
+        }
+
+        function logAlert(data) {
+            const alertObj = {
+                symbol: data.symbol,
+                tipo: data.tipo,
+                direction: data.direction,
+                score: data.score,
+                rechazos: data.rechazos || [],
+                params: data.params,
+                time: new Date().toLocaleTimeString()
+            };
+
+            const alerts = loadAlerts();
+            alerts.unshift(alertObj);
+            saveAlerts(alerts);
+            appendAlertHTML(alertObj);
+            showToast(alertObj);
+
+            const dropdown = document.getElementById('alert-dropdown');
+            if (dropdown.classList.contains('hidden')) {
+                unreadAlerts++;
+                updateBadge();
+            }
+        }
+
+        // ============================================
+        // CARGAR SNAPSHOT REST
+        // ============================================
+        async function loadSnapshot() {
+            try {
+                console.log('[SNAPSHOT] Cargando estado completo vía REST...');
+                const res = await fetch('/api/snapshot');
+                const data = await res.json();
+
+                if (!data.snapshot) {
+                    console.warn('[SNAPSHOT] Respuesta vacía del servidor');
+                    return;
+                }
+
+                for (const [sym, symData] of Object.entries(data.snapshot)) {
+                    if (!marketData[sym]) marketData[sym] = {};
+
+                    if (symData.precio != null) marketData[sym].price = symData.precio;
+
+                    if (symData.estado) {
+                        marketData[sym].estado = symData.estado.estado;
+                        marketData[sym].direccion_filtro = symData.estado.direccion_filtro;
+                        marketData[sym].score = symData.estado.score;
+                        marketData[sym].filtro_aprobado = symData.estado.filtro_aprobado;
+                        marketData[sym].velas_confirmacion = symData.estado.velas_confirmacion;
+                        // FASE 4: Circuit breaker
+                        marketData[sym].circuit_breaker = symData.estado.circuit_breaker_activo;
+                    }
+
+                    if (symData.indicadores_1m) {
+                        const p = symData.indicadores_1m;
+                        Object.assign(marketData[sym], {
+                            rsi_7: p.rsi_7, ema_300: p.ema_300,
+                            wick_upper: p.wick_upper_pct, wick_lower: p.wick_lower_pct,
+                            body_dir: p.body_direction, close: p.close, high: p.high, low: p.low,
+                            atr_1m: p.atr_1m, mecha_valida_short: p.mecha_valida_short,
+                            mecha_valida_long: p.mecha_valida_long,
+                            ema300_distancia_pct: p.ema300_distancia_pct,
+                            volume: p.volume, volume_sma20: p.volume_sma20,
+                        });
+                    }
+
+                    if (symData.indicadores_15m) {
+                        const p = symData.indicadores_15m;
+                        Object.assign(marketData[sym], {
+                            rsi_15m: p.rsi, adx: p.adx, macd: p.macd_hist, atr: p.atr,
+                            ema200_15m: p.ema200_15m, volume: p.volume,
+                            volume_sma20: p.volume_sma20,
+                            recent_high: p.recent_high, recent_low: p.recent_low,
+                        });
+                    }
+
+                    if (symData.indicadores_4h) {
+                        marketData[sym].ema200_4h = symData.indicadores_4h.ema200_4h;
+                        marketData[sym].close_4h = symData.indicadores_4h.close;
+                    }
+
+                    if (!document.getElementById(`coin-${sym}`)) {
+                        createCoinListItem(sym);
+                    }
+                    updateCoinListItem(sym);
+                }
+
+                if (!activeSymbol && Object.keys(marketData).length > 0) {
+                    selectCoin(Object.keys(marketData)[0]);
+                } else if (activeSymbol && marketData[activeSymbol]) {
+                    updateIndicatorsUI(marketData[activeSymbol]);
+                }
+
+                updateCoinCount();
+                console.log(`[SNAPSHOT] Estado reconstruido para ${Object.keys(data.snapshot).length} símbolos`);
+            } catch (e) {
+                console.error('[SNAPSHOT] Error cargando snapshot:', e);
+            }
+        }
+
+        // ============================================
+        // CARGAR VELAS
+        // ============================================
+        async function loadChartData(symbol, tf = '1m') {
+            try {
+                const res = await fetch(`/api/velas/${symbol}?tf=${tf}`);
+                const data = await res.json();
+
+                if (data.velas && data.velas.length > 0) {
+                    let chartData = data.velas
+                        .filter(v => v.time != null && v.open != null && v.high != null && v.low != null && v.close != null)
+                        .filter(v => !isNaN(v.time) && !isNaN(v.open) && !isNaN(v.high) && !isNaN(v.low) && !isNaN(v.close))
+                        .map(v => ({
+                            time: Math.floor(v.time),
+                            open: parseFloat(v.open),
+                            high: parseFloat(v.high),
+                            low: parseFloat(v.low),
+                            close: parseFloat(v.close)
+                        }));
+                    chartData.sort((a, b) => a.time - b.time);
+                    if (chartData.length > 2000) {
+                        chartData = chartData.slice(-2000);
+                    }
+                    if (chartData.length > 0) {
+                        candleSeries.setData(chartData);
+                    }
+
+                    if (tf === '1m' && chartData.length >= 300) {
+                        const emaData = calcularEMA300(chartData);
+                        if (emaData.length > 0) {
+                            emaSeries.setData(emaData);
+                            emaSeries.applyOptions({ visible: true });
+                        }
+                    } else {
+                        emaSeries.setData([]);
+                        emaSeries.applyOptions({ visible: false });
+                    }
+
+                    if (tf === '15m' && marketData[symbol] && marketData[symbol].ema200_15m != null && !isNaN(marketData[symbol].ema200_15m)) {
+                        const emaVal = parseFloat(marketData[symbol].ema200_15m);
+                        const emaData = chartData.map(v => ({
+                            time: v.time, value: emaVal
+                        })).filter(v => v.time != null && !isNaN(v.value));
+                        if (emaData.length > 0) {
+                            ema200Series.setData(emaData);
+                            ema200Series.applyOptions({ visible: true });
+                        }
+                    } else {
+                        ema200Series.setData([]);
+                        ema200Series.applyOptions({ visible: false });
+                    }
+
+                    chart.timeScale().fitContent();
+                    document.getElementById('chart-info').innerText = `${chartData.length} velas | tf=${tf}`;
+                } else {
+                    document.getElementById('chart-info').innerText = `0 velas | tf=${tf}`;
+                }
+            } catch (e) { console.error("[CHART] Error cargando velas:", e); }
+        }
+
+        function switchTimeframe(tf) {
+            activeTimeframe = tf;
+            ['1m','15m','4h'].forEach(t => {
+                const btn = document.getElementById(`btn-${t}`);
+                if (t === tf) {
+                    btn.className = 'px-3 py-1 text-xs font-bold rounded bg-blue-600 text-white';
+                } else {
+                    btn.className = 'px-3 py-1 text-xs font-bold rounded bg-gray-700 text-gray-400 hover:bg-gray-600';
+                }
+            });
+            if (activeSymbol) loadChartData(activeSymbol, tf);
+        }
+
+        function selectCoin(symbol) {
+            if (!symbol) return;
+            activeSymbol = symbol;
+            document.getElementById('active-coin-title').innerText = symbol;
+
+            document.querySelectorAll('.coin-item').forEach(el => {
+                el.classList.remove('active');
+            });
+            const activeEl = document.getElementById(`coin-${symbol}`);
+            if (activeEl) {
+                activeEl.classList.add('active');
+            }
+
+            if (marketData[symbol]) updateIndicatorsUI(marketData[symbol]);
+            loadChartData(symbol, activeTimeframe);
+        }
+
+        // ============================================
+        // COLORES DE ESTADO
+        // ============================================
+        function getStateColor(estado, circuitBreaker = false) {
+            if (circuitBreaker) return 'bg-purple-600 text-white';
+            switch(estado) {
+                case 'FIRE': return 'bg-red-600 text-white';
+                case 'ARMED': return 'bg-yellow-600 text-black';
+                case 'COOLDOWN': return 'bg-orange-700 text-white';
+                case 'MONITOREO': return 'bg-gray-700 text-gray-400';
+                default: return 'bg-gray-700 text-gray-400';
+            }
+        }
+
+        function getStateDot(estado, circuitBreaker = false) {
+            if (circuitBreaker) return 'bg-purple-500 pulse-dot-circuit';
+            switch(estado) {
+                case 'FIRE': return 'bg-red-500 pulse-dot-fire';
+                case 'ARMED': return 'bg-yellow-500 pulse-dot-armed';
+                case 'COOLDOWN': return 'bg-orange-500 pulse-dot-cooldown';
+                case 'MONITOREO': return 'bg-gray-500';
+                default: return 'bg-gray-500';
+            }
+        }
+
+        function getStateBadgeClass(estado, circuitBreaker = false) {
+            if (circuitBreaker) return 'state-badge-circuit';
+            switch(estado) {
+                case 'FIRE': return 'state-badge-fire';
+                case 'ARMED': return 'state-badge-armed';
+                case 'COOLDOWN': return 'state-badge-cooldown';
+                case 'MONITOREO': return 'state-badge-monitoreo';
+                default: return 'state-badge-monitoreo';
+            }
+        }
+
+        // ============================================
+        // ACTUALIZAR UI DE INDICADORES
+        // ============================================
+        function updateIndicatorsUI(data) {
+            if (!data) {
+                console.warn('[UI] updateIndicatorsUI: data es null');
+                return;
+            }
+
+            if (data.price != null && !isNaN(data.price)) {
+                const el = document.getElementById('active-coin-price');
+                if (el) el.innerText = `$${parseFloat(data.price).toFixed(4)}`;
+            }
+
+            const rsi1mEl = document.getElementById('ind-rsi-1m');
+            if (rsi1mEl && data.rsi_7 != null && !isNaN(data.rsi_7)) {
+                const rsi = parseFloat(data.rsi_7);
+                rsi1mEl.innerText = rsi.toFixed(1);
+                if (rsi > 75) rsi1mEl.className = 'font-bold font-mono text-lg text-red-400';
+                else if (rsi < 25) rsi1mEl.className = 'font-bold font-mono text-lg text-green-400';
+                else rsi1mEl.className = 'font-bold font-mono text-lg text-gray-300';
+            }
+
+            if (data.rsi_15m != null && !isNaN(data.rsi_15m)) {
+                const el = document.getElementById('ind-rsi-15m');
+                if (el) el.innerText = parseFloat(data.rsi_15m).toFixed(1);
+            }
+
+            if (data.adx != null && !isNaN(data.adx)) {
+                const el = document.getElementById('ind-adx');
+                if (el) el.innerText = parseFloat(data.adx).toFixed(1);
+            }
+
+            if (data.wick_upper != null && !isNaN(data.wick_upper)) {
+                const el = document.getElementById('ind-wick');
+                if (el) el.innerText = parseFloat(data.wick_upper).toFixed(2) + '%';
+            }
+
+            if (data.ema_300 != null && !isNaN(data.ema_300)) {
+                const el = document.getElementById('ind-ema300');
+                if (el) el.innerText = parseFloat(data.ema_300).toFixed(4);
+            }
+
+            if (data.ema300_distancia_pct != null && !isNaN(data.ema300_distancia_pct)) {
+                const dist = parseFloat(data.ema300_distancia_pct);
+                const el = document.getElementById('ind-ema-dist');
+                if (el) {
+                    el.innerText = (dist > 0 ? '+' : '') + dist.toFixed(2) + '%';
+                    if (dist > 0.5) el.className = 'font-bold font-mono text-sm text-red-400';
+                    else if (dist < -0.5) el.className = 'font-bold font-mono text-sm text-green-400';
+                    else el.className = 'font-bold font-mono text-sm text-gray-300';
+                }
+            }
+
+            if (data.atr_1m != null && !isNaN(data.atr_1m)) {
+                const el = document.getElementById('ind-atr-1m');
+                if (el) el.innerText = parseFloat(data.atr_1m).toFixed(4);
+            }
+
+            const estadoEl = document.getElementById('active-coin-state');
+            if (estadoEl && data.estado) {
+                estadoEl.innerText = data.estado;
+                estadoEl.className = `text-xs font-bold px-2 py-1 rounded ${getStateColor(data.estado, data.circuit_breaker)}`;
+            }
+
+            const dirEl = document.getElementById('active-coin-dir');
+            if (dirEl) {
+                if (data.direccion_filtro) {
+                    dirEl.innerText = data.direccion_filtro;
+                    dirEl.className = `text-[10px] font-bold px-1.5 py-0.5 rounded ${data.direccion_filtro === 'LONG' ? 'bg-green-900 text-green-400' : 'bg-red-900 text-red-400'}`;
+                    dirEl.classList.remove('hidden');
+                } else {
+                    dirEl.classList.add('hidden');
+                }
+            }
+
+            // FASE 4: Circuit breaker badge
+            const cbEl = document.getElementById('active-coin-cb');
+            if (cbEl) {
+                if (data.circuit_breaker) {
+                    cbEl.classList.remove('hidden');
+                } else {
+                    cbEl.classList.add('hidden');
+                }
+            }
+
+            const macroEl = document.getElementById('ind-macro');
+            const price = data.price, ema4h = data.ema200_4h;
+            if (macroEl && ema4h != null && price != null && !isNaN(ema4h) && !isNaN(price) && ema4h > 0 && price > 0) {
+                const diff = ((price - ema4h) / ema4h) * 100;
+                if (diff > 2) {
+                    macroEl.innerText = 'LONG';
+                    macroEl.className = 'font-bold text-sm mt-1 px-2 py-0.5 rounded bg-green-900/50 text-green-400 border border-green-700';
+                } else if (diff < -2) {
+                    macroEl.innerText = 'SHORT';
+                    macroEl.className = 'font-bold text-sm mt-1 px-2 py-0.5 rounded bg-red-900/50 text-red-400 border border-red-700';
+                } else {
+                    macroEl.innerText = 'NEUTRAL';
+                    macroEl.className = 'font-bold text-sm mt-1 px-2 py-0.5 rounded bg-gray-700 text-gray-400 border border-gray-600';
+                }
+            } else if (macroEl) {
+                macroEl.innerText = 'SIN 4H';
+                macroEl.className = 'font-bold text-sm mt-1 px-2 py-0.5 rounded bg-gray-700 text-gray-500 border border-transparent';
+            }
+        }
+
+        function updateConnectionQuality() {
+            const now = Date.now();
+            const latency = now - lastPing;
+            const el = document.getElementById('conn-quality');
+            if (!el) return;
+            if (latency < 1000) {
+                el.innerText = `${latency}ms`;
+                el.className = 'text-[9px] text-green-500 font-mono';
+            } else if (latency < 5000) {
+                el.innerText = `${latency}ms`;
+                el.className = 'text-[9px] text-yellow-500 font-mono';
+            } else {
+                el.innerText = `${latency}ms`;
+                el.className = 'text-[9px] text-red-500 font-mono';
+            }
+        }
+
+        setInterval(updateConnectionQuality, 5000);
+
+        // ============================================
+        // WEBSOCKET
+        // ============================================
+        function setStatus(connected, msg) {
+            const dot = document.getElementById('status-dot');
+            const badge = document.getElementById('ws-status');
+            const attempts = document.getElementById('conn-attempts');
+            if (connected) {
+                dot.className = 'w-3 h-3 rounded-full bg-green-500 pulse-dot';
+                badge.innerText = 'Online';
+                badge.className = 'text-xs text-green-400 font-mono';
+                attempts.classList.add('hidden');
+                reconnectDelay = 3000;
+            } else {
+                dot.className = 'w-3 h-3 rounded-full bg-red-500';
+                badge.innerText = msg || 'Desconectado';
+                badge.className = 'text-xs text-red-500 font-mono animate-pulse';
+            }
+        }
+
+        function startReconnectCountdown() {
+            const attempts = document.getElementById('conn-attempts');
+            const timer = document.getElementById('reconnect-timer');
+            attempts.classList.remove('hidden');
+            let seconds = Math.ceil(reconnectDelay / 1000);
+            timer.innerText = seconds;
+            const interval = setInterval(() => {
+                seconds--;
+                timer.innerText = seconds;
+                if (seconds <= 0) clearInterval(interval);
+            }, 1000);
+        }
+
+        async function fetchEstadosIniciales() {
+            try {
+                const res = await fetch('/api/estados');
+                const data = await res.json();
+                if (data.estados) {
+                    data.estados.forEach(st => {
+                        if (!marketData[st.symbol]) marketData[st.symbol] = {};
+                        marketData[st.symbol].estado = st.estado;
+                        marketData[st.symbol].direccion_filtro = st.direccion_filtro;
+                        marketData[st.symbol].score = st.ultimo_score;
+                        marketData[st.symbol].circuit_breaker = st.circuit_breaker_activo;
+                        updateCoinListItem(st.symbol);
+                    });
+                }
+            } catch (e) { console.warn("No se pudieron cargar estados iniciales:", e); }
+        }
+
+        function connectWebSocket() {
+            if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
+                console.log('[WS] Ya conectado o conectando, skip');
+                return;
+            }
+            console.log(`[WS] Intentando conectar a ws://${window.location.host}/ws`);
+            try {
+                ws = new WebSocket(`ws://${window.location.host}/ws`);
+                ws.onopen = () => {
+                    console.log('[WS] Conectado exitosamente');
+                    setStatus(true);
+                    lastPing = Date.now();
+                    reconnectDelay = 3000;
+
+                    if (isFirstConnect) {
+                        isFirstConnect = false;
+                        document.getElementById('coin-list').innerHTML = '';
+                        marketData = {};
+                    }
+                    loadSnapshot();
+                };
+                ws.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        handleMessage(data);
+                    } catch (e) {
+                        console.error('[WS] Error parseando mensaje:', e, 'Raw:', event.data.substring(0, 200));
+                    }
+                };
+                ws.onclose = (event) => {
+                    console.warn(`[WS] Cerrado. Código: ${event.code}, Razón: ${event.reason || 'N/A'}`);
+                    setStatus(false, 'Desconectado');
+                    startReconnectCountdown();
+                    reconnectDelay = Math.min(reconnectDelay * 1.5, 30000);
+                    reconnectTimer = setTimeout(connectWebSocket, reconnectDelay);
+                };
+                ws.onerror = (err) => {
+                    console.error('[WS] Error:', err);
+                    setStatus(false, 'Error WS');
+                };
+            } catch (e) {
+                console.error('[WS] Error creando conexión:', e);
+                setStatus(false, 'Error de Red');
+                startReconnectCountdown();
+                reconnectTimer = setTimeout(connectWebSocket, reconnectDelay);
+            }
+        }
+
+        setInterval(() => {
+            const now = Date.now();
+            const timeSinceLastPing = now - lastPing;
+
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ action: "ping" }));
+                if (timeSinceLastPing > 45000) {
+                    console.warn(`[WS] Zombie connection detectada (${timeSinceLastPing}ms sin pong). Forzando reconexión...`);
+                    ws.close();
+                    ws = null;
+                    setTimeout(connectWebSocket, 1000);
+                }
+            } else if (!ws || ws.readyState === WebSocket.CLOSED) {
+                console.log('[WS] No conectado, intentando reconexión...');
+                connectWebSocket();
+            }
+        }, 20000);
+
+        // ============================================
+        // MANEJADOR DE MENSAJES WS — FASE 4: Snapshot consolidado
+        // ============================================
+        function handleMessage(data) {
+            try {
+                if (!data) {
+                    console.warn('[WS] Mensaje vacío recibido');
+                    return;
+                }
+
+                if (data.msg_type === 'pong') {
+                    lastPing = Date.now();
+                    console.log('[WS] Pong recibido');
+                    return;
+                }
+
+                if (!data.symbol) {
+                    console.warn('[WS] Mensaje sin symbol:', data.msg_type);
+                    return;
+                }
+
+                const sym = data.symbol;
+
+                if (!marketData[sym]) {
+                    marketData[sym] = {};
+                    createCoinListItem(sym);
+                    if (!activeSymbol) selectCoin(sym);
+                }
+
+                // FASE 4: Snapshot consolidado (único mensaje por símbolo)
+                if (data.msg_type === 'snapshot' && data.payload) {
+                    const p = data.payload;
+                    if (p.precio != null) marketData[sym].price = p.precio;
+
+                    if (p.indicadores_1m) {
+                        const i1m = p.indicadores_1m;
+                        Object.assign(marketData[sym], {
+                            rsi_7: i1m.rsi_7, ema_300: i1m.ema_300,
+                            wick_upper: i1m.wick_upper_pct, wick_lower: i1m.wick_lower_pct,
+                            body_dir: i1m.body_direction, close: i1m.close, high: i1m.high, low: i1m.low,
+                            atr_1m: i1m.atr_1m, mecha_valida_short: i1m.mecha_valida_short,
+                            mecha_valida_long: i1m.mecha_valida_long,
+                            ema300_distancia_pct: i1m.ema300_distancia_pct,
+                            volume: i1m.volume, volume_sma20: i1m.volume_sma20,
+                        });
+                    }
+
+                    if (p.indicadores_15m) {
+                        const i15m = p.indicadores_15m;
+                        Object.assign(marketData[sym], {
+                            rsi_15m: i15m.rsi, adx: i15m.adx, macd: i15m.macd_hist, atr: i15m.atr,
+                            ema200_15m: i15m.ema200_15m, volume: i15m.volume,
+                            volume_sma20: i15m.volume_sma20,
+                            recent_high: i15m.recent_high, recent_low: i15m.recent_low,
+                        });
+                    }
+
+                    if (p.indicadores_4h) {
+                        marketData[sym].ema200_4h = p.indicadores_4h.ema200_4h;
+                        marketData[sym].close_4h = p.indicadores_4h.close;
+                    }
+
+                    if (p.estado) {
+                        const prevEstado = marketData[sym].estado;
+                        marketData[sym].estado = p.estado.estado;
+                        marketData[sym].direccion_filtro = p.estado.direccion;
+                        marketData[sym].score = p.estado.score;
+                        marketData[sym].filtro_aprobado = p.estado.filtro_aprobado;
+                        marketData[sym].velas_confirmacion = p.estado.velas_confirmacion;
+                        marketData[sym].circuit_breaker = p.estado.circuit_breaker_activo;
+
+                        updateCoinListItem(sym);
+
+                        if (p.estado.estado === 'FIRE' && prevEstado !== 'FIRE') {
+                            showToast({ symbol: sym, tipo: 'FIRE', direction: p.estado.direccion, score: p.estado.score });
+                        }
+                    }
+
+                    if (sym === activeSymbol) updateIndicatorsUI(marketData[sym]);
+                    document.getElementById('last-update').innerText = new Date().toLocaleTimeString();
+                    return;
+                }
+
+                // Mensajes individuales (compatibilidad hacia atrás)
+                if (data.msg_type === 'precio') {
+                    marketData[sym].price = data.price;
+                    const priceEl = document.getElementById(`list-price-${sym}`);
+                    if (priceEl) priceEl.innerText = parseFloat(data.price).toFixed(4);
+
+                } else if (data.msg_type === 'alerta' && data.payload) {
+                    logAlert(data.payload);
+                } else {
+                    console.log('[WS] Tipo no manejado:', data.msg_type);
+                }
+
+                if (sym === activeSymbol) updateIndicatorsUI(marketData[sym]);
+                document.getElementById('last-update').innerText = new Date().toLocaleTimeString();
+            } catch (err) {
+                console.error('[WS] ERROR en handleMessage:', err, 'Data:', data);
+            }
+        }
+
+        // ============================================
+        // CREAR / ACTUALIZAR ITEM DE MONEDA
+        // ============================================
+        function createCoinListItem(symbol) {
+            const list = document.getElementById('coin-list');
+            if (list.innerHTML.includes('Esperando datos')) list.innerHTML = '';
+
+            const html = `
+                <button id="coin-${symbol}" onclick="selectCoin('${symbol}')"
+                        class="coin-item w-full text-left px-3 py-2.5 rounded-lg border border-transparent hover:bg-gray-700/50 transition flex justify-between items-center group">
+                    <div class="flex items-center gap-2.5">
+                        <span id="state-dot-${symbol}" class="w-2.5 h-2.5 rounded-full bg-gray-500 shrink-0"></span>
+                        <div class="flex flex-col">
+                            <span class="font-bold text-sm group-hover:text-blue-400 transition">${symbol}</span>
+                            <span id="list-state-${symbol}" class="state-badge state-badge-monitoreo w-fit mt-0.5">MONITOREO</span>
+                        </div>
+                    </div>
+                    <div class="flex flex-col items-end">
+                        <span id="list-price-${symbol}" class="font-mono text-sm text-gray-400">...</span>
+                        <span id="list-dir-${symbol}" class="text-[9px] text-gray-600 font-mono mt-0.5 hidden">--</span>
+                    </div>
+                </button>
+            `;
+            list.insertAdjacentHTML('beforeend', html);
+            updateCoinCount();
+        }
+
+        function updateCoinListItem(symbol) {
+            const data = marketData[symbol];
+            if (!data) return;
+
+            const stateEl = document.getElementById(`list-state-${symbol}`);
+            const dotEl = document.getElementById(`state-dot-${symbol}`);
+            const dirEl = document.getElementById(`list-dir-${symbol}`);
+            const cb = data.circuit_breaker || false;
+
+            if (stateEl) {
+                stateEl.innerText = data.estado || 'MONITOREO';
+                stateEl.className = `state-badge w-fit mt-0.5 ${getStateBadgeClass(data.estado, cb)}`;
+            }
+            if (dotEl) {
+                dotEl.className = `w-2.5 h-2.5 rounded-full shrink-0 ${getStateDot(data.estado, cb)}`;
+            }
+            if (dirEl && data.direccion_filtro) {
+                dirEl.innerText = data.direccion_filtro;
+                dirEl.className = `text-[9px] font-mono mt-0.5 ${data.direccion_filtro === 'LONG' ? 'text-green-500' : 'text-red-500'}`;
+                dirEl.classList.remove('hidden');
+            }
+        }
+
+        function updateCoinCount() {
+            const count = Object.keys(marketData).length;
+            document.getElementById('coin-count').innerText = count;
+        }
+
+        // ============================================
+        // INICIALIZACIÓN
+        // ============================================
+        document.addEventListener('DOMContentLoaded', () => {
+            renderAlertsFromStorage();
+            window.dispatchEvent(new Event('resize'));
+            loadSnapshot().then(() => {
+                connectWebSocket();
+            });
+        });
+
+        window.addEventListener('beforeunload', () => {
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            if (ws) ws.close();
+        });
+    </script>
+</body>
+</html>
