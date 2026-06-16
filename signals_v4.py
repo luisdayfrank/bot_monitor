@@ -8,7 +8,7 @@ import pytz
 
 
 class SignalState:
-    """Estado de la máquina de estados por símbolo — V5.2 MFM + Correcciones."""
+    """Estado de la máquina de estados por símbolo — V5.5 Correcciones Etapa 5.5."""
     def __init__(self):
         self.estado = 'MONITOREO'
         self.velas_confirmacion = 0
@@ -46,43 +46,35 @@ class SignalState:
         # ═══════════════════════════════════════════════════════════════════════════════
         # V4.2: PAUSA MANUAL (nueva)
         # ═══════════════════════════════════════════════════════════════════════════════
-        # moneda_pausada = True → pausa automática por inactividad (score bajo)
-        # moneda_pausada_manual = True → pausa manual por comando del usuario
-        # La pausa manual tiene PRIORIDAD sobre la automática
-        self.moneda_pausada = False           # Pausa automática por inactividad
-        self.moneda_pausada_manual = False    # Pausa manual por comando usuario
-        self.moneda_pausada_razon = None      # Razón de la última pausa automática
-        self.moneda_pausada_timestamp = 0     # Cuándo se pausó automáticamente
+        self.moneda_pausada = False
+        self.moneda_pausada_manual = False
+        self.moneda_pausada_razon = None
+        self.moneda_pausada_timestamp = 0
 
         # ═══════════════════════════════════════════════════════════════════════════════
         # FASE 5.4: COMMITMENT SCORE (historial de 1m para confirmación real)
         # ═══════════════════════════════════════════════════════════════════════════════
-        # Buffer de últimas 2 velas 1m para evaluar commitment
-        self.commitment_historial_1m: list = []  # [{rsi_7, ema300_dist, close, timestamp}, ...]
-        self.commitment_score_actual: int = 0    # 0-100, score de commitment
-        self.commitment_velas_requeridas: int = 2  # Velas consecutivas alineadas requeridas
+        self.commitment_historial_1m: list = []
+        self.commitment_score_actual: int = 0
+        self.commitment_velas_requeridas: int = 2
+
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # FASE 5.5: Último snapshot de auditoría periódica
+        # ═══════════════════════════════════════════════════════════════════════════════
+        self.ultimo_snapshot_timestamp: int = 0
 
 
 class SignalGenerator:
     """
-    Generador de señales V5.2 — MFM + Correcciones Pausa Manual/Automática.
+    Generador de señales V5.5 — Correcciones Etapa 5.5.
 
-    CORRECCIONES APLICADAS:
-    ────────────────────────
-    1. FIX: Despausa automática ahora funciona correctamente (bug #4)
-    2. NUEVO: Pausa manual por comando Telegram (/pause, /resume)
-    3. NUEVO: Persistencia de pausa manual en SignalState
-    4. FIX: PAUSA_INACTIVIDAD_HORAS movido a config.py
-    5. NUEVO: Diferenciación clara entre pausa automática y manual en logs
-    6. NUEVO: Comandos /pause, /resume, /pause_all, /resume_all, /list_paused
-
-    FASE 5.2 NUEVO:
-    ────────────────
-    7. MFM (Money Flow Multiplier) integrado en filtro macro.
-       El bonus de volumen ahora depende de que el MFM esté alineado
-       con la dirección operativa. Volumen contradictorio = penalización.
-    8. Nuevo rechazo: "MFM contradictorio" cuando volumen presiona
-       en dirección opuesta al setup.
+    CORRECCIONES ETAPA 5.5:
+    ─────────────────────────
+    A. Umbral dinámico ATR integrado en filtro macro (no solo en gatillo)
+    B. Commitment score con puntuación gradual (no todo/nada)
+    C. MFM penalización proporcional (no fija -20)
+    D. Umbral 999 → códigos descriptivos negativos
+    E. Snapshot periódico en auditoría cada 4h
     """
 
     def __init__(self, queue_in: asyncio.Queue, queue_out: asyncio.Queue):
@@ -97,12 +89,8 @@ class SignalGenerator:
         # FASE 3: ATR histórico por símbolo para percentil 95
         self._atr_historico: Dict[str, list] = {s: [] for s in CONFIG.symbols}
 
-        # ═══════════════════════════════════════════════════════════════════════════════
         # FASE 5.3: BUFFER HISTÓRICO DE ATR(15m) PARA UMBRAL DINÁMICO
-        # ═══════════════════════════════════════════════════════════════════════════════
-        # Ventana de velas 15m para calcular percentiles del ATR
         self._atr15m_historico: Dict[str, list] = {s: [] for s in CONFIG.symbols}
-        # Rango reciente (high/low de últimas N velas) para detectar rupturas
         self._rango_reciente: Dict[str, dict] = {s: {'highs': [], 'lows': []} for s in CONFIG.symbols}
 
         # FASE 5.4: BUFFER DE HISTORIAL 1M PARA COMMITMENT SCORE
@@ -117,12 +105,20 @@ class SignalGenerator:
     ARMED_TIMEOUT_MIN = 30
     SCORE_DISPARO_MIN = 70
     SCORE_MANTENIMIENTO_ARMED = 50
-    # FASE 5.1: PAUSA_INACTIVIDAD_HORAS ahora viene de config.py
-    # self.PAUSA_INACTIVIDAD_HORAS → CONFIG.pausa_inactividad_horas
     ADX_RECHAZO_MIN = 20
 
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 5.5: NUEVAS CONSTANTES
+    # ═══════════════════════════════════════════════════════════════════════════════
+    COMMITMENT_UMBRAL = 50          # Antes: 60 (demasiado restrictivo)
+    SNAPSHOT_INTERVALO_MS = 4 * 60 * 60 * 1000  # 4 horas en ms
+
+    # Códigos de umbral bloqueado (reemplazan el 999 confuso)
+    UMBRAL_BLOQUEADO_ADX_EXTREMO = -1
+    UMBRAL_BLOQUEADO_ADX_BAJO = -2
+
     # ================================================================
-    # V4.2: COMANDOS DE PAUSA MANUAL (nuevos métodos públicos)
+    # V4.2: COMANDOS DE PAUSA MANUAL (sin cambios)
     # ================================================================
     def pausar_moneda_manual(self, symbol: str, razon: str = "Comando usuario") -> bool:
         """Pausa una moneda manualmente. Retorna True si se pausó."""
@@ -130,15 +126,14 @@ class SignalGenerator:
             return False
         state = self.states[symbol]
         if state.moneda_pausada_manual:
-            return False  # Ya está pausada manualmente
+            return False
 
         estado_anterior = state.estado
         state.moneda_pausada_manual = True
-        state.moneda_pausada = True  # También marca como pausada automática para consistencia
+        state.moneda_pausada = True
         state.moneda_pausada_razon = razon
         state.moneda_pausada_timestamp = int(datetime.now(pytz.UTC).timestamp())
 
-        # Resetear estado de la máquina
         state.estado = 'MONITOREO'
         state.velas_confirmacion = 0
         state.filtro_macro_aprobado = False
@@ -150,16 +145,14 @@ class SignalGenerator:
         return True
 
     def reanudar_moneda_manual(self, symbol: str) -> bool:
-        """Reanuda una moneda pausada manualmente. Retorna True si se reanudó."""
+        """Reanuda una moneda pausada manualmente."""
         if symbol not in self.states:
             return False
         state = self.states[symbol]
         if not state.moneda_pausada_manual:
-            return False  # No estaba pausada manualmente
+            return False
 
         state.moneda_pausada_manual = False
-        # La pausa automática se limpia también, pero el sistema de inactividad
-        # puede volver a pausarla si el score sigue bajo
         state.moneda_pausada = False
         state.moneda_pausada_razon = None
         state.moneda_pausada_timestamp = 0
@@ -169,7 +162,6 @@ class SignalGenerator:
         return True
 
     def pausar_todas_manual(self, razon: str = "Comando usuario") -> list:
-        """Pausa todas las monedas. Retorna lista de símbolos pausados."""
         pausadas = []
         for symbol in CONFIG.symbols:
             if self.pausar_moneda_manual(symbol, razon):
@@ -177,7 +169,6 @@ class SignalGenerator:
         return pausadas
 
     def reanudar_todas_manual(self) -> list:
-        """Reanuda todas las monedas pausadas manualmente. Retorna lista de símbolos reanudadas."""
         reanudadas = []
         for symbol in CONFIG.symbols:
             if self.reanudar_moneda_manual(symbol):
@@ -185,7 +176,6 @@ class SignalGenerator:
         return reanudadas
 
     def get_monedas_pausadas(self) -> Dict[str, dict]:
-        """Retorna dict con todas las monedas pausadas y su tipo de pausa."""
         resultado = {}
         for symbol, state in self.states.items():
             if state.moneda_pausada or state.moneda_pausada_manual:
@@ -207,10 +197,7 @@ class SignalGenerator:
 
             if tf == '1m':
                 self.indicadores_1m[symbol] = data
-
-                # FASE 5.4: Alimentar historial de 1m para commitment score
                 self._alimentar_historial_1m(symbol, data)
-
                 await self._actualizar_estado_maquina(symbol)
                 if self.states[symbol].estado == 'ARMED':
                     await self.evaluar_gatillo(symbol)
@@ -223,12 +210,10 @@ class SignalGenerator:
                     if len(self._atr_historico[symbol]) > 500:
                         self._atr_historico[symbol] = self._atr_historico[symbol][-500:]
 
-                    # FASE 5.3: Alimentar buffer de ATR(15m) para umbral dinámico
                     self._atr15m_historico[symbol].append(atr_val)
                     if len(self._atr15m_historico[symbol]) > CONFIG.atr_percentil_ventana:
                         self._atr15m_historico[symbol] = self._atr15m_historico[symbol][-CONFIG.atr_percentil_ventana:]
 
-                # FASE 5.3: Actualizar rango reciente (highs/lows de últimas 20 velas)
                 if data.get('high') and data.get('low'):
                     self._rango_reciente[symbol]['highs'].append(data['high'])
                     self._rango_reciente[symbol]['lows'].append(data['low'])
@@ -238,32 +223,80 @@ class SignalGenerator:
 
                 await self.evaluar_filtro_macro(symbol)
 
+                # FASE 5.5: Snapshot periódico cada 4h
+                await self._log_snapshot_periodico(symbol, data)
+
             elif tf == '4h':
                 self.indicadores_4h[symbol] = data
 
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 5.5: SNAPSHOT PERIÓDICO PARA AUDITORÍA GRANULAR
+    # ═══════════════════════════════════════════════════════════════════════════════
+    async def _log_snapshot_periodico(self, symbol: str, data: dict):
+        """Loguea estado actual cada 4h para auditoría granular."""
+        if not self.audit_logger:
+            return
+
+        state = self.states[symbol]
+        timestamp_actual = data.get('timestamp', 0)
+
+        # Solo loguear si pasaron 4h desde el último snapshot
+        if timestamp_actual - state.ultimo_snapshot_timestamp < self.SNAPSHOT_INTERVALO_MS:
+            return
+
+        state.ultimo_snapshot_timestamp = timestamp_actual
+
+        i15 = self.indicadores_15m.get(symbol, {})
+        if not i15:
+            return
+
+        # Calcular umbral legible para auditoría
+        umbral_raw = self._calcular_umbral_filtro(symbol)
+        umbral_legible = self._umbral_a_string(umbral_raw)
+
+        await self.audit_logger.log_snapshot(
+            symbol=symbol,
+            estado=state.estado,
+            score_macro=state.score_macro_actual,
+            direccion=state.direccion_filtro or state.direccion_ultima_valida,
+            contexto={
+                'precio': i15.get('close'),
+                'rsi': i15.get('rsi'),
+                'adx': i15.get('adx'),
+                'atr': i15.get('atr'),
+                'score_macro': state.score_macro_actual,
+                'commitment_score': state.commitment_score_actual,
+                'umbral_aplicado': umbral_legible,
+                'umbral_raw': umbral_raw,
+            }
+        )
+
+    def _umbral_a_string(self, umbral: int) -> str:
+        """Convierte umbral numérico a string descriptivo para auditoría."""
+        if umbral == self.UMBRAL_BLOQUEADO_ADX_EXTREMO:
+            return "BLOQUEADO_ADX_EXTREMO"
+        elif umbral == self.UMBRAL_BLOQUEADO_ADX_BAJO:
+            return "BLOQUEADO_ADX_BAJO"
+        elif umbral < 0:
+            return f"BLOQUEADO({umbral})"
+        else:
+            return str(umbral)
+
     # ================================================================
-    # CAPA 1: FILTRO MACRO (evalúa cada 15m) — FASE 5.2 MFM
+    # CAPA 1: FILTRO MACRO (evalúa cada 15m) — FASE 5.5 CORREGIDO
     # ================================================================
     async def evaluar_filtro_macro(self, symbol: str):
-        """Evalúa si el mercado macro permite operar. Con MFM integrado."""
+        """Evalúa si el mercado macro permite operar. V5.5 con correcciones."""
         i15 = self.indicadores_15m.get(symbol)
         i4h = self.indicadores_4h.get(symbol)
         state = self.states[symbol]
 
-        # ═══════════════════════════════════════════════════════════════════════════════
-        # V4.2 FIX #4: Despausa automática AHORA FUNCIONA
-        # ═══════════════════════════════════════════════════════════════════════════════
-        # ANTES: Si moneda_pausada == True, hacía return early y NUNCA evaluaba despausa
-        # AHORA: Evaluamos SIEMPRE el score primero, y luego decidimos si pausar/despausar
-
-        # Si está pausada MANUALMENTE, no evaluamos nada (el usuario tiene control total)
         if state.moneda_pausada_manual:
             state.filtro_macro_aprobado = False
             return
 
         if not i15 or not i4h:
             state.filtro_macro_aprobado = False
-            # V4.2: Aún así evaluamos si debemos despausar una pausa automática
             await self._evaluar_despausa_automatica(symbol, state, score_macro=0)
             return
 
@@ -288,7 +321,6 @@ class SignalGenerator:
         macd_hist_prev = i15['macd_hist_prev']
         vol_ratio = i15['volume'] / i15['volume_sma20'] if i15['volume_sma20'] > 0 else 0
 
-        # FASE 5.2: Obtener MFM del indicador
         mfm = i15.get('mfm_15m', 0.0)
         mfm_sma5 = i15.get('mfm_sma5', 0.0)
 
@@ -316,15 +348,23 @@ class SignalGenerator:
 
         rechazos = []
         score_macro = 0
+        umbral_entrada = 70  # default
+        umbral_mantenimiento = self.SCORE_MANTENIMIENTO_ARMED
+        umbral_bloqueado = False
 
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # FASE 5.5: LÓGICA DE ADX CON UMBRALES DESCRIPTIVOS (no 999)
+        # ═══════════════════════════════════════════════════════════════════════════════
         if adx is None or np.isnan(adx) or adx > 45:
             rechazos.append(f"ADX extremo: {adx:.1f}")
-            umbral_entrada = 999
-            umbral_mantenimiento = 999
+            umbral_entrada = self.UMBRAL_BLOQUEADO_ADX_EXTREMO
+            umbral_mantenimiento = self.UMBRAL_BLOQUEADO_ADX_EXTREMO
+            umbral_bloqueado = True
         elif adx < self.ADX_RECHAZO_MIN:
             rechazos.append(f"ADX sin tendencia: {adx:.1f}")
-            umbral_entrada = 999
-            umbral_mantenimiento = 999
+            umbral_entrada = self.UMBRAL_BLOQUEADO_ADX_BAJO
+            umbral_mantenimiento = self.UMBRAL_BLOQUEADO_ADX_BAJO
+            umbral_bloqueado = True
         elif self.ADX_RECHAZO_MIN <= adx < 25:
             score_macro += 10
             umbral_entrada = 75
@@ -374,48 +414,66 @@ class SignalGenerator:
             score_macro += 15
 
         # ═══════════════════════════════════════════════════════════════════════════════
-        # FASE 5.2: VOLUMEN INTELIGENTE CON MFM
-        # ═══════════════════════════════════════════════════════════════════════════════
-        # ANTES: Volumen alto = +10 puntos siempre (independiente de dirección)
-        # AHORA: Volumen alto solo suma si MFM está alineado con dirección
-        #        Volumen alto + MFM contrario = penalización (absorción/trampa)
+        # FASE 5.5: MFM PENALIZACIÓN PROPORCIONAL (no fija -20)
         # ═══════════════════════════════════════════════════════════════════════════════
         if vol_ratio >= CONFIG.volume_min_ratio:
             mfm_alineado = False
             if direction == 'SHORT' and mfm_sma5 < -CONFIG.mfm_umbral_alineacion:
-                # Volumen presiona a la baja → alineado con SHORT
                 mfm_alineado = True
                 score_macro += CONFIG.mfm_bonus_alineado
                 print(f"  📊 {symbol} Volumen+MFM alineado SHORT | mfm={mfm_sma5:.3f} | +{CONFIG.mfm_bonus_alineado}pts")
             elif direction == 'LONG' and mfm_sma5 > CONFIG.mfm_umbral_alineacion:
-                # Volumen presiona al alza → alineado con LONG
                 mfm_alineado = True
                 score_macro += CONFIG.mfm_bonus_alineado
                 print(f"  📊 {symbol} Volumen+MFM alineado LONG | mfm={mfm_sma5:.3f} | +{CONFIG.mfm_bonus_alineado}pts")
             else:
-                # Volumen contradice dirección → posible trampa o absorción
-                score_macro -= CONFIG.mfm_penalizacion_contrario
-                rechazos.append(f"MFM contradictorio: mfm={mfm_sma5:.3f} vs dirección {direction}")
-                print(f"  ⚠️ {symbol} Volumen+MFM CONTRADICTORIO | mfm={mfm_sma5:.3f} vs {direction} | -{CONFIG.mfm_penalizacion_contrario}pts")
+                # FASE 5.5: Penalización proporcional a la fuerza del MFM contradictorio
+                mfm_fuerza = abs(mfm_sma5)
+                if mfm_fuerza >= 0.5:
+                    penalizacion = 20
+                elif mfm_fuerza >= 0.3:
+                    penalizacion = 15
+                elif mfm_fuerza >= 0.1:
+                    penalizacion = 10
+                else:
+                    penalizacion = 5
+
+                # FASE 5.5: En tendencias fuertes (ADX > 40), el volumen contradictorio
+                # puede ser absorción/agotamiento. Reducir penalización a la mitad.
+                if adx > 40:
+                    penalizacion_antes = penalizacion
+                    penalizacion = penalizacion // 2
+                    print(f"  📊 {symbol} MFM contradictorio REDUCIDO por ADX>40 | "
+                          f"{penalizacion_antes} → {penalizacion}pts")
+
+                score_macro -= penalizacion
+                rechazos.append(f"MFM contradictorio: mfm={mfm_sma5:.3f} vs {direction} (-{penalizacion}pts)")
+                print(f"  ⚠️ {symbol} Volumen+MFM CONTRADICTORIO | mfm={mfm_sma5:.3f} vs {direction} | -{penalizacion}pts")
         else:
             rechazos.append(f"Volumen bajo: {vol_ratio:.1%}")
 
         score_macro = max(0, min(100, score_macro))
         state.score_macro_actual = score_macro
 
-        # ═══════════════════════════════════════════════════════════════════════════════
-        # V4.2 FIX #4: Evaluar despausa automática ANTES de decidir si pausar
-        # ═══════════════════════════════════════════════════════════════════════════════
-        # Si está pausada automáticamente, verificamos si el score mejoró
+        # FASE 5.5: Evaluar despausa automática
         await self._evaluar_despausa_automatica(symbol, state, score_macro)
 
-        # Si sigue pausada automáticamente después de evaluar despausa, no continuamos
         if state.moneda_pausada and not state.moneda_pausada_manual:
             state.filtro_macro_aprobado = False
             return
 
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # FASE 5.5: UMBRAL DINÁMICO ATR INTEGRADO EN FILTRO MACRO
+        # ═══════════════════════════════════════════════════════════════════════════════
         if state.estado == 'ARMED':
-            score_minimo = umbral_mantenimiento
+            # Antes: umbral_mantenimiento fijo (50)
+            # Ahora: umbral dinámico ATR adaptativo
+            umbral_dinamico = self._calcular_umbral_dinamico(symbol)
+            # Si el umbral dinámico es válido (no bloqueado), usarlo
+            if umbral_dinamico > 0:
+                score_minimo = umbral_dinamico
+            else:
+                score_minimo = umbral_mantenimiento
         else:
             score_minimo = umbral_entrada
 
@@ -430,8 +488,7 @@ class SignalGenerator:
 
         state.ultimo_filtro_timestamp = i15.get('timestamp', 0)
 
-        # V4.2: Tracking de inactividad (pausa automática) - AHORA DESPUÉS del despausa
-        # FASE 5.1: Usar CONFIG.pausa_inactividad_horas en vez de hardcodeo
+        # V4.2: Tracking de inactividad (pausa automática)
         if score_macro < 50:
             if state.score_bajo_desde is None:
                 state.score_bajo_desde = int(datetime.now(pytz.UTC).timestamp())
@@ -444,12 +501,17 @@ class SignalGenerator:
                     print(f"  ⏸️ {symbol} AUTO-PAUSADA por inactividad | {state.moneda_pausada_razon}")
         else:
             state.score_bajo_desde = None
-            # NOTA: No limpiamos moneda_pausada aquí, eso lo hace _evaluar_despausa_automatica
 
         # FASE 4.5: Loggear cambio de filtro macro
         if self.audit_logger:
             estado_previo = state._prev_filtro_aprobado
             if estado_previo != state.filtro_macro_aprobado:
+                # FASE 5.5: Umbral legible para auditoría
+                umbral_legible = self._umbral_a_string(score_minimo)
+                umbral_real = umbral_entrada if not umbral_bloqueado else (
+                    75 if adx < 25 else 70 if adx <= 35 else 65
+                )
+
                 contexto_macro = {
                     'precio': price,
                     'rsi': rsi,
@@ -459,12 +521,13 @@ class SignalGenerator:
                     'ema50_15m': ema50,
                     'macd_hist': macd_hist,
                     'volumen_ratio': vol_ratio,
-                    # FASE 5.2: Incluir MFM en contexto de auditoría
                     'mfm_15m': mfm,
                     'mfm_sma5': mfm_sma5,
                     'direccion': direction,
                     'score_macro': score_macro,
-                    'umbral_aplicado': score_minimo,
+                    'umbral_aplicado': umbral_legible,
+                    'umbral_real': umbral_real,
+                    'umbral_bloqueado': umbral_bloqueado,
                     'estado_maquina': state.estado,
                     'pausa_auto': state.moneda_pausada,
                     'pausa_manual': state.moneda_pausada_manual
@@ -481,31 +544,40 @@ class SignalGenerator:
 
         if filtro_aprobado:
             mfm_str = f" | MFM={mfm_sma5:.3f}" if mfm_sma5 != 0 else ""
-            print(f"  🟢 {symbol} Filtro Macro OK ({direction}) | Score: {score_macro} | Umbral: {score_minimo} | RSI: {rsi:.1f} | ADX: {adx:.1f}{mfm_str}")
+            umbral_str = self._umbral_a_string(score_minimo)
+            print(f"  🟢 {symbol} Filtro Macro OK ({direction}) | Score: {score_macro} | Umbral: {umbral_str} | RSI: {rsi:.1f} | ADX: {adx:.1f}{mfm_str}")
         else:
             if state.estado == 'ARMED':
-                print(f"  🔴 {symbol} Filtro Macro ROTO | Rechazos: {rechazos[:2]} | Score: {score_macro} | Umbral: {score_minimo}")
+                print(f"  🔴 {symbol} Filtro Macro ROTO | Rechazos: {rechazos[:2]} | Score: {score_macro} | Umbral: {self._umbral_a_string(score_minimo)}")
             elif state.estado in ('MONITOREO',):
                 if score_macro > 40:
                     print(f"  🟡 {symbol} Filtro Macro NO apto | Score: {score_macro} | {rechazos[:1]}")
 
     # ═══════════════════════════════════════════════════════════════════════════════
-    # V4.2: NUEVO MÉTODO - Evaluar despausa automática
+    # FASE 5.5: CALCULAR UMBRAL PARA FILTRO MACRO (usado en auditoría)
     # ═══════════════════════════════════════════════════════════════════════════════
+    def _calcular_umbral_filtro(self, symbol: str) -> int:
+        """Calcula el umbral base del filtro macro (sin dinámico ATR)."""
+        i15 = self.indicadores_15m.get(symbol, {})
+        adx = i15.get('adx', 30)
+
+        if adx is None or np.isnan(adx) or adx > 45:
+            return self.UMBRAL_BLOQUEADO_ADX_EXTREMO
+        elif adx < self.ADX_RECHAZO_MIN:
+            return self.UMBRAL_BLOQUEADO_ADX_BAJO
+        elif self.ADX_RECHAZO_MIN <= adx < 25:
+            return 75
+        elif 25 <= adx <= 35:
+            return 70
+        else:
+            return 65
+
+    # V4.2: Evaluar despausa automática (sin cambios)
     async def _evaluar_despausa_automatica(self, symbol: str, state: SignalState, score_macro: int):
-        """
-        Evalúa si una moneda pausada automáticamente debe reactivarse.
-        Se llama SIEMPRE al inicio de evaluar_filtro_macro, antes de cualquier early return.
-        """
-        # Si está pausada MANUALMENTE, NUNCA despausar automáticamente
         if state.moneda_pausada_manual:
             return
-
-        # Si NO está pausada automáticamente, nada que hacer
         if not state.moneda_pausada:
             return
-
-        # Si el score mejoró a >= 50, despausar automáticamente
         if score_macro >= 50:
             tiempo_pausada = int(datetime.now(pytz.UTC).timestamp()) - state.moneda_pausada_timestamp
             state.moneda_pausada = False
@@ -514,19 +586,15 @@ class SignalGenerator:
             state.score_bajo_desde = None
             print(f"  ▶️ {symbol} AUTO-REANUDADA | Score recuperado a {score_macro} | Pausada durante {tiempo_pausada/60:.0f}min")
         else:
-            # Aún pausada, mostrar cuánto tiempo lleva pausada
             if state.moneda_pausada_timestamp > 0:
                 tiempo_pausada = int(datetime.now(pytz.UTC).timestamp()) - state.moneda_pausada_timestamp
-                if tiempo_pausada % 300 == 0:  # Log cada 5 minutos
+                if tiempo_pausada % 300 == 0:
                     print(f"  ⏸️ {symbol} sigue AUTO-PAUSADA | Score: {score_macro} | Tiempo pausada: {tiempo_pausada/60:.0f}min")
 
     # ================================================================
-    # CAPA 1.5: MÁQUINA DE ESTADOS (hysteresis suavizada + timeout)
+    # CAPA 1.5: MÁQUINA DE ESTADOS
     # ================================================================
 
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # FASE 5.4: COMMITMENT SCORE REAL
-    # ═══════════════════════════════════════════════════════════════════════════════
     def _alimentar_historial_1m(self, symbol: str, data: dict):
         """Alimenta el buffer de historial 1m para evaluar commitment."""
         if not data:
@@ -547,20 +615,17 @@ class SignalGenerator:
         }
 
         self._historial_1m[symbol].append(registro)
-        # Mantener solo últimas 5 velas para análisis
         if len(self._historial_1m[symbol]) > 5:
             self._historial_1m[symbol] = self._historial_1m[symbol][-5:]
 
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 5.5: COMMITMENT SCORE CON PUNTUACIÓN GRADUAL
+    # ═══════════════════════════════════════════════════════════════════════════════
     def _evaluar_commitment_score(self, symbol: str, direction: str) -> int:
         """
-        Evalúa el commitment score basado en alineación de indicadores de 1m.
-
-        Requisitos para commitment positivo:
-        1. RSI(7) alineado con dirección durante N velas consecutivas
-        2. Precio alineado con dirección (vs EMA300) durante N velas
-        3. Volumen soportando el movimiento
-
-        Retorna: score 0-100 (commitment)
+        Evalúa el commitment score con puntuación gradual.
+        ANTES: Todo/nada (40+40+20 pts). AHORA: Gradual 0-30 + 0-30 + 0-20 = 0-80
+        Umbral: 50 (antes: 60, demasiado restrictivo)
         """
         historial = self._historial_1m.get(symbol, [])
         if len(historial) < 2:
@@ -568,63 +633,94 @@ class SignalGenerator:
 
         state = self.states[symbol]
         velas_requeridas = state.commitment_velas_requeridas
-
-        # Tomar últimas N velas
         velas = historial[-velas_requeridas:]
         if len(velas) < velas_requeridas:
             return 0
 
         score = 0
 
-        # 1. RSI(7) alineado con dirección
-        rsi_alineado = True
+        # 1. RSI(7) alineado con dirección — PUNTUACIÓN GRADUAL 0-30 pts
+        rsi_score = 0
         for v in velas:
             rsi = v.get('rsi_7')
             if rsi is None:
-                rsi_alineado = False
-                break
-            if direction == 'SHORT' and rsi < 60:  # RSI debe estar alto para SHORT
-                rsi_alineado = False
-                break
-            if direction == 'LONG' and rsi > 40:   # RSI debe estar bajo para LONG
-                rsi_alineado = False
+                rsi_score = 0
                 break
 
-        if rsi_alineado:
-            score += 40
+            if direction == 'SHORT':
+                if rsi >= 70:
+                    rsi_score = max(rsi_score, 30)
+                elif rsi >= 60:
+                    rsi_score = max(rsi_score, 20)
+                elif rsi >= 55:
+                    rsi_score = max(rsi_score, 10)
+                # rsi < 55 → 0 pts
+            elif direction == 'LONG':
+                if rsi <= 30:
+                    rsi_score = max(rsi_score, 30)
+                elif rsi <= 40:
+                    rsi_score = max(rsi_score, 20)
+                elif rsi <= 45:
+                    rsi_score = max(rsi_score, 10)
+                # rsi > 45 → 0 pts
 
-        # 2. Precio alineado con dirección vs EMA300
-        precio_alineado = True
+        score += rsi_score
+
+        # 2. Precio alineado con dirección vs EMA300 — PUNTUACIÓN GRADUAL 0-30 pts
+        precio_score = 0
         for v in velas:
             close = v.get('close')
             ema300 = v.get('ema_300')
             if close is None or ema300 is None or ema300 == 0:
-                precio_alineado = False
+                precio_score = 0
                 break
             distancia_pct = ((close - ema300) / ema300) * 100
+            distancia_abs = abs(distancia_pct)
 
-            if direction == 'SHORT' and distancia_pct > -0.05:  # Debe estar por encima o cerca de EMA300
-                precio_alineado = False
-                break
-            if direction == 'LONG' and distancia_pct < 0.05:    # Debe estar por debajo o cerca de EMA300
-                precio_alineado = False
-                break
+            if direction == 'SHORT':
+                # Para SHORT, queremos precio por ENCIMA de EMA300 (distancia positiva)
+                # o al menos no muy por debajo
+                if distancia_pct >= 0.2:
+                    precio_score = max(precio_score, 30)
+                elif distancia_pct >= 0.1:
+                    precio_score = max(precio_score, 20)
+                elif distancia_pct >= 0.05:
+                    precio_score = max(precio_score, 10)
+                elif distancia_pct >= -0.05:
+                    precio_score = max(precio_score, 5)
+            elif direction == 'LONG':
+                # Para LONG, queremos precio por DEBAJO de EMA300 (distancia negativa)
+                if distancia_pct <= -0.2:
+                    precio_score = max(precio_score, 30)
+                elif distancia_pct <= -0.1:
+                    precio_score = max(precio_score, 20)
+                elif distancia_pct <= -0.05:
+                    precio_score = max(precio_score, 10)
+                elif distancia_pct <= 0.05:
+                    precio_score = max(precio_score, 5)
 
-        if precio_alineado:
-            score += 40
+        score += precio_score
 
-        # 3. Volumen soportando (al menos 1 velas con volumen > SMA20)
-        volumen_soportando = 0
+        # 3. Volumen soportando — PUNTUACIÓN GRADUAL 0-20 pts
+        volumen_score = 0
         for v in velas:
             vol = v.get('volume', 0)
             vol_sma = v.get('volume_sma20', 1)
-            if vol_sma > 0 and vol >= vol_sma * 0.8:  # 80% del promedio es suficiente
-                volumen_soportando += 1
+            if vol_sma > 0:
+                ratio = vol / vol_sma
+                if ratio >= 1.5:
+                    volumen_score = max(volumen_score, 20)
+                elif ratio >= 1.0:
+                    volumen_score = max(volumen_score, 15)
+                elif ratio >= 0.8:
+                    volumen_score = max(volumen_score, 10)
+                elif ratio >= 0.5:
+                    volumen_score = max(volumen_score, 5)
 
-        if volumen_soportando >= 1:
-            score += 20
+        score += volumen_score
 
-        return min(100, score)
+        # Score máximo: 30 + 30 + 20 = 80
+        return min(80, score)
 
     def _commitment_aprobado(self, symbol: str) -> bool:
         """Verifica si el commitment score es suficiente para pasar a ARMED."""
@@ -637,27 +733,23 @@ class SignalGenerator:
         commitment = self._evaluar_commitment_score(symbol, direction)
         state.commitment_score_actual = commitment
 
-        # Umbral de commitment: 60/100 (2 de 3 requisitos cumplidos)
-        aprobado = commitment >= 60
+        # FASE 5.5: Umbral reducido de 60 a 50 (más permisivo)
+        aprobado = commitment >= self.COMMITMENT_UMBRAL
 
         if aprobado:
-            print(f"  ✅ {symbol} Commitment APROBADO: {commitment}/100 ({direction})")
+            print(f"  ✅ {symbol} Commitment APROBADO: {commitment}/80 ({direction})")
         else:
             if state.estado == 'MONITOREO':
-                print(f"  ⏳ {symbol} Commitment insuficiente: {commitment}/100 ({direction})")
+                print(f"  ⏳ {symbol} Commitment insuficiente: {commitment}/80, necesita {self.COMMITMENT_UMBRAL} ({direction})")
 
         return aprobado
 
     async def _actualizar_estado_maquina(self, symbol: str):
-        """
-        Transiciona estados con hysteresis suavizada y timeout ARMED.
-        V4.2: Respeta pausa manual y automática.
-        """
+        """Transiciona estados con hysteresis suavizada y timeout ARMED."""
         state = self.states[symbol]
         i15 = self.indicadores_15m.get(symbol, {})
         timestamp_15m_actual = i15.get('timestamp', 0)
 
-        # V4.2: Si moneda pausada (manual o automática), forzar MONITOREO
         if state.moneda_pausada or state.moneda_pausada_manual:
             if state.estado != 'MONITOREO':
                 estado_anterior_log = state.estado
@@ -677,7 +769,6 @@ class SignalGenerator:
                 print(f"  ⏸️ {symbol} → MONITOREO (pausa {tipo_pausa} activa)")
             return
 
-        # FASE 4.5: Loggear cambio de estado
         estado_anterior_log = state.estado
 
         if state.estado == 'COOLDOWN':
@@ -697,21 +788,14 @@ class SignalGenerator:
 
         if state.estado == 'MONITOREO':
             if state.filtro_macro_aprobado and state.direccion_filtro:
-                # FASE 5.4: Commitment Score Real en vez de hysteresis simple
-                # ANTES: contar 3 velas de confirmación (hysteresis_velas)
-                # AHORA: verificar alineación real de indicadores de 1m
                 commitment_ok = self._commitment_aprobado(symbol)
 
                 if commitment_ok:
                     state.estado = 'ARMED'
                     state.velas_confirmacion = 0
                     state.armed_timestamp = int(datetime.now(pytz.UTC).timestamp() * 1000)
-                    print(f"  🎯 {symbol} → ARMED ({state.direccion_filtro}) | Commitment: {state.commitment_score_actual}/100")
-                else:
-                    # Aún no hay commitment suficiente, seguir en MONITOREO
-                    pass
+                    print(f"  🎯 {symbol} → ARMED ({state.direccion_filtro}) | Commitment: {state.commitment_score_actual}/80")
             else:
-                # Resetear commitment si filtro se pierde
                 state.commitment_score_actual = 0
                 if CONFIG.hysteresis_suavizada and state.velas_confirmacion > 0:
                     state.velas_confirmacion = max(0, state.velas_confirmacion - CONFIG.hysteresis_decremento)
@@ -739,22 +823,19 @@ class SignalGenerator:
                         state._prev_estado = 'MONITOREO'
                     return
 
-            # FASE 5.4: En ARMED, verificar que commitment sigue siendo válido
             if state.filtro_macro_aprobado and state.direccion_filtro:
                 commitment_actual = self._evaluar_commitment_score(symbol, state.direccion_filtro)
                 state.commitment_score_actual = commitment_actual
 
-                if commitment_actual < 30:  # Commitment perdido drásticamente
+                if commitment_actual < 20:  # Commitment perdido drásticamente
                     state.estado = 'MONITOREO'
                     state.velas_confirmacion = 0
                     state.filtro_macro_aprobado = False
                     state.direccion_filtro = None
                     state.armed_timestamp = 0
                     state.commitment_score_actual = 0
-                    print(f"  🔄 {symbol} → MONITOREO (commitment perdido: {commitment_actual}/100)")
-                # Si commitment sigue OK, permanece en ARMED
+                    print(f"  🔄 {symbol} → MONITOREO (commitment perdido: {commitment_actual}/80)")
             else:
-                # Filtro macro roto, salir de ARMED
                 if CONFIG.hysteresis_suavizada:
                     state.velas_confirmacion += 1
                     if state.velas_confirmacion >= CONFIG.hysteresis_velas:
@@ -776,7 +857,6 @@ class SignalGenerator:
                         state.commitment_score_actual = 0
                         print(f"  🔄 {symbol} → MONITOREO (filtro roto, {CONFIG.hysteresis_velas} velas 1m)")
 
-        # FASE 4.5: Loggear transición de estado
         if estado_anterior_log != state.estado:
             if self.audit_logger:
                 await self.audit_logger.log_cambio_estado(
@@ -791,31 +871,19 @@ class SignalGenerator:
     # CAPA 2: GATILLO MICRO (evalúa cada 1m, solo si ARMED)
     # ================================================================
 
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # FASE 5.3: UMBRAL DINÁMICO VÍA ATR(15m)
-    # ═══════════════════════════════════════════════════════════════════════════════
     def _calcular_umbral_dinamico(self, symbol: str) -> int:
         """
         Calcula el score mínimo de disparo adaptativo basado en ATR(15m).
-
-        Lógica:
-        - ATR en percentil 20 (bajo, consolidación) → score_min alto (85) = más selectivo
-        - ATR en percentil 80 (alto, expansión) → score_min bajo (65) = más permisivo
-        - Interpolación lineal entre ambos
-
-        Pre-expansión: Si el precio rompe el rango reciente (high/low últimas 20 velas),
-        bajamos temporalmente el umbral para capturar el inicio del movimiento.
+        FASE 5.5: Ahora también usado en filtro macro (no solo gatillo).
         """
         atr_historico = self._atr15m_historico.get(symbol, [])
         if len(atr_historico) < 20:
-            # Datos insuficientes, usar umbral estático
             return self.SCORE_DISPARO_MIN
 
         atr_actual = atr_historico[-1]
         atr_p20 = np.percentile(atr_historico, 20)
         atr_p80 = np.percentile(atr_historico, 80)
 
-        # Normalizar ATR actual entre 0 y 1 (0 = consolidación, 1 = expansión)
         if atr_p80 > atr_p20:
             atr_normalizado = (atr_actual - atr_p20) / (atr_p80 - atr_p20)
         else:
@@ -823,11 +891,9 @@ class SignalGenerator:
 
         atr_normalizado = max(0.0, min(1.0, atr_normalizado))
 
-        # Interpolación lineal: consolidación = 85, expansión = 65
         score_min = CONFIG.score_min_consolidacion - atr_normalizado * (CONFIG.score_min_consolidacion - CONFIG.score_min_expansion)
         score_min = int(round(score_min))
 
-        # FASE 5.3: Detección de pre-expansión (ruptura de rango reciente)
         rango = self._rango_reciente.get(symbol, {})
         highs = rango.get('highs', [])
         lows = rango.get('lows', [])
@@ -839,9 +905,7 @@ class SignalGenerator:
             recent_low = min(lows)
             rango_size = recent_high - recent_low
 
-            # Si el precio rompe el rango reciente → pre-expansión detectada
             if price > recent_high + rango_size * 0.01 or price < recent_low - rango_size * 0.01:
-                # Bajamos temporalmente el umbral para capturar el movimiento
                 score_min_pre_exp = max(CONFIG.score_min_expansion, score_min - 10)
                 print(f"  📊 {symbol} PRE-EXPANSIÓN detectada | Umbral: {score_min} → {score_min_pre_exp}")
                 return score_min_pre_exp
@@ -859,11 +923,10 @@ class SignalGenerator:
             return
         if not state.filtro_macro_aprobado or not state.direccion_filtro:
             return
-        # FASE 5.3: Umbral dinámico vía ATR(15m)
+
         score_min_dinamico = self._calcular_umbral_dinamico(symbol)
         if state.score_macro_actual < score_min_dinamico:
             return
-        # V4.2: No disparar si pausada
         if state.moneda_pausada or state.moneda_pausada_manual:
             return
 
@@ -918,7 +981,7 @@ class SignalGenerator:
     # FASE 3: PROCESAR DISPARO CON GRID BLINDADO
     # ================================================================
     async def _procesar_disparo(self, symbol: str, direction: str, price: float, i1m: dict, i15: dict):
-        """Procesa un disparo validado: calcula grid blindado, verifica rentabilidad, emite alerta."""
+        """Procesa un disparo validado."""
         state = self.states[symbol]
         i4h = self.indicadores_4h.get(symbol, {})
         atr_15m = i15.get('atr', price * 0.001)
@@ -956,7 +1019,6 @@ class SignalGenerator:
         state.ultimo_score = score
         state.ultimos_params = params
 
-        # FASE 5.3: Log del umbral dinámico usado
         score_min_usado = self._calcular_umbral_dinamico(symbol)
         umbral_info = f" | Umbral: {score_min_usado}" if score_min_usado != self.SCORE_DISPARO_MIN else ""
 
@@ -994,7 +1056,6 @@ class SignalGenerator:
                 'volume_sma20': i15.get('volume_sma20'),
                 'recent_high': i15.get('recent_high'),
                 'recent_low': i15.get('recent_low'),
-                # FASE 5.2: Incluir MFM en contexto de auditoría
                 'mfm_15m': i15.get('mfm_15m'),
                 'mfm_sma5': i15.get('mfm_sma5')
             }

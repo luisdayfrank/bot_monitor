@@ -15,17 +15,16 @@ from database_v5 import (
 
 class AuditLogger:
     """
-    Logger de auditoría para modo auditoría externa.
+    Logger de auditoría para modo auditoría externa — V5.5.
 
     Responsabilidad: SOLO guardar eventos en SQLite.
     NO evalúa, NO simula, NO toma decisiones.
 
-    FASE 5.1 MEJORAS:
+    FASE 5.5 CAMBIOS:
     ─────────────────
-    • FIX: grid_rentable_aqui ahora respeta la dirección del disparo
-    • FIX: asyncio.Lock sobre _disparos_activos evita race conditions
-    • NUEVO: Persistencia en SQLite para sobrevivir reinicios
-    • NUEVO: Recuperación automática de disparos activos al iniciar
+    • NUEVO: log_snapshot() para auditoría granular periódica
+    • Los snapshots NO afectan el resumen diario (son informativos)
+    • Versión actualizada a 5.5
     """
 
     def __init__(self):
@@ -34,18 +33,14 @@ class AuditLogger:
         self._flush_interval = 60  # Flush cada 60 segundos
         self._shutdown = asyncio.Event()
 
-        # ═══════════════════════════════════════════════════════════════════════════════
-        # FASE 5.1: Lock para _disparos_activos (evita race conditions entre
-        # el loop de trackeo de precios y el flush del buffer)
-        # ═══════════════════════════════════════════════════════════════════════════════
+        # FASE 5.1: Lock para _disparos_activos
         self._disparos_lock = asyncio.Lock()
 
         # Tracking de disparos activos para seguimiento post-FIRE
-        self._disparos_activos: Dict[str, dict] = {}  # symbol -> {evento_id, timestamp, precio_entrada, grid_params}
+        self._disparos_activos: Dict[str, dict] = {}
 
     async def run(self):
         """Loop de flush periódico del buffer."""
-        # FASE 5.1: Recuperar disparos activos persistentes al iniciar
         await self._recuperar_disparos_activos()
 
         while not self._shutdown.is_set():
@@ -55,7 +50,6 @@ class AuditLogger:
     async def stop(self):
         self._shutdown.set()
         await self._flush_buffer()
-        # FASE 5.1: Persistir disparos activos antes de detener
         await self._persistir_disparos_activos()
 
     async def _flush_buffer(self):
@@ -74,7 +68,6 @@ class AuditLogger:
                 if evento.get('tipo') == 'FIRE' and evento_id:
                     symbol = evento['symbol']
                     ts_str = evento['timestamp_utc']
-                    # Asegurar que el timestamp sea timezone-aware
                     if isinstance(ts_str, str):
                         ts = datetime.fromisoformat(ts_str)
                         if ts.tzinfo is None:
@@ -82,7 +75,6 @@ class AuditLogger:
                     else:
                         ts = ts_str
 
-                    # FASE 5.1: Usar lock al modificar _disparos_activos
                     async with self._disparos_lock:
                         self._disparos_activos[symbol] = {
                             'evento_id': evento_id,
@@ -97,18 +89,17 @@ class AuditLogger:
                             'primera_vez_fuera_rango': None
                         }
 
-                    # FASE 5.1: Persistir inmediatamente en DB
                     await self._persistir_disparo_individual(symbol)
 
             except Exception as e:
                 print(f"  ⚠️ Error guardando evento auditoría: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════════════
-    # FASE 5.1: PERSISTENCIA DE DISPAROS ACTIVOS
+    # FASE 5.1: PERSISTENCIA DE DISPAROS ACTIVOS (sin cambios)
     # ═══════════════════════════════════════════════════════════════════════════════
 
     async def _persistir_disparos_activos(self):
-        """Persiste TODOS los disparos activos en SQLite (llamado al detener)."""
+        """Persiste TODOS los disparos activos en SQLite."""
         async with self._disparos_lock:
             for symbol, disparo in self._disparos_activos.items():
                 await self._persistir_disparo_individual(symbol, disparo)
@@ -180,7 +171,7 @@ class AuditLogger:
             print(f"  ⚠️ Error recuperando disparos activos: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════════════
-    # MÉTODOS PÚBLICOS: Hooks para signals_v4.py
+    # MÉTODOS PÚBLICOS: Hooks para signals_v55.py
     # ═══════════════════════════════════════════════════════════════════════════════
 
     async def log_cambio_estado(self, symbol: str, de: str, a: str, direccion: str = None,
@@ -208,6 +199,39 @@ class AuditLogger:
         async with self._buffer_lock:
             self._buffer_eventos.append(evento)
 
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 5.5: NUEVO — log_snapshot para auditoría granular periódica
+    # ═══════════════════════════════════════════════════════════════════════════════
+    async def log_snapshot(self, symbol: str, estado: str, score_macro: int,
+                           direccion: str = None, contexto: dict = None):
+        """
+        Registra un snapshot periódico del estado (cada 4h).
+
+        Los snapshots NO son cambios de estado, son fotos del estado actual
+        para ver la evolución del score durante el día.
+        """
+        if not CONFIG.modo_auditoria:
+            return
+
+        timestamp_utc = now_utc()
+        contexto_json = json.dumps(contexto) if contexto else None
+
+        evento = {
+            'symbol': symbol,
+            'timestamp_utc': timestamp_utc,
+            'tipo': 'SNAPSHOT',
+            'direccion': direccion,
+            'precio': contexto.get('precio') if contexto else None,
+            'contexto_json': contexto_json,
+            'grid_params_json': None,
+            'score': score_macro,
+            'rechazos_json': None,
+            'estado_maquina': estado
+        }
+
+        async with self._buffer_lock:
+            self._buffer_eventos.append(evento)
+
     async def log_fire(self, symbol: str, direccion: str, precio: float,
                        contexto_1m: dict, contexto_15m: dict, contexto_4h: dict,
                        grid_params: dict, score_disparo: int):
@@ -217,7 +241,6 @@ class AuditLogger:
 
         timestamp_utc = now_utc()
 
-        # Combinar contextos
         contexto_completo = {
             'timestamp_utc': timestamp_utc.isoformat(),
             'timestamp_local': utc_to_local(timestamp_utc).isoformat(),
@@ -299,25 +322,18 @@ class AuditLogger:
             self._buffer_eventos.append(evento)
 
     # ═══════════════════════════════════════════════════════════════════════════════
-    # SEGUIMIENTO POST-DISPARO
+    # SEGUIMIENTO POST-DISPARO (sin cambios respecto a v5.1)
     # ═══════════════════════════════════════════════════════════════════════════════
 
     async def trackear_precio_post_disparo(self, symbol: str, precio: float, timestamp_utc: datetime):
-        """
-        Llamado en cada tick de precio para monitorear disparos activos.
-        Guarda muestras cada N minutos y detecta eventos significativos.
-
-        FASE 5.1 FIX: grid_rentable_aqui ahora respeta la dirección del disparo.
-        """
+        """Llamado en cada tick de precio para monitorear disparos activos."""
         if not CONFIG.modo_auditoria:
             return
 
-        # FASE 5.1: Usar lock al acceder a _disparos_activos
         async with self._disparos_lock:
             if symbol not in self._disparos_activos:
                 return
 
-            # Asegurar que el timestamp sea timezone-aware
             if timestamp_utc.tzinfo is None:
                 timestamp_utc = timestamp_utc.replace(tzinfo=pytz.UTC)
 
@@ -327,31 +343,17 @@ class AuditLogger:
             direccion = disparo['direccion']
             grid_params = disparo['grid_params']
 
-            # Calcular minutos desde el disparo
             minutos_desde = int((timestamp_utc - disparo['timestamp_utc']).total_seconds() / 60)
 
-            # Actualizar máximo y mínimo vistos
             if precio > disparo['maximo_visto']:
                 disparo['maximo_visto'] = precio
             if precio < disparo['minimo_visto']:
                 disparo['minimo_visto'] = precio
 
-            # Detectar eventos significativos
             if grid_params:
                 upper = grid_params.get('upper_limit')
                 lower = grid_params.get('lower_limit')
 
-                # ═══════════════════════════════════════════════════════════════════
-                # FASE 5.1 FIX: grid_rentable_aqui ahora respeta la dirección
-                # ANTES: grid_rentable_aqui = True siempre que estuviera en rango
-                # AHORA: 
-                #   - SHORT: rentable si precio <= upper (estamos SHORT, queremos que baje)
-                #   - LONG: rentable si precio >= lower (estamos LONG, queremos que suba)
-                #   NOTA: Un grid es rentable cuando el precio toca una línea del grid
-                #   en dirección favorable. Para SHORT, bajar = favorable. Para LONG, subir = favorable.
-                # ═══════════════════════════════════════════════════════════════════
-
-                # Primera vez dentro del grid
                 if disparo['primera_vez_en_grid'] is None and lower and upper:
                     if lower <= precio <= upper:
                         disparo['primera_vez_en_grid'] = {
@@ -360,15 +362,12 @@ class AuditLogger:
                             'minutos_desde': minutos_desde
                         }
 
-                        # FASE 5.1 FIX: Determinar si es rentable según dirección
                         if direccion == 'SHORT':
-                            # En SHORT, entrar en grid por debajo del precio de entrada es favorable
                             grid_rentable = precio <= precio_entrada
                         elif direccion == 'LONG':
-                            # En LONG, entrar en grid por encima del precio de entrada es favorable
                             grid_rentable = precio >= precio_entrada
                         else:
-                            grid_rentable = True  # Fallback
+                            grid_rentable = True
 
                         await guardar_evento_post(
                             evento_id, symbol, timestamp_utc, 'PRIMERA_VEZ_EN_GRID',
@@ -378,13 +377,11 @@ class AuditLogger:
                             nota=f"Precio entra en rango del grid [{lower}, {upper}] | Rentable para {direccion}: {grid_rentable}"
                         )
 
-                        # FASE 5.1: Persistir actualización
                         await actualizar_disparo_activo(
                             evento_id,
                             primera_vez_en_grid_json=json.dumps(disparo['primera_vez_en_grid'])
                         )
 
-                # Primera vez fuera del grid
                 if disparo['primera_vez_fuera_rango'] is None and lower and upper:
                     if precio > upper or precio < lower:
                         direccion_fuera = 'UPPER' if precio > upper else 'LOWER'
@@ -395,13 +392,9 @@ class AuditLogger:
                             'direccion': direccion_fuera
                         }
 
-                        # FASE 5.1 FIX: Fuera del grid = NO rentable (se rompió el rango)
-                        # PERO: si rompe en dirección favorable, podría ser bueno para trailing
                         if direccion == 'SHORT' and precio < lower:
-                            # Rompió hacia abajo en SHORT = muy favorable
                             nota_extra = " | RUPTURA FAVORABLE SHORT"
                         elif direccion == 'LONG' and precio > upper:
-                            # Rompió hacia arriba en LONG = muy favorable
                             nota_extra = " | RUPTURA FAVORABLE LONG"
                         else:
                             nota_extra = " | RUPTURA DESFAVORABLE"
@@ -414,24 +407,20 @@ class AuditLogger:
                             nota=f"Precio rompe {direccion_fuera} del grid [{lower}, {upper}]" + nota_extra
                         )
 
-                        # FASE 5.1: Persistir actualización
                         await actualizar_disparo_activo(
                             evento_id,
                             primera_vez_fuera_rango_json=json.dumps(disparo['primera_vez_fuera_rango'])
                         )
 
-            # Guardar muestra cada N minutos (solo primeras X horas)
             horas_seguimiento = CONFIG.auditoria_horas_seguimiento
             intervalo = CONFIG.auditoria_muestras_intervalo_min
 
             if minutos_desde <= horas_seguimiento * 60:
-                # Verificar si ya guardamos una muestra en este intervalo
                 intervalo_actual = minutos_desde // intervalo
                 if intervalo_actual > disparo['muestras_guardadas']:
                     await guardar_muestra_post(evento_id, symbol, timestamp_utc, precio, minutos_desde)
                     disparo['muestras_guardadas'] = intervalo_actual
 
-                    # FASE 5.1: Persistir actualización de muestras
                     await actualizar_disparo_activo(
                         evento_id,
                         maximo_visto=disparo['maximo_visto'],
@@ -439,31 +428,23 @@ class AuditLogger:
                         muestras_guardadas=disparo['muestras_guardadas']
                     )
 
-            # Verificar si debemos dejar de trackear (después de X horas)
             if minutos_desde > horas_seguimiento * 60:
-                # Guardar eventos finales: máximo y mínimo absolutos
                 await self._guardar_eventos_finales(symbol, disparo, timestamp_utc)
-
-                # FASE 5.1: Eliminar de DB persistente
                 await eliminar_disparo_activo(evento_id)
-
                 del self._disparos_activos[symbol]
 
     async def _guardar_eventos_finales(self, symbol: str, disparo: dict, timestamp_utc: datetime):
-        """Guarda los eventos finales de un disparo (máximo y mínimo absolutos)."""
+        """Guarda los eventos finales de un disparo."""
         evento_id = disparo['evento_id']
         precio_entrada = disparo['precio_entrada']
         direccion = disparo['direccion']
 
-        # Máximo absoluto
         if disparo['maximo_visto'] > precio_entrada:
-            # FASE 5.1 FIX: Para SHORT, máximo > entrada = drawdown (malo)
-            # Para LONG, máximo > entrada = runup (bueno)
             if direccion == 'SHORT':
-                grid_rentable = False  # Drawdown para SHORT
+                grid_rentable = False
                 nota = "Máximo precio alcanzado durante seguimiento | DRAWDOWN para SHORT"
             else:
-                grid_rentable = True   # Runup para LONG
+                grid_rentable = True
                 nota = "Máximo precio alcanzado durante seguimiento | RUNUP para LONG"
 
             await guardar_evento_post(
@@ -474,15 +455,12 @@ class AuditLogger:
                 nota=nota
             )
 
-        # Mínimo absoluto
         if disparo['minimo_visto'] < precio_entrada:
-            # FASE 5.1 FIX: Para SHORT, mínimo < entrada = runup (bueno)
-            # Para LONG, mínimo < entrada = drawdown (malo)
             if direccion == 'SHORT':
-                grid_rentable = True   # Runup para SHORT
+                grid_rentable = True
                 nota = "Mínimo precio alcanzado durante seguimiento | RUNUP para SHORT"
             else:
-                grid_rentable = False  # Drawdown para LONG
+                grid_rentable = False
                 nota = "Mínimo precio alcanzado durante seguimiento | DRAWDOWN para LONG"
 
             await guardar_evento_post(
@@ -493,12 +471,10 @@ class AuditLogger:
                 nota=nota
             )
 
-        # FASE 5.1: Eliminar de DB persistente
         await eliminar_disparo_activo(evento_id)
 
     async def cerrar_seguimiento_todos(self):
-        """Cierra todos los seguimientos activos (útil al final del día)."""
-        # FASE 5.1: Usar lock
+        """Cierra todos los seguimientos activos."""
         async with self._disparos_lock:
             disparos_copia = list(self._disparos_activos.items())
 
