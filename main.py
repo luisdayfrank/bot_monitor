@@ -248,7 +248,7 @@ async def lifespan(fastapi_app):
 app.router.lifespan_context = lifespan
 
 if __name__ == "__main__":
-    print("🚀 Iniciando Crypto Monitor V5.2 — Multi-Timeframe Sniper Dashboard + MFM...")
+    print("🚀 Iniciando Crypto Monitor V5.4 — Multi-Timeframe Sniper Dashboard + MFM...")
     if CONFIG.modo_auditoria:
         print(f"📋 MODO AUDITORÍA: Reportes a las {CONFIG.auditoria_hora_reporte} {CONFIG.timezone}")
         print(f"📊 MODO MFM: Volumen inteligente con Money Flow Multiplier")
