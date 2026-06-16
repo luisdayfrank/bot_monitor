@@ -43,6 +43,9 @@ async def lifespan(fastapi_app):
         signals.audit_logger = audit_logger
         print(f"📋 Modo auditoría ACTIVADO ({CONFIG.timezone})")
         print(f"   Reporte diario: {CONFIG.auditoria_hora_reporte} {CONFIG.timezone}")
+        # FASE 5.2: Notificar que MFM está activo
+        print(f"   📊 MFM (Money Flow Multiplier) ACTIVADO en filtro macro")
+        print(f"   Umbral alineación: ±{CONFIG.mfm_umbral_alineacion}")
     else:
         print("📋 Modo auditoría DESACTIVADO")
 
@@ -123,7 +126,7 @@ async def lifespan(fastapi_app):
     await asyncio.sleep(2)
     await notifier.notificar_online(
         symbols=CONFIG.symbols,
-        uptime_start=datetime.utcnow().timestamp()
+        uptime_start=datetime.now(pytz.UTC).timestamp()
     )
     await notifier.notificar_resumen(
         estados=signals.states,
@@ -179,7 +182,7 @@ async def lifespan(fastapi_app):
                         monedas_pausadas_auto += 1
                     elif st.score_bajo_desde:
                         mins_bajo = (int(datetime.now(pytz.UTC).timestamp()) - st.score_bajo_desde) // 60
-                        pausa_info = f' [bajo:{mins_bajo}min→pausa en {max(0, 30-mins_bajo)}min]'
+                        pausa_info = f' [bajo:{mins_bajo}min→pausa en {max(0, int(CONFIG.pausa_inactividad_horas*60)-mins_bajo)}min]'
 
                     armed_age = ''
                     if st.estado == 'ARMED' and st.armed_timestamp > 0:
@@ -245,7 +248,8 @@ async def lifespan(fastapi_app):
 app.router.lifespan_context = lifespan
 
 if __name__ == "__main__":
-    print("🚀 Iniciando Crypto Monitor V5.1 — Multi-Timeframe Sniper Dashboard...")
+    print("🚀 Iniciando Crypto Monitor V5.2 — Multi-Timeframe Sniper Dashboard + MFM...")
     if CONFIG.modo_auditoria:
         print(f"📋 MODO AUDITORÍA: Reportes a las {CONFIG.auditoria_hora_reporte} {CONFIG.timezone}")
+        print(f"📊 MODO MFM: Volumen inteligente con Money Flow Multiplier")
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
