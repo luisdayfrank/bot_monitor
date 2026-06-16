@@ -9,15 +9,23 @@ from config import CONFIG
 
 class IndicatorEngineV3:
     """
-    Motor de indicadores V3.1 — Multi-Timeframe Sniper Optimizado.
+    Motor de indicadores V3.2 — Multi-Timeframe Sniper Optimizado + MFM.
 
-    MEJORAS CLAVE vs V3:
+    MEJORAS CLAVE vs V3.1:
     ─────────────────────
     1. EMA50 de 15m añadido para dirección intradía (fix análisis cruzado).
     2. EMA_300 incremental: ~0.1ms por símbolo (vs ~50ms recalculando pandas_ta).
     3. RSI(7) incremental: ~0.05ms por símbolo (vs ~20ms recalculando pandas_ta).
     4. ATR(14) en 1m: contexto de significancia para mechas de gatillo.
     5. Validación de mecha mejorada: flags de rechazo confirmado vs EMA_300.
+
+    FASE 5.2 NUEVO:
+    ───────────────
+    6. MFM (Money Flow Multiplier) en 15m: detecta presión de volumen real.
+       mfm = ((close - low) - (high - close)) / (high - low)  # rango [-1, +1]
+       mfm > 0.2  → presión compradora (volumen en parte alta de la vela)
+       mfm < -0.2 → presión vendedora (volumen en parte baja de la vela)
+    7. mfm_sma5: suavizado de MFM para reducir ruido.
 
     FASE 1 — ESTABILIDAD:
     ─────────────────────
@@ -56,7 +64,7 @@ class IndicatorEngineV3:
     # PRECÁLCULO (Cold Start)
     # ================================================================
     async def precalcular(self):
-        print("📊 Precalculando indicadores V3.1 (con EMA50 15m)...")
+        print("📊 Precalculando indicadores V3.2 (con EMA50 15m + MFM)...")
 
         for symbol, df in self.buffers_1m.items():
             n = len(df)
@@ -77,10 +85,11 @@ class IndicatorEngineV3:
                 result = self.calcular_15m(symbol)
                 if result:
                     await self.queue_out.put(('15m', symbol, result))
+                    mfm_str = f" MFM={result.get('mfm_15m', 'N/A'):.3f}" if result.get('mfm_15m') is not None else ""
                     print(f"  ✅ {symbol} 15M precalculado | "
                           f"RSI={result.get('rsi', 'N/A'):.1f} "
                           f"ADX={result.get('adx', 'N/A'):.1f} "
-                          f"EMA50={result.get('ema50_15m', 'N/A'):.4f}")
+                          f"EMA50={result.get('ema50_15m', 'N/A'):.4f}{mfm_str}")
             else:
                 print(f"  ⚠️ {symbol} 15M: solo {len(df)} velas, esperando más...")
 
@@ -93,7 +102,7 @@ class IndicatorEngineV3:
             else:
                 print(f"  ⚠️ {symbol} 4H: solo {len(df)} velas, esperando más...")
 
-        print("📊 Precálculo V3.1 completado. Estado incremental listo.")
+        print("📊 Precálculo V3.2 completado. Estado incremental listo.")
 
     def _init_estado_1m(self, symbol: str, df: pd.DataFrame):
         df = df.copy()
@@ -309,10 +318,10 @@ class IndicatorEngineV3:
         }
 
     # ================================================================
-    # CAPA MACRO: calcular_15m (EMA50 añadido)
+    # CAPA MACRO: calcular_15m (EMA50 añadido + MFM)
     # ================================================================
     def calcular_15m(self, symbol: str) -> dict:
-        """Filtro Macro: RSI(14), ADX(14), MACD, ATR, EMAs, volumen, recent_high/low"""
+        """Filtro Macro: RSI(14), ADX(14), MACD, ATR, EMAs, volumen, MFM, recent_high/low"""
         df = self.buffers_15m[symbol].copy()
         if len(df) < 50:
             return None
@@ -335,6 +344,39 @@ class IndicatorEngineV3:
         recent_high = float(df['high'].tail(50).max())
         recent_low = float(df['low'].tail(50).min())
 
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # FASE 5.2: MFM (Money Flow Multiplier)
+        # Fórmula: mfm = ((close - low) - (high - close)) / (high - low)
+        # Interpretación:
+        #   mfm = +1  → close == high (volumen 100% comprador)
+        #   mfm = -1  → close == low  (volumen 100% vendedor)
+        #   mfm = 0   → close == mid  (volumen neutro)
+        # ═══════════════════════════════════════════════════════════════════════════════
+        high_val = float(last['high'])
+        low_val = float(last['low'])
+        close_val = float(last['close'])
+
+        rango = high_val - low_val
+        if rango > 0:
+            mfm_15m = ((close_val - low_val) - (high_val - close_val)) / rango
+        else:
+            mfm_15m = 0.0  # Vela doji sin rango
+
+        # MFM suavizado (SMA de últimas 5 velas)
+        if len(df) >= 5:
+            mfm_series = []
+            for i in range(-5, 0):
+                row = df.iloc[i]
+                h, l, c = float(row['high']), float(row['low']), float(row['close'])
+                r = h - l
+                if r > 0:
+                    mfm_series.append(((c - l) - (h - c)) / r)
+                else:
+                    mfm_series.append(0.0)
+            mfm_sma5 = np.mean(mfm_series)
+        else:
+            mfm_sma5 = mfm_15m
+
         return {
             'timestamp': int(last['timestamp']),
             'close': float(last['close']),
@@ -344,7 +386,7 @@ class IndicatorEngineV3:
             'adx': float(last['ADX_14']) if not pd.isna(last['ADX_14']) else None,
             'atr': float(last['ATRr_14']) if not pd.isna(last['ATRr_14']) else None,
             'ema200_15m': float(last['EMA_200']) if not pd.isna(last['EMA_200']) else None,
-            'ema50_15m': float(last['EMA_50']) if not pd.isna(last.get('EMA_50')) else None,  # ← NUEVO
+            'ema50_15m': float(last['EMA_50']) if not pd.isna(last.get('EMA_50')) else None,
             'volume': float(last['volume']),
             'volume_sma20': float(df['volume'].tail(20).mean()),
             'recent_high': recent_high,
@@ -354,6 +396,9 @@ class IndicatorEngineV3:
             'ema25_15m': float(last['EMA_25']) if not pd.isna(last.get('EMA_25')) else None,
             'ema7_15m_prev': float(prev['EMA_7']) if not pd.isna(prev.get('EMA_7')) else None,
             'ema25_15m_prev': float(prev['EMA_25']) if not pd.isna(prev.get('EMA_25')) else None,
+            # FASE 5.2: Nuevos campos MFM
+            'mfm_15m': round(mfm_15m, 4),
+            'mfm_sma5': round(mfm_sma5, 4),
         }
 
     # ================================================================

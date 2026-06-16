@@ -18,6 +18,8 @@ class AuditReporter:
     Se ejecuta una vez al día (hora configurada en config.py),
     genera un JSON por moneda con todos los eventos y seguimiento,
     y lo envía como archivo adjunto por Telegram.
+
+    FASE 5.2: Incluye análisis de MFM en reportes.
     """
 
     def __init__(self, notifier):
@@ -237,7 +239,7 @@ class AuditReporter:
                 "symbol": symbol,
                 "fecha": fecha,
                 "modo": "auditoria_externa",
-                "version_bot": "5.1",
+                "version_bot": "5.2",
                 "timezone": CONFIG.timezone,
                 "hora_generacion": now_local().isoformat(),
                 "total_eventos": len(eventos)
@@ -325,8 +327,19 @@ class AuditReporter:
                 correcto = variacion > 0
                 direccion_str = "subió"
 
+            # FASE 5.2: Extraer MFM del contexto si existe
+            mfm_info = ""
+            try:
+                ctx = json.loads(ev.get('contexto_json', '{}'))
+                ctx_15m = ctx.get('contexto_15m', {})
+                mfm = ctx_15m.get('mfm_sma5')
+                if mfm is not None:
+                    mfm_info = f" | MFM={mfm:.3f}"
+            except:
+                pass
+
             pregunta = {
-                "disparo": f"{ts} {direccion} @ ${precio} (score: {score})",
+                "disparo": f"{ts} {direccion} @ ${precio} (score: {score}){mfm_info}",
                 "pregunta": f"¿El FIRE {direccion} fue correcto?",
                 "datos": f"Precio {direccion_str} {variacion:.2f}% en {CONFIG.auditoria_horas_seguimiento}h. "
                         f"Máximo drawdown: {max_dd:.2f}%. Máximo runup: {max_run:.2f}%.",
@@ -344,8 +357,12 @@ class AuditReporter:
                 except:
                     pass
 
+            # FASE 5.2: Destacar rechazos por MFM contradictorio
+            mfm_rechazo = any('MFM contradictorio' in r for r in rechazos)
+            nota_extra = " | ⚠️ Rechazado por MFM contradictorio" if mfm_rechazo else ""
+
             pregunta = {
-                "disparo": f"{ev['timestamp_utc']} {ev['direccion']} @ ${ev['precio']}",
+                "disparo": f"{ev['timestamp_utc']} {ev['direccion']} @ ${ev['precio']}{nota_extra}",
                 "pregunta": "¿Este rechazo fue correcto?",
                 "datos": f"Motivo: {'; '.join(rechazos) if rechazos else 'Sin motivo registrado'}",
                 "analisis_sugerido": "Verificar si el precio se movió favorablemente después",
@@ -361,6 +378,7 @@ class AuditReporter:
 
         # Analizar rechazos frecuentes
         rechazos_frecuentes = {}
+        mfm_contradictorios = 0
         for ev in eventos:
             if ev['tipo'] == 'RECHAZADO' and ev.get('rechazos_json'):
                 try:
@@ -369,6 +387,8 @@ class AuditReporter:
                         # Extraer tipo de rechazo (ej: "ADX extremo: 46.2" -> "ADX extremo")
                         tipo_rechazo = r.split(':')[0] if ':' in r else r
                         rechazos_frecuentes[tipo_rechazo] = rechazos_frecuentes.get(tipo_rechazo, 0) + 1
+                        if 'MFM contradictorio' in r:
+                            mfm_contradictorios += 1
                 except:
                     pass
 
@@ -391,6 +411,16 @@ class AuditReporter:
                 "sugerido": max(0.05, CONFIG.atr_min_pct - 0.05),
                 "motivo": f"{rechazos_frecuentes['ATR bajo']} rechazos por ATR bajo. "
                           "Considerar reducir el umbral mínimo."
+            })
+
+        # FASE 5.2: Si hay muchos rechazos por MFM contradictorio
+        if mfm_contradictorios >= 3:
+            recomendaciones.append({
+                "parametro": "mfm_umbral_alineacion",
+                "actual": CONFIG.mfm_umbral_alineacion,
+                "sugerido": max(0.1, CONFIG.mfm_umbral_alineacion - 0.05),
+                "motivo": f"{mfm_contradictorios} rechazos por MFM contradictorio. "
+                          "Considerar relajar el umbral de alineación (más permisivo)."
             })
 
         # Analizar si los FIREs tuvieron drawdowns excesivos
@@ -418,6 +448,18 @@ class AuditReporter:
         total_fire = sum(len([e for e in evs if e['tipo'] == 'FIRE']) for evs in eventos_por_moneda.values())
         total_rechazos = sum(len([e for e in evs if e['tipo'] == 'RECHAZADO']) for evs in eventos_por_moneda.values())
 
+        # FASE 5.2: Contar rechazos por MFM
+        mfm_rechazos = 0
+        for evs in eventos_por_moneda.values():
+            for ev in evs:
+                if ev['tipo'] == 'RECHAZADO' and ev.get('rechazos_json'):
+                    try:
+                        rechazos = json.loads(ev['rechazos_json'])
+                        if any('MFM contradictorio' in r for r in rechazos):
+                            mfm_rechazos += 1
+                    except:
+                        pass
+
         lineas = [
             f"📋 <b>AUDITORÍA DIARIA — {fecha}</b>",
             f"🕐 Generado: {now_local().strftime('%H:%M:%S')} ({CONFIG.timezone})",
@@ -425,10 +467,16 @@ class AuditReporter:
             f"📊 Total eventos: {total_eventos}",
             f"🔥 Disparos: {total_fire}",
             f"❌ Rechazados: {total_rechazos}",
+        ]
+
+        if mfm_rechazos > 0:
+            lineas.append(f"📉 Rechazos MFM: {mfm_rechazos}")
+
+        lineas.extend([
             f"📁 Archivos adjuntos: {len(eventos_por_moneda)} monedas",
             "",
             "<b>Monedas con actividad:</b>"
-        ]
+        ])
 
         for symbol, eventos in sorted(eventos_por_moneda.items()):
             fires = len([e for e in eventos if e['tipo'] == 'FIRE'])

@@ -4,10 +4,11 @@ import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple, Set
 from config import CONFIG
+import pytz
 
 
 class SignalState:
-    """Estado de la máquina de estados por símbolo — V4.2 Correcciones Pausa."""
+    """Estado de la máquina de estados por símbolo — V5.2 MFM + Correcciones."""
     def __init__(self):
         self.estado = 'MONITOREO'
         self.velas_confirmacion = 0
@@ -53,19 +54,35 @@ class SignalState:
         self.moneda_pausada_razon = None      # Razón de la última pausa automática
         self.moneda_pausada_timestamp = 0     # Cuándo se pausó automáticamente
 
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # FASE 5.4: COMMITMENT SCORE (historial de 1m para confirmación real)
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # Buffer de últimas 2 velas 1m para evaluar commitment
+        self.commitment_historial_1m: list = []  # [{rsi_7, ema300_dist, close, timestamp}, ...]
+        self.commitment_score_actual: int = 0    # 0-100, score de commitment
+        self.commitment_velas_requeridas: int = 2  # Velas consecutivas alineadas requeridas
+
 
 class SignalGenerator:
     """
-    Generador de señales V4.2 — Correcciones Pausa Manual/Automática.
+    Generador de señales V5.2 — MFM + Correcciones Pausa Manual/Automática.
 
     CORRECCIONES APLICADAS:
     ────────────────────────
     1. FIX: Despausa automática ahora funciona correctamente (bug #4)
     2. NUEVO: Pausa manual por comando Telegram (/pause, /resume)
     3. NUEVO: Persistencia de pausa manual en SignalState
-    4. FIX: PAUSA_INACTIVIDAD_HORAS aumentado a 0.5h (30 min) para menos churn
+    4. FIX: PAUSA_INACTIVIDAD_HORAS movido a config.py
     5. NUEVO: Diferenciación clara entre pausa automática y manual en logs
     6. NUEVO: Comandos /pause, /resume, /pause_all, /resume_all, /list_paused
+
+    FASE 5.2 NUEVO:
+    ────────────────
+    7. MFM (Money Flow Multiplier) integrado en filtro macro.
+       El bonus de volumen ahora depende de que el MFM esté alineado
+       con la dirección operativa. Volumen contradictorio = penalización.
+    8. Nuevo rechazo: "MFM contradictorio" cuando volumen presiona
+       en dirección opuesta al setup.
     """
 
     def __init__(self, queue_in: asyncio.Queue, queue_out: asyncio.Queue):
@@ -80,6 +97,17 @@ class SignalGenerator:
         # FASE 3: ATR histórico por símbolo para percentil 95
         self._atr_historico: Dict[str, list] = {s: [] for s in CONFIG.symbols}
 
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # FASE 5.3: BUFFER HISTÓRICO DE ATR(15m) PARA UMBRAL DINÁMICO
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # Ventana de velas 15m para calcular percentiles del ATR
+        self._atr15m_historico: Dict[str, list] = {s: [] for s in CONFIG.symbols}
+        # Rango reciente (high/low de últimas N velas) para detectar rupturas
+        self._rango_reciente: Dict[str, dict] = {s: {'highs': [], 'lows': []} for s in CONFIG.symbols}
+
+        # FASE 5.4: BUFFER DE HISTORIAL 1M PARA COMMITMENT SCORE
+        self._historial_1m: Dict[str, list] = {s: [] for s in CONFIG.symbols}
+
         # FASE 4.5: AuditLogger (inyectado desde main.py)
         self.audit_logger = None
 
@@ -87,9 +115,10 @@ class SignalGenerator:
     # CONSTANTES DE CORRECCIÓN
     # ================================================================
     ARMED_TIMEOUT_MIN = 30
-    SCORE_MANTENIMIENTO_ARMED = 50
     SCORE_DISPARO_MIN = 70
-    PAUSA_INACTIVIDAD_HORAS = 1    # ← FIX #5: 30 minutos en vez de 3 minutos
+    SCORE_MANTENIMIENTO_ARMED = 50
+    # FASE 5.1: PAUSA_INACTIVIDAD_HORAS ahora viene de config.py
+    # self.PAUSA_INACTIVIDAD_HORAS → CONFIG.pausa_inactividad_horas
     ADX_RECHAZO_MIN = 20
 
     # ================================================================
@@ -107,7 +136,7 @@ class SignalGenerator:
         state.moneda_pausada_manual = True
         state.moneda_pausada = True  # También marca como pausada automática para consistencia
         state.moneda_pausada_razon = razon
-        state.moneda_pausada_timestamp = int(datetime.utcnow().timestamp())
+        state.moneda_pausada_timestamp = int(datetime.now(pytz.UTC).timestamp())
 
         # Resetear estado de la máquina
         state.estado = 'MONITOREO'
@@ -178,6 +207,10 @@ class SignalGenerator:
 
             if tf == '1m':
                 self.indicadores_1m[symbol] = data
+
+                # FASE 5.4: Alimentar historial de 1m para commitment score
+                self._alimentar_historial_1m(symbol, data)
+
                 await self._actualizar_estado_maquina(symbol)
                 if self.states[symbol].estado == 'ARMED':
                     await self.evaluar_gatillo(symbol)
@@ -189,16 +222,30 @@ class SignalGenerator:
                     self._atr_historico[symbol].append(atr_val)
                     if len(self._atr_historico[symbol]) > 500:
                         self._atr_historico[symbol] = self._atr_historico[symbol][-500:]
+
+                    # FASE 5.3: Alimentar buffer de ATR(15m) para umbral dinámico
+                    self._atr15m_historico[symbol].append(atr_val)
+                    if len(self._atr15m_historico[symbol]) > CONFIG.atr_percentil_ventana:
+                        self._atr15m_historico[symbol] = self._atr15m_historico[symbol][-CONFIG.atr_percentil_ventana:]
+
+                # FASE 5.3: Actualizar rango reciente (highs/lows de últimas 20 velas)
+                if data.get('high') and data.get('low'):
+                    self._rango_reciente[symbol]['highs'].append(data['high'])
+                    self._rango_reciente[symbol]['lows'].append(data['low'])
+                    if len(self._rango_reciente[symbol]['highs']) > 20:
+                        self._rango_reciente[symbol]['highs'] = self._rango_reciente[symbol]['highs'][-20:]
+                        self._rango_reciente[symbol]['lows'] = self._rango_reciente[symbol]['lows'][-20:]
+
                 await self.evaluar_filtro_macro(symbol)
 
             elif tf == '4h':
                 self.indicadores_4h[symbol] = data
 
     # ================================================================
-    # CAPA 1: FILTRO MACRO (evalúa cada 15m)
+    # CAPA 1: FILTRO MACRO (evalúa cada 15m) — FASE 5.2 MFM
     # ================================================================
     async def evaluar_filtro_macro(self, symbol: str):
-        """Evalúa si el mercado macro permite operar."""
+        """Evalúa si el mercado macro permite operar. Con MFM integrado."""
         i15 = self.indicadores_15m.get(symbol)
         i4h = self.indicadores_4h.get(symbol)
         state = self.states[symbol]
@@ -240,6 +287,10 @@ class SignalGenerator:
         macd_hist = i15['macd_hist']
         macd_hist_prev = i15['macd_hist_prev']
         vol_ratio = i15['volume'] / i15['volume_sma20'] if i15['volume_sma20'] > 0 else 0
+
+        # FASE 5.2: Obtener MFM del indicador
+        mfm = i15.get('mfm_15m', 0.0)
+        mfm_sma5 = i15.get('mfm_sma5', 0.0)
 
         ema50 = i15.get('ema50_15m')
         if ema50 is None:
@@ -322,10 +373,32 @@ class SignalGenerator:
         else:
             score_macro += 15
 
-        if vol_ratio < CONFIG.volume_min_ratio:
-            rechazos.append(f"Volumen bajo: {vol_ratio:.1%}")
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # FASE 5.2: VOLUMEN INTELIGENTE CON MFM
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # ANTES: Volumen alto = +10 puntos siempre (independiente de dirección)
+        # AHORA: Volumen alto solo suma si MFM está alineado con dirección
+        #        Volumen alto + MFM contrario = penalización (absorción/trampa)
+        # ═══════════════════════════════════════════════════════════════════════════════
+        if vol_ratio >= CONFIG.volume_min_ratio:
+            mfm_alineado = False
+            if direction == 'SHORT' and mfm_sma5 < -CONFIG.mfm_umbral_alineacion:
+                # Volumen presiona a la baja → alineado con SHORT
+                mfm_alineado = True
+                score_macro += CONFIG.mfm_bonus_alineado
+                print(f"  📊 {symbol} Volumen+MFM alineado SHORT | mfm={mfm_sma5:.3f} | +{CONFIG.mfm_bonus_alineado}pts")
+            elif direction == 'LONG' and mfm_sma5 > CONFIG.mfm_umbral_alineacion:
+                # Volumen presiona al alza → alineado con LONG
+                mfm_alineado = True
+                score_macro += CONFIG.mfm_bonus_alineado
+                print(f"  📊 {symbol} Volumen+MFM alineado LONG | mfm={mfm_sma5:.3f} | +{CONFIG.mfm_bonus_alineado}pts")
+            else:
+                # Volumen contradice dirección → posible trampa o absorción
+                score_macro -= CONFIG.mfm_penalizacion_contrario
+                rechazos.append(f"MFM contradictorio: mfm={mfm_sma5:.3f} vs dirección {direction}")
+                print(f"  ⚠️ {symbol} Volumen+MFM CONTRADICTORIO | mfm={mfm_sma5:.3f} vs {direction} | -{CONFIG.mfm_penalizacion_contrario}pts")
         else:
-            score_macro += 10
+            rechazos.append(f"Volumen bajo: {vol_ratio:.1%}")
 
         score_macro = max(0, min(100, score_macro))
         state.score_macro_actual = score_macro
@@ -358,15 +431,16 @@ class SignalGenerator:
         state.ultimo_filtro_timestamp = i15.get('timestamp', 0)
 
         # V4.2: Tracking de inactividad (pausa automática) - AHORA DESPUÉS del despausa
+        # FASE 5.1: Usar CONFIG.pausa_inactividad_horas en vez de hardcodeo
         if score_macro < 50:
             if state.score_bajo_desde is None:
-                state.score_bajo_desde = int(datetime.utcnow().timestamp())
+                state.score_bajo_desde = int(datetime.now(pytz.UTC).timestamp())
             else:
-                segundos_bajo = int(datetime.utcnow().timestamp()) - state.score_bajo_desde
-                if segundos_bajo > self.PAUSA_INACTIVIDAD_HORAS * 3600 and not state.moneda_pausada:
+                segundos_bajo = int(datetime.now(pytz.UTC).timestamp()) - state.score_bajo_desde
+                if segundos_bajo > CONFIG.pausa_inactividad_horas * 3600 and not state.moneda_pausada:
                     state.moneda_pausada = True
                     state.moneda_pausada_razon = f"Score < 50 durante {segundos_bajo/60:.0f}min"
-                    state.moneda_pausada_timestamp = int(datetime.utcnow().timestamp())
+                    state.moneda_pausada_timestamp = int(datetime.now(pytz.UTC).timestamp())
                     print(f"  ⏸️ {symbol} AUTO-PAUSADA por inactividad | {state.moneda_pausada_razon}")
         else:
             state.score_bajo_desde = None
@@ -385,6 +459,9 @@ class SignalGenerator:
                     'ema50_15m': ema50,
                     'macd_hist': macd_hist,
                     'volumen_ratio': vol_ratio,
+                    # FASE 5.2: Incluir MFM en contexto de auditoría
+                    'mfm_15m': mfm,
+                    'mfm_sma5': mfm_sma5,
                     'direccion': direction,
                     'score_macro': score_macro,
                     'umbral_aplicado': score_minimo,
@@ -403,7 +480,8 @@ class SignalGenerator:
                 state._prev_filtro_aprobado = state.filtro_macro_aprobado
 
         if filtro_aprobado:
-            print(f"  🟢 {symbol} Filtro Macro OK ({direction}) | Score: {score_macro} | Umbral: {score_minimo} | RSI: {rsi:.1f} | ADX: {adx:.1f}")
+            mfm_str = f" | MFM={mfm_sma5:.3f}" if mfm_sma5 != 0 else ""
+            print(f"  🟢 {symbol} Filtro Macro OK ({direction}) | Score: {score_macro} | Umbral: {score_minimo} | RSI: {rsi:.1f} | ADX: {adx:.1f}{mfm_str}")
         else:
             if state.estado == 'ARMED':
                 print(f"  🔴 {symbol} Filtro Macro ROTO | Rechazos: {rechazos[:2]} | Score: {score_macro} | Umbral: {score_minimo}")
@@ -429,7 +507,7 @@ class SignalGenerator:
 
         # Si el score mejoró a >= 50, despausar automáticamente
         if score_macro >= 50:
-            tiempo_pausada = int(datetime.utcnow().timestamp()) - state.moneda_pausada_timestamp
+            tiempo_pausada = int(datetime.now(pytz.UTC).timestamp()) - state.moneda_pausada_timestamp
             state.moneda_pausada = False
             state.moneda_pausada_razon = None
             state.moneda_pausada_timestamp = 0
@@ -438,13 +516,138 @@ class SignalGenerator:
         else:
             # Aún pausada, mostrar cuánto tiempo lleva pausada
             if state.moneda_pausada_timestamp > 0:
-                tiempo_pausada = int(datetime.utcnow().timestamp()) - state.moneda_pausada_timestamp
+                tiempo_pausada = int(datetime.now(pytz.UTC).timestamp()) - state.moneda_pausada_timestamp
                 if tiempo_pausada % 300 == 0:  # Log cada 5 minutos
                     print(f"  ⏸️ {symbol} sigue AUTO-PAUSADA | Score: {score_macro} | Tiempo pausada: {tiempo_pausada/60:.0f}min")
 
     # ================================================================
     # CAPA 1.5: MÁQUINA DE ESTADOS (hysteresis suavizada + timeout)
     # ================================================================
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 5.4: COMMITMENT SCORE REAL
+    # ═══════════════════════════════════════════════════════════════════════════════
+    def _alimentar_historial_1m(self, symbol: str, data: dict):
+        """Alimenta el buffer de historial 1m para evaluar commitment."""
+        if not data:
+            return
+
+        registro = {
+            'timestamp': data.get('timestamp', 0),
+            'rsi_7': data.get('rsi_7'),
+            'ema_300': data.get('ema_300'),
+            'close': data.get('close'),
+            'high': data.get('high'),
+            'low': data.get('low'),
+            'wick_upper_pct': data.get('wick_upper_pct', 0),
+            'wick_lower_pct': data.get('wick_lower_pct', 0),
+            'body_direction': data.get('body_direction', 0),
+            'volume': data.get('volume', 0),
+            'volume_sma20': data.get('volume_sma20', 1),
+        }
+
+        self._historial_1m[symbol].append(registro)
+        # Mantener solo últimas 5 velas para análisis
+        if len(self._historial_1m[symbol]) > 5:
+            self._historial_1m[symbol] = self._historial_1m[symbol][-5:]
+
+    def _evaluar_commitment_score(self, symbol: str, direction: str) -> int:
+        """
+        Evalúa el commitment score basado en alineación de indicadores de 1m.
+
+        Requisitos para commitment positivo:
+        1. RSI(7) alineado con dirección durante N velas consecutivas
+        2. Precio alineado con dirección (vs EMA300) durante N velas
+        3. Volumen soportando el movimiento
+
+        Retorna: score 0-100 (commitment)
+        """
+        historial = self._historial_1m.get(symbol, [])
+        if len(historial) < 2:
+            return 0
+
+        state = self.states[symbol]
+        velas_requeridas = state.commitment_velas_requeridas
+
+        # Tomar últimas N velas
+        velas = historial[-velas_requeridas:]
+        if len(velas) < velas_requeridas:
+            return 0
+
+        score = 0
+
+        # 1. RSI(7) alineado con dirección
+        rsi_alineado = True
+        for v in velas:
+            rsi = v.get('rsi_7')
+            if rsi is None:
+                rsi_alineado = False
+                break
+            if direction == 'SHORT' and rsi < 60:  # RSI debe estar alto para SHORT
+                rsi_alineado = False
+                break
+            if direction == 'LONG' and rsi > 40:   # RSI debe estar bajo para LONG
+                rsi_alineado = False
+                break
+
+        if rsi_alineado:
+            score += 40
+
+        # 2. Precio alineado con dirección vs EMA300
+        precio_alineado = True
+        for v in velas:
+            close = v.get('close')
+            ema300 = v.get('ema_300')
+            if close is None or ema300 is None or ema300 == 0:
+                precio_alineado = False
+                break
+            distancia_pct = ((close - ema300) / ema300) * 100
+
+            if direction == 'SHORT' and distancia_pct > -0.05:  # Debe estar por encima o cerca de EMA300
+                precio_alineado = False
+                break
+            if direction == 'LONG' and distancia_pct < 0.05:    # Debe estar por debajo o cerca de EMA300
+                precio_alineado = False
+                break
+
+        if precio_alineado:
+            score += 40
+
+        # 3. Volumen soportando (al menos 1 velas con volumen > SMA20)
+        volumen_soportando = 0
+        for v in velas:
+            vol = v.get('volume', 0)
+            vol_sma = v.get('volume_sma20', 1)
+            if vol_sma > 0 and vol >= vol_sma * 0.8:  # 80% del promedio es suficiente
+                volumen_soportando += 1
+
+        if volumen_soportando >= 1:
+            score += 20
+
+        return min(100, score)
+
+    def _commitment_aprobado(self, symbol: str) -> bool:
+        """Verifica si el commitment score es suficiente para pasar a ARMED."""
+        state = self.states[symbol]
+        direction = state.direccion_filtro
+
+        if not direction:
+            return False
+
+        commitment = self._evaluar_commitment_score(symbol, direction)
+        state.commitment_score_actual = commitment
+
+        # Umbral de commitment: 60/100 (2 de 3 requisitos cumplidos)
+        aprobado = commitment >= 60
+
+        if aprobado:
+            print(f"  ✅ {symbol} Commitment APROBADO: {commitment}/100 ({direction})")
+        else:
+            if state.estado == 'MONITOREO':
+                print(f"  ⏳ {symbol} Commitment insuficiente: {commitment}/100 ({direction})")
+
+        return aprobado
+
     async def _actualizar_estado_maquina(self, symbol: str):
         """
         Transiciona estados con hysteresis suavizada y timeout ARMED.
@@ -482,7 +685,7 @@ class SignalGenerator:
                 if state.filtro_macro_aprobado:
                     state.estado = 'ARMED'
                     state.velas_confirmacion = 0
-                    state.armed_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                    state.armed_timestamp = int(datetime.now(pytz.UTC).timestamp() * 1000)
                     print(f"  🎯 {symbol} → ARMED (nueva vela 15m, filtro activo)")
                 else:
                     state.estado = 'MONITOREO'
@@ -494,20 +697,29 @@ class SignalGenerator:
 
         if state.estado == 'MONITOREO':
             if state.filtro_macro_aprobado and state.direccion_filtro:
-                state.velas_confirmacion += 1
-                if state.velas_confirmacion >= CONFIG.hysteresis_velas:
+                # FASE 5.4: Commitment Score Real en vez de hysteresis simple
+                # ANTES: contar 3 velas de confirmación (hysteresis_velas)
+                # AHORA: verificar alineación real de indicadores de 1m
+                commitment_ok = self._commitment_aprobado(symbol)
+
+                if commitment_ok:
                     state.estado = 'ARMED'
                     state.velas_confirmacion = 0
-                    state.armed_timestamp = int(datetime.utcnow().timestamp() * 1000)
-                    print(f"  🎯 {symbol} → ARMED ({state.direccion_filtro}) | {CONFIG.hysteresis_velas} velas confirmadas")
+                    state.armed_timestamp = int(datetime.now(pytz.UTC).timestamp() * 1000)
+                    print(f"  🎯 {symbol} → ARMED ({state.direccion_filtro}) | Commitment: {state.commitment_score_actual}/100")
+                else:
+                    # Aún no hay commitment suficiente, seguir en MONITOREO
+                    pass
             else:
+                # Resetear commitment si filtro se pierde
+                state.commitment_score_actual = 0
                 if CONFIG.hysteresis_suavizada and state.velas_confirmacion > 0:
                     state.velas_confirmacion = max(0, state.velas_confirmacion - CONFIG.hysteresis_decremento)
                 else:
                     state.velas_confirmacion = 0
 
         elif state.estado == 'ARMED':
-            ahora_ms = int(datetime.utcnow().timestamp() * 1000)
+            ahora_ms = int(datetime.now(pytz.UTC).timestamp() * 1000)
             if state.armed_timestamp > 0:
                 tiempo_en_armed_ms = ahora_ms - state.armed_timestamp
                 armed_timeout_ms = self.ARMED_TIMEOUT_MIN * 60 * 1000
@@ -517,6 +729,7 @@ class SignalGenerator:
                     state.filtro_macro_aprobado = False
                     state.direccion_filtro = None
                     state.armed_timestamp = 0
+                    state.commitment_score_actual = 0
                     print(f"  🔄 {symbol} → MONITOREO (timeout ARMED: {tiempo_en_armed_ms/60000:.0f}min)")
                     if self.audit_logger:
                         await self.audit_logger.log_cambio_estado(
@@ -526,7 +739,22 @@ class SignalGenerator:
                         state._prev_estado = 'MONITOREO'
                     return
 
-            if not state.filtro_macro_aprobado:
+            # FASE 5.4: En ARMED, verificar que commitment sigue siendo válido
+            if state.filtro_macro_aprobado and state.direccion_filtro:
+                commitment_actual = self._evaluar_commitment_score(symbol, state.direccion_filtro)
+                state.commitment_score_actual = commitment_actual
+
+                if commitment_actual < 30:  # Commitment perdido drásticamente
+                    state.estado = 'MONITOREO'
+                    state.velas_confirmacion = 0
+                    state.filtro_macro_aprobado = False
+                    state.direccion_filtro = None
+                    state.armed_timestamp = 0
+                    state.commitment_score_actual = 0
+                    print(f"  🔄 {symbol} → MONITOREO (commitment perdido: {commitment_actual}/100)")
+                # Si commitment sigue OK, permanece en ARMED
+            else:
+                # Filtro macro roto, salir de ARMED
                 if CONFIG.hysteresis_suavizada:
                     state.velas_confirmacion += 1
                     if state.velas_confirmacion >= CONFIG.hysteresis_velas:
@@ -535,6 +763,7 @@ class SignalGenerator:
                         state.filtro_macro_aprobado = False
                         state.direccion_filtro = None
                         state.armed_timestamp = 0
+                        state.commitment_score_actual = 0
                         print(f"  🔄 {symbol} → MONITOREO (filtro roto, {CONFIG.hysteresis_velas} velas contrarias)")
                 else:
                     state.velas_confirmacion += 1
@@ -544,10 +773,8 @@ class SignalGenerator:
                         state.filtro_macro_aprobado = False
                         state.direccion_filtro = None
                         state.armed_timestamp = 0
+                        state.commitment_score_actual = 0
                         print(f"  🔄 {symbol} → MONITOREO (filtro roto, {CONFIG.hysteresis_velas} velas 1m)")
-            else:
-                if state.velas_confirmacion > 0:
-                    state.velas_confirmacion = 0
 
         # FASE 4.5: Loggear transición de estado
         if estado_anterior_log != state.estado:
@@ -563,6 +790,64 @@ class SignalGenerator:
     # ================================================================
     # CAPA 2: GATILLO MICRO (evalúa cada 1m, solo si ARMED)
     # ================================================================
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 5.3: UMBRAL DINÁMICO VÍA ATR(15m)
+    # ═══════════════════════════════════════════════════════════════════════════════
+    def _calcular_umbral_dinamico(self, symbol: str) -> int:
+        """
+        Calcula el score mínimo de disparo adaptativo basado en ATR(15m).
+
+        Lógica:
+        - ATR en percentil 20 (bajo, consolidación) → score_min alto (85) = más selectivo
+        - ATR en percentil 80 (alto, expansión) → score_min bajo (65) = más permisivo
+        - Interpolación lineal entre ambos
+
+        Pre-expansión: Si el precio rompe el rango reciente (high/low últimas 20 velas),
+        bajamos temporalmente el umbral para capturar el inicio del movimiento.
+        """
+        atr_historico = self._atr15m_historico.get(symbol, [])
+        if len(atr_historico) < 20:
+            # Datos insuficientes, usar umbral estático
+            return self.SCORE_DISPARO_MIN
+
+        atr_actual = atr_historico[-1]
+        atr_p20 = np.percentile(atr_historico, 20)
+        atr_p80 = np.percentile(atr_historico, 80)
+
+        # Normalizar ATR actual entre 0 y 1 (0 = consolidación, 1 = expansión)
+        if atr_p80 > atr_p20:
+            atr_normalizado = (atr_actual - atr_p20) / (atr_p80 - atr_p20)
+        else:
+            atr_normalizado = 0.5
+
+        atr_normalizado = max(0.0, min(1.0, atr_normalizado))
+
+        # Interpolación lineal: consolidación = 85, expansión = 65
+        score_min = CONFIG.score_min_consolidacion - atr_normalizado * (CONFIG.score_min_consolidacion - CONFIG.score_min_expansion)
+        score_min = int(round(score_min))
+
+        # FASE 5.3: Detección de pre-expansión (ruptura de rango reciente)
+        rango = self._rango_reciente.get(symbol, {})
+        highs = rango.get('highs', [])
+        lows = rango.get('lows', [])
+        i15 = self.indicadores_15m.get(symbol, {})
+        price = i15.get('close', 0)
+
+        if len(highs) >= 10 and len(lows) >= 10 and price > 0:
+            recent_high = max(highs)
+            recent_low = min(lows)
+            rango_size = recent_high - recent_low
+
+            # Si el precio rompe el rango reciente → pre-expansión detectada
+            if price > recent_high + rango_size * 0.01 or price < recent_low - rango_size * 0.01:
+                # Bajamos temporalmente el umbral para capturar el movimiento
+                score_min_pre_exp = max(CONFIG.score_min_expansion, score_min - 10)
+                print(f"  📊 {symbol} PRE-EXPANSIÓN detectada | Umbral: {score_min} → {score_min_pre_exp}")
+                return score_min_pre_exp
+
+        return score_min
+
     async def evaluar_gatillo(self, symbol: str):
         """Evalúa condiciones de disparo en 1m. Solo si estado == ARMED."""
         i1m = self.indicadores_1m.get(symbol)
@@ -574,7 +859,9 @@ class SignalGenerator:
             return
         if not state.filtro_macro_aprobado or not state.direccion_filtro:
             return
-        if state.score_macro_actual < self.SCORE_DISPARO_MIN:
+        # FASE 5.3: Umbral dinámico vía ATR(15m)
+        score_min_dinamico = self._calcular_umbral_dinamico(symbol)
+        if state.score_macro_actual < score_min_dinamico:
             return
         # V4.2: No disparar si pausada
         if state.moneda_pausada or state.moneda_pausada_manual:
@@ -669,10 +956,14 @@ class SignalGenerator:
         state.ultimo_score = score
         state.ultimos_params = params
 
+        # FASE 5.3: Log del umbral dinámico usado
+        score_min_usado = self._calcular_umbral_dinamico(symbol)
+        umbral_info = f" | Umbral: {score_min_usado}" if score_min_usado != self.SCORE_DISPARO_MIN else ""
+
         if params.get('auto_compressed'):
-            print(f"  🔥 {symbol} → FIRE ({direction}) | Score: {score} | GRID AUTO-COMPRIMIDO")
+            print(f"  🔥 {symbol} → FIRE ({direction}) | Score: {score}{umbral_info} | GRID AUTO-COMPRIMIDO")
         else:
-            print(f"  🔥 {symbol} → FIRE ({direction}) | Score: {score} | Grid: {params['grid_count']} líneas")
+            print(f"  🔥 {symbol} → FIRE ({direction}) | Score: {score}{umbral_info} | Grid: {params['grid_count']} líneas")
 
         if self.audit_logger:
             contexto_1m = {
@@ -702,7 +993,10 @@ class SignalGenerator:
                 'volume': i15.get('volume'),
                 'volume_sma20': i15.get('volume_sma20'),
                 'recent_high': i15.get('recent_high'),
-                'recent_low': i15.get('recent_low')
+                'recent_low': i15.get('recent_low'),
+                # FASE 5.2: Incluir MFM en contexto de auditoría
+                'mfm_15m': i15.get('mfm_15m'),
+                'mfm_sma5': i15.get('mfm_sma5')
             }
 
             contexto_4h = {
@@ -835,7 +1129,7 @@ class SignalGenerator:
         state = self.states[symbol]
         state.circuit_breaker_activo = True
         pausa_ms = CONFIG.circuit_breaker_pausa_seg * 1000
-        state.circuit_breaker_hasta = int(datetime.utcnow().timestamp() * 1000) + pausa_ms
+        state.circuit_breaker_hasta = int(datetime.now(pytz.UTC).timestamp() * 1000) + pausa_ms
 
         state.capital_actual = max(
             CONFIG.grid_default_capital * CONFIG.circuit_breaker_reduccion_capital,
@@ -860,7 +1154,7 @@ class SignalGenerator:
     # ================================================================
     def _get_current_15m_timestamp(self) -> int:
         """DEPRECADO en Fase 2. Mantenido por compatibilidad."""
-        now = datetime.utcnow()
+        now = datetime.now(pytz.UTC)
         minute_15m = (now.minute // 15) * 15
         ts = now.replace(minute=minute_15m, second=0, microsecond=0)
         return int(ts.timestamp() * 1000)
@@ -928,7 +1222,7 @@ class SignalGenerator:
             'rechazos': rechazos,
             'params': params,
             'price': price,
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(pytz.UTC).isoformat(),
             'estado_maquina': self.states[symbol].estado
         }
         await self.queue_out.put(evento)

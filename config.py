@@ -1,3 +1,4 @@
+##v5.4
 from pydantic import BaseModel, Field
 from typing import List
 import os
@@ -63,6 +64,12 @@ class Config(BaseModel):
     cooldown_15m_velas: int = 1
 
     # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 5.1: PAUSA DE INACTIVIDAD (antes hardcodeado en signals_v4.py)
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # Horas de score bajo antes de auto-pausar una moneda
+    pausa_inactividad_horas: float = 1.0    # 1 hora (antes era 3 min en hardcodeo, luego 1h)
+
+    # ═══════════════════════════════════════════════════════════════════════════════
     # FASE 3: PARÁMETROS DE SEGURIDAD DEL GRID
     # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -118,6 +125,28 @@ class Config(BaseModel):
     # En vez de resetear a 0 en una vela contraria, decrementar progresivamente
     hysteresis_suavizada: bool = True
     hysteresis_decremento: int = 1       # Velas de confirmación que se pierden por vela contraria
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 5.2: MFM (Money Flow Multiplier) — VOLUMEN INTELIGENTE
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # Umbral de MFM para considerar volumen alineado con dirección
+    # MFM > 0.2  → presión alcista (volumen comprador dominante)
+    # MFM < -0.2 → presión bajista (volumen vendedor dominante)
+    mfm_umbral_alineacion: float = 0.2
+    # Puntos que resta el MFM cuando contradice la dirección
+    mfm_penalizacion_contrario: int = 5
+    # Puntos que suma el MFM cuando alinea con dirección (reemplaza bonus volumen genérico)
+    mfm_bonus_alineado: int = 10
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 5.3 (PREPARACIÓN): UMBRAL DINÁMICO VÍA ATR
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # Ventana de velas 15m para calcular percentiles del ATR
+    atr_percentil_ventana: int = 100
+    # Score mínimo en consolidación (ATR bajo = más selectivo)
+    score_min_consolidacion: int = 85
+    # Score mínimo en expansión (ATR alto = más permisivo)
+    score_min_expansion: int = 65
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # FASE 4.5: MODO AUDITORÍA EXTERNA

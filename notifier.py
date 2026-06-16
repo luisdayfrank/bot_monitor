@@ -7,15 +7,16 @@ from plyer import notification
 from telegram import Bot, Update, InputFile
 from telegram.constants import ParseMode
 from config import CONFIG
+import pytz
 
 class Notifier:
     def __init__(self):
         self.bot = Bot(token=CONFIG.telegram_token) if CONFIG.telegram_token else None
         self._last_update_id = 0
         self.signal_generator = None
-        self._ws_last_msg_time = datetime.utcnow()
+        self._ws_last_msg_time = datetime.now(pytz.UTC)
         self._ws_connected = False
-        self._process_start_time = datetime.utcnow()
+        self._process_start_time = datetime.now(pytz.UTC)
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # FIX CRÍTICO: Limpiar mensajes pendientes de Telegram al iniciar
@@ -149,7 +150,7 @@ class Notifier:
     async def notificar_online(self, symbols: list, uptime_start: float = None):
         uptime_str = ""
         if uptime_start:
-            elapsed = datetime.utcnow().timestamp() - uptime_start
+            elapsed = datetime.now(pytz.UTC).timestamp() - uptime_start
             uptime_str = f"\n⏱️ Tiempo de arranque: {elapsed:.1f}s"
         msg = (
             f"<b>🚀 Crypto Monitor V5.1 ONLINE</b>\n"
@@ -182,7 +183,7 @@ class Notifier:
 
     async def notificar_status(self, estados: dict, precios: dict, indicadores_15m: dict):
         lineas = ["<b>📊 ESTADO ACTUAL</b>\n"]
-        ahora = datetime.utcnow().strftime("%H:%M:%S UTC")
+        ahora = datetime.now(pytz.UTC).strftime("%H:%M:%S UTC")
         lineas.append(f"🕐 {ahora}\n")
         for symbol in sorted(estados.keys()):
             st = estados[symbol]
@@ -293,7 +294,7 @@ class Notifier:
 
     async def _cmd_health(self, precios_vivo: dict, signal_states: dict):
         """/health — Diagnóstico completo."""
-        uptime = datetime.utcnow() - self._process_start_time
+        uptime = datetime.now(pytz.UTC) - self._process_start_time
         uptime_str = f"{uptime.days}d {uptime.seconds//3600}h {(uptime.seconds//60)%60}m"
 
         estados_count = {}
@@ -326,7 +327,7 @@ class Notifier:
             f"  Tamaño: {db_size:.1f} MB\n"
             f"  Path: {CONFIG.db_path}\n\n"
             f"<b>WebSocket:</b>\n"
-            f"  Último mensaje: hace {(datetime.utcnow()-self._ws_last_msg_time).seconds}s\n"
+            f"  Último mensaje: hace {(datetime.now(pytz.UTC)-self._ws_last_msg_time).seconds}s\n"
             f"  Estado: {'✅ Conectado' if self._ws_connected else '❌ Desconectado'}"
         )
         await self.enviar_telegram(msg)
@@ -354,7 +355,7 @@ class Notifier:
 
         cb_info = ""
         if st and getattr(st, 'circuit_breaker_activo', False):
-            remaining = (st.circuit_breaker_hasta - int(datetime.utcnow().timestamp()*1000)) // 1000
+            remaining = (st.circuit_breaker_hasta - int(datetime.now(pytz.UTC).timestamp()*1000)) // 1000
             cb_info = f"\n🔒 <b>Circuit Breaker</b> | {remaining}s restantes"
 
         msg = (
@@ -451,7 +452,7 @@ class Notifier:
             await self.enviar_telegram("❌ Base de datos no encontrada.")
             return
 
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(pytz.UTC).strftime("%Y%m%d_%H%M%S")
         backup_dir = "backups"
         os.makedirs(backup_dir, exist_ok=True)
         backup_path = f"{backup_dir}/crypto_monitor_{timestamp}.db"
@@ -560,7 +561,7 @@ class Notifier:
                                     razon = info.get('razon', 'N/A')
                                     tiempo = ""
                                     if info['timestamp'] > 0:
-                                        mins = (datetime.utcnow().timestamp() - info['timestamp']) / 60
+                                        mins = (datetime.now(pytz.UTC).timestamp() - info['timestamp']) / 60
                                         tiempo = f" ({mins:.0f}min)"
                                     lineas.append(f"⏸️ <b>{sym}</b> [{tipo}]{tiempo}\n   Razón: {razon}")
                                 await self.enviar_telegram("\n".join(lineas))

@@ -3,6 +3,7 @@ import asyncio
 from config import CONFIG
 from datetime import datetime
 import pytz
+import json
 
 # ─── Conexión persistente singleton ───
 _db_conn = None
@@ -217,6 +218,28 @@ async def init_db():
             )
         """)
 
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # FASE 5.1: TABLA PARA PERSISTENCIA DE DISPAROS ACTIVOS (sobrevive reinicios)
+        # ═══════════════════════════════════════════════════════════════════════════════
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS auditoria_disparos_activos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                evento_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                timestamp_utc TEXT NOT NULL,
+                precio_entrada REAL NOT NULL,
+                direccion TEXT NOT NULL,
+                grid_params_json TEXT,
+                maximo_visto REAL,
+                minimo_visto REAL,
+                primera_vez_en_grid_json TEXT,      -- JSON con {timestamp, precio, minutos_desde}
+                primera_vez_fuera_rango_json TEXT,  -- JSON con {timestamp, precio, minutos_desde, direccion}
+                muestras_guardadas INTEGER DEFAULT 0,
+                horas_seguimiento INTEGER,
+                FOREIGN KEY (evento_id) REFERENCES auditoria_eventos(id)
+            )
+        """)
+
         # Índices para consultas rápidas
         await db.execute("CREATE INDEX IF NOT EXISTS idx_auditoria_fecha ON auditoria_eventos(fecha)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_auditoria_symbol ON auditoria_eventos(symbol)")
@@ -224,9 +247,12 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_muestras_evento ON auditoria_muestras_post(evento_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_eventos_post_evento ON auditoria_eventos_post(evento_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_velas_post_evento ON auditoria_velas_post(evento_id)")
+        # FASE 5.1: Índice para disparos activos
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_disparos_activos_symbol ON auditoria_disparos_activos(symbol)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_disparos_activos_evento ON auditoria_disparos_activos(evento_id)")
 
         await db.commit()
-    print("🗄️ Base de datos inicializada (WAL mode activado) + Tablas auditoría")
+    print("🗄️ Base de datos inicializada (WAL mode activado) + Tablas auditoría + Disparos activos persistentes")
 
 async def insertar_vela(symbol: str, tf: str, vela: dict):
     tabla = f"velas_{tf}"
@@ -356,6 +382,75 @@ async def guardar_vela_post(evento_id, symbol, timestamp_utc, open_p, high, low,
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (evento_id, symbol, timestamp_utc.isoformat() if timestamp_utc else now_utc().isoformat(),
             timestamp_local, open_p, high, low, close, volume, minutos_desde_disparo))
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FASE 5.1: FUNCIONES DE PERSISTENCIA DE DISPAROS ACTIVOS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def guardar_disparo_activo(evento_id, symbol, timestamp_utc, precio_entrada, direccion,
+                                  grid_params_json, maximo_visto, minimo_visto,
+                                  primera_vez_en_grid_json, primera_vez_fuera_rango_json,
+                                  muestras_guardadas, horas_seguimiento):
+    """Guarda o actualiza un disparo activo en la base de datos para persistencia."""
+    await _execute_with_retry("""
+        INSERT OR REPLACE INTO auditoria_disparos_activos
+        (evento_id, symbol, timestamp_utc, precio_entrada, direccion, grid_params_json,
+         maximo_visto, minimo_visto, primera_vez_en_grid_json, primera_vez_fuera_rango_json,
+         muestras_guardadas, horas_seguimiento)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (evento_id, symbol, timestamp_utc.isoformat() if timestamp_utc else now_utc().isoformat(),
+            precio_entrada, direccion, grid_params_json,
+            maximo_visto, minimo_visto,
+            primera_vez_en_grid_json, primera_vez_fuera_rango_json,
+            muestras_guardadas, horas_seguimiento))
+
+async def cargar_disparos_activos():
+    """Carga todos los disparos activos persistentes (útil al reiniciar el bot)."""
+    db = await _get_db()
+    async with _db_lock:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT * FROM auditoria_disparos_activos
+            ORDER BY timestamp_utc ASC
+        """)
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def actualizar_disparo_activo(evento_id, maximo_visto=None, minimo_visto=None,
+                                      primera_vez_en_grid_json=None, primera_vez_fuera_rango_json=None,
+                                      muestras_guardadas=None):
+    """Actualiza campos de un disparo activo existente."""
+    campos = []
+    valores = []
+    if maximo_visto is not None:
+        campos.append("maximo_visto = ?")
+        valores.append(maximo_visto)
+    if minimo_visto is not None:
+        campos.append("minimo_visto = ?")
+        valores.append(minimo_visto)
+    if primera_vez_en_grid_json is not None:
+        campos.append("primera_vez_en_grid_json = ?")
+        valores.append(primera_vez_en_grid_json)
+    if primera_vez_fuera_rango_json is not None:
+        campos.append("primera_vez_fuera_rango_json = ?")
+        valores.append(primera_vez_fuera_rango_json)
+    if muestras_guardadas is not None:
+        campos.append("muestras_guardadas = ?")
+        valores.append(muestras_guardadas)
+
+    if not campos:
+        return
+
+    valores.append(evento_id)
+    sql = f"UPDATE auditoria_disparos_activos SET {', '.join(campos)} WHERE evento_id = ?"
+    await _execute_with_retry(sql, tuple(valores))
+
+async def eliminar_disparo_activo(evento_id):
+    """Elimina un disparo activo (cuando el seguimiento termina)."""
+    await _execute_with_retry(
+        "DELETE FROM auditoria_disparos_activos WHERE evento_id = ?",
+        (evento_id,)
+    )
 
 async def cargar_eventos_dia(fecha_local: str):
     """Carga todos los eventos de auditoría de un día específico (fecha local)."""
