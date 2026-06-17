@@ -2,7 +2,24 @@ import asyncio
 import json
 import logging
 import numpy as np
+import os
 
+REGISTRY_PATH = "coins_registry.json"
+
+def _load_registry():
+    """Carga el registro de monedas desde disco."""
+    if not os.path.exists(REGISTRY_PATH):
+        return {}
+    try:
+        with open(REGISTRY_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_registry(registry):
+    """Guarda el registro de monedas a disco."""
+    with open(REGISTRY_PATH, 'w', encoding='utf-8') as f:
+        json.dump(registry, f, indent=2, ensure_ascii=False)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -288,8 +305,12 @@ async def get_snapshot(request: Request):
     indicadores_15m = getattr(request.app.state, 'indicadores_15m', {})
     indicadores_4h = getattr(request.app.state, 'indicadores_4h', {})
 
+    # Cargar registry actual
+    registry = _load_registry()
+
     result = {}
-    for symbol in CONFIG.symbols:
+    # Incluir TODAS las monedas del registry, no solo las activas
+    for symbol in registry.keys():
         st = estados.get(symbol)
         i1m = indicadores_1m.get(symbol, {})
         i15m = indicadores_15m.get(symbol, {})
@@ -298,13 +319,12 @@ async def get_snapshot(request: Request):
         result[symbol] = {
             "precio": precios.get(symbol),
             "estado": {
-                "estado": st.estado if st else "UNKNOWN",
+                "estado": st.estado if st else "SIN_DATOS",
                 "direccion_filtro": st.direccion_filtro if st else None,
                 "score": st.ultimo_score if st else 0,
                 "filtro_aprobado": st.filtro_macro_aprobado if st else False,
                 "velas_confirmacion": st.velas_confirmacion if st else 0,
                 "circuit_breaker_activo": getattr(st, 'circuit_breaker_activo', False) if st else False,
-                # V4.2: Estado de pausa
                 "moneda_pausada": getattr(st, 'moneda_pausada', False) if st else False,
                 "moneda_pausada_manual": getattr(st, 'moneda_pausada_manual', False) if st else False,
             },
@@ -340,12 +360,18 @@ async def get_snapshot(request: Request):
                 "close": i4h.get("close"),
             },
         }
+    
+    # Incluir coin_config en la respuesta
     return _sanitize_numpy({
         "snapshot": result,
+        "coin_config": {
+            symbol: {"active": data.get("active", 0), "category": data.get("category", "unknown")}
+            for symbol, data in registry.items()
+        },
         "symbols_count": len(result),
+        "active_count": sum(1 for d in registry.values() if d.get("active", 0) == 1),
         "timestamp": int(time.time() * 1000)
     })
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # V4.2: NUEVOS ENDPOINTS REST PARA PAUSA MANUAL
@@ -434,6 +460,117 @@ async def get_paused(request: Request):
         "count": len(pausadas),
         "timestamp": int(time.time() * 1000)
     }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENDPOINTS PARA COIN REGISTRY (Toggle desde dashboard)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/coin-registry")
+async def get_coin_registry():
+    """Retorna el registro completo de monedas (activas y inactivas)."""
+    registry = _load_registry()
+    return {
+        "registry": registry,
+        "total": len(registry),
+        "active_count": sum(1 for d in registry.values() if d.get("active", 0) == 1),
+        "categories": list(set(d.get("category", "unknown") for d in registry.values())),
+        "timestamp": int(time.time() * 1000)
+    }
+
+
+@app.post("/api/toggle-coin")
+async def toggle_coin(request: Request):
+    """Activa o desactiva una moneda individual. Cambia el JSON en disco."""
+    try:
+        data = await request.json()
+        symbol = data.get("symbol")
+        active = data.get("active")
+        
+        if symbol is None or active is None:
+            return {"error": "Faltan 'symbol' o 'active'", "success": False}
+        
+        registry = _load_registry()
+        if symbol not in registry:
+            return {"error": f"{symbol} no existe en el registro", "success": False}
+        
+        registry[symbol]["active"] = 1 if active else 0
+        _save_registry(registry)
+        
+        # Notificar por Telegram que se necesita /restart
+        await notifier.enviar_telegram(
+            f"🔄 <b>Registro actualizado</b>\n"
+            f"{symbol}: {'✅ ACTIVADA' if active else '❌ DESACTIVADA'}\n"
+            f"⚠️ Ejecuta <code>/restart</code> para aplicar cambios."
+        )
+        
+        # Broadcast a WebSocket para actualizar dashboard inmediatamente
+        await manager.broadcast_json({
+            "msg_type": "coin_config_update",
+            "coin_config": {symbol: {"active": active}}
+        })
+        
+        return {
+            "symbol": symbol,
+            "active": active,
+            "success": True,
+            "needs_restart": True,
+            "message": "Cambio guardado. Ejecuta /restart para aplicar."
+        }
+        
+    except Exception as e:
+        return {"error": str(e), "success": False}
+
+
+@app.post("/api/toggle-all-coins")
+async def toggle_all_coins(request: Request):
+    """Activa o desactiva TODAS las monedas."""
+    try:
+        data = await request.json()
+        active = data.get("active")
+        category = data.get("category")  # Opcional: filtrar por categoría
+        
+        if active is None:
+            return {"error": "Falta 'active'", "success": False}
+        
+        registry = _load_registry()
+        changed = []
+        
+        for symbol, data_coin in registry.items():
+            if category and data_coin.get("category") != category:
+                continue
+            if data_coin.get("active", 0) != (1 if active else 0):
+                data_coin["active"] = 1 if active else 0
+                changed.append(symbol)
+        
+        _save_registry(registry)
+        
+        cat_msg = f" en categoría '{category}'" if category else ""
+        await notifier.enviar_telegram(
+            f"🔄 <b>Todas {'ACTIVADAS' if active else 'DESACTIVADAS'}{cat_msg}</b>\n"
+            f"Monedas afectadas: {len(changed)}\n"
+            f"⚠️ Ejecuta <code>/restart</code> para aplicar cambios."
+        )
+        
+        # Broadcast update
+        update_payload = {
+            symbol: {"active": active} 
+            for symbol in changed
+        }
+        await manager.broadcast_json({
+            "msg_type": "coin_config_update",
+            "coin_config": update_payload
+        })
+        
+        return {
+            "changed": changed,
+            "count": len(changed),
+            "active": active,
+            "success": True,
+            "needs_restart": True
+        }
+        
+    except Exception as e:
+        return {"error": str(e), "success": False}
 
 
 async def orquestador_eventos(queue_eventos: asyncio.Queue, precios_vivo: dict,
