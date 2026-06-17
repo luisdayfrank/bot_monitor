@@ -108,6 +108,39 @@
             background: rgba(59, 130, 246, 0.15);
             border-left: 3px solid #3b82f6;
         }
+        .coin-item.disabled {
+            opacity: 0.4;
+            filter: grayscale(0.6);
+        }
+
+        /* Toggle switch */
+        .toggle-switch {
+            position: relative;
+            width: 36px;
+            height: 20px;
+            background-color: #374151;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            flex-shrink: 0;
+        }
+        .toggle-switch.active {
+            background-color: #22c55e;
+        }
+        .toggle-switch::after {
+            content: '';
+            position: absolute;
+            top: 2px;
+            left: 2px;
+            width: 16px;
+            height: 16px;
+            background-color: white;
+            border-radius: 50%;
+            transition: transform 0.2s;
+        }
+        .toggle-switch.active::after {
+            transform: translateX(16px);
+        }
 
         #tvchart { min-height: 400px; position: relative; }
     </style>
@@ -128,9 +161,30 @@
             </div>
         </div>
 
-        <div class="p-3 text-xs text-gray-400 font-semibold uppercase tracking-wider bg-gray-800/50 flex justify-between">
-            <span>Activos</span>
-            <span id="coin-count" class="text-gray-500">0</span>
+        <!-- FILTROS Y CONTROLES -->
+        <div class="p-2 border-b border-gray-700 bg-gray-800/80">
+            <div class="flex items-center justify-between mb-2">
+                <span class="text-xs text-gray-400 font-semibold uppercase tracking-wider">Activos</span>
+                <div class="flex items-center gap-2">
+                    <span id="coin-count" class="text-xs text-gray-500 font-mono">0/0</span>
+                    <button onclick="toggleAllCoins(true)" class="text-[10px] px-2 py-1 rounded bg-green-900/50 text-green-400 hover:bg-green-900 border border-green-700 transition">ON ALL</button>
+                    <button onclick="toggleAllCoins(false)" class="text-[10px] px-2 py-1 rounded bg-red-900/50 text-red-400 hover:bg-red-900 border border-red-700 transition">OFF ALL</button>
+                </div>
+            </div>
+            <div class="flex items-center gap-2">
+                <input type="text" id="coin-filter" placeholder="Filtrar moneda..." 
+                       class="flex-1 bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300 focus:outline-none focus:border-blue-500"
+                       oninput="filterCoinList()">
+                <select id="state-filter" onchange="filterCoinList()" 
+                        class="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300 focus:outline-none focus:border-blue-500">
+                    <option value="all">Todos</option>
+                    <option value="active">Activos</option>
+                    <option value="paused">Pausados</option>
+                    <option value="FIRE">FIRE</option>
+                    <option value="ARMED">ARMED</option>
+                    <option value="COOLDOWN">COOLDOWN</option>
+                </select>
+            </div>
         </div>
 
         <div id="coin-list" class="flex-1 overflow-y-auto p-2 space-y-1">
@@ -241,6 +295,7 @@
         let activeSymbol = null;
         let activeTimeframe = '1m';
         let marketData = {};
+        let coinConfig = {};      // { symbol: { active: true/false, ... } }
         let ws = null;
         let reconnectTimer = null;
         let reconnectDelay = 3000;
@@ -512,7 +567,104 @@
         }
 
         // ============================================
-        // CARGAR SNAPSHOT REST
+        // TOGGLE MONEDAS
+        // ============================================
+        function toggleCoin(symbol, event) {
+            if (event) event.stopPropagation();
+            
+            const isActive = coinConfig[symbol] ? coinConfig[symbol].active : true;
+            const newState = !isActive;
+            
+            // Actualizar estado local
+            if (!coinConfig[symbol]) coinConfig[symbol] = {};
+            coinConfig[symbol].active = newState;
+            
+            // Actualizar UI
+            updateCoinToggleUI(symbol, newState);
+            
+            // Enviar al servidor
+            fetch('/api/toggle-coin', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ symbol: symbol, active: newState })
+            }).catch(e => console.error('[TOGGLE] Error:', e));
+            
+            // Si la moneda activa se desactiva, limpiar gráfico
+            if (activeSymbol === symbol && !newState) {
+                candleSeries.setData([]);
+                emaSeries.setData([]);
+                ema200Series.setData([]);
+                document.getElementById('active-coin-title').innerText = 'SELECCIONA MONEDA';
+                document.getElementById('active-coin-price').innerText = '--.----';
+                activeSymbol = null;
+            }
+            
+            filterCoinList();
+        }
+
+        function updateCoinToggleUI(symbol, isActive) {
+            const item = document.getElementById(`coin-${symbol}`);
+            const toggle = document.getElementById(`toggle-${symbol}`);
+            if (item) {
+                if (isActive) {
+                    item.classList.remove('disabled');
+                } else {
+                    item.classList.add('disabled');
+                }
+            }
+            if (toggle) {
+                if (isActive) {
+                    toggle.classList.add('active');
+                } else {
+                    toggle.classList.remove('active');
+                }
+            }
+        }
+
+        function toggleAllCoins(state) {
+            Object.keys(coinConfig).forEach(sym => {
+                coinConfig[sym].active = state;
+                updateCoinToggleUI(sym, state);
+            });
+            
+            fetch('/api/toggle-all-coins', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ active: state })
+            }).catch(e => console.error('[TOGGLE ALL] Error:', e));
+            
+            filterCoinList();
+        }
+
+        function filterCoinList() {
+            const textFilter = document.getElementById('coin-filter').value.toLowerCase();
+            const stateFilter = document.getElementById('state-filter').value;
+            
+            document.querySelectorAll('.coin-item').forEach(item => {
+                const symbol = item.dataset.symbol;
+                const data = marketData[symbol];
+                let visible = true;
+                
+                // Filtro de texto
+                if (textFilter && !symbol.toLowerCase().includes(textFilter)) {
+                    visible = false;
+                }
+                
+                // Filtro de estado
+                if (stateFilter === 'active') {
+                    if (!coinConfig[symbol] || !coinConfig[symbol].active) visible = false;
+                } else if (stateFilter === 'paused') {
+                    if (coinConfig[symbol] && coinConfig[symbol].active) visible = false;
+                } else if (stateFilter !== 'all') {
+                    if (!data || data.estado !== stateFilter) visible = false;
+                }
+                
+                item.style.display = visible ? '' : 'none';
+            });
+        }
+
+        // ============================================
+        // CARGAR SNAPSHOT REST — SIN DATOS HISTÓRICOS
         // ============================================
         async function loadSnapshot() {
             try {
@@ -523,6 +675,11 @@
                 if (!data.snapshot) {
                     console.warn('[SNAPSHOT] Respuesta vacía del servidor');
                     return;
+                }
+
+                // Cargar configuración de monedas (activo/pausado)
+                if (data.coin_config) {
+                    coinConfig = data.coin_config;
                 }
 
                 for (const [sym, symData] of Object.entries(data.snapshot)) {
@@ -536,7 +693,6 @@
                         marketData[sym].score = symData.estado.score;
                         marketData[sym].filtro_aprobado = symData.estado.filtro_aprobado;
                         marketData[sym].velas_confirmacion = symData.estado.velas_confirmacion;
-                        // FASE 4: Circuit breaker
                         marketData[sym].circuit_breaker = symData.estado.circuit_breaker_activo;
                     }
 
@@ -575,7 +731,11 @@
                 }
 
                 if (!activeSymbol && Object.keys(marketData).length > 0) {
-                    selectCoin(Object.keys(marketData)[0]);
+                    // Seleccionar primera moneda activa
+                    const firstActive = Object.keys(marketData).find(s => 
+                        coinConfig[s] && coinConfig[s].active
+                    );
+                    selectCoin(firstActive || Object.keys(marketData)[0]);
                 } else if (activeSymbol && marketData[activeSymbol]) {
                     updateIndicatorsUI(marketData[activeSymbol]);
                 }
@@ -588,7 +748,7 @@
         }
 
         // ============================================
-        // CARGAR VELAS
+        // CARGAR VELAS — NO SE CARGA AUTOMÁTICAMENTE AL INICIAR
         // ============================================
         async function loadChartData(symbol, tf = '1m') {
             try {
@@ -662,6 +822,12 @@
 
         function selectCoin(symbol) {
             if (!symbol) return;
+            
+            // No permitir seleccionar moneda pausada
+            if (coinConfig[symbol] && !coinConfig[symbol].active) {
+                return;
+            }
+            
             activeSymbol = symbol;
             document.getElementById('active-coin-title').innerText = symbol;
 
@@ -674,6 +840,7 @@
             }
 
             if (marketData[symbol]) updateIndicatorsUI(marketData[symbol]);
+            // Cargar velas solo al seleccionar explícitamente
             loadChartData(symbol, activeTimeframe);
         }
 
@@ -789,7 +956,6 @@
                 }
             }
 
-            // FASE 4: Circuit breaker badge
             const cbEl = document.getElementById('active-coin-cb');
             if (cbEl) {
                 if (data.circuit_breaker) {
@@ -955,7 +1121,7 @@
         }, 20000);
 
         // ============================================
-        // MANEJADOR DE MENSAJES WS — FASE 4: Snapshot consolidado
+        // MANEJADOR DE MENSAJES WS
         // ============================================
         function handleMessage(data) {
             try {
@@ -983,7 +1149,6 @@
                     if (!activeSymbol) selectCoin(sym);
                 }
 
-                // FASE 4: Snapshot consolidado (único mensaje por símbolo)
                 if (data.msg_type === 'snapshot' && data.payload) {
                     const p = data.payload;
                     if (p.precio != null) marketData[sym].price = p.precio;
@@ -1037,7 +1202,6 @@
                     return;
                 }
 
-                // Mensajes individuales (compatibilidad hacia atrás)
                 if (data.msg_type === 'precio') {
                     marketData[sym].price = data.price;
                     const priceEl = document.getElementById(`list-price-${sym}`);
@@ -1045,6 +1209,15 @@
 
                 } else if (data.msg_type === 'alerta' && data.payload) {
                     logAlert(data.payload);
+                } else if (data.msg_type === 'coin_config_update') {
+                    // Actualización de configuración de moneda desde el servidor
+                    if (data.coin_config) {
+                        coinConfig = { ...coinConfig, ...data.coin_config };
+                        Object.keys(data.coin_config).forEach(s => {
+                            updateCoinToggleUI(s, data.coin_config[s].active);
+                        });
+                        filterCoinList();
+                    }
                 } else {
                     console.log('[WS] Tipo no manejado:', data.msg_type);
                 }
@@ -1063,21 +1236,26 @@
             const list = document.getElementById('coin-list');
             if (list.innerHTML.includes('Esperando datos')) list.innerHTML = '';
 
+            const isActive = coinConfig[symbol] ? coinConfig[symbol].active : true;
+
             const html = `
-                <button id="coin-${symbol}" onclick="selectCoin('${symbol}')"
-                        class="coin-item w-full text-left px-3 py-2.5 rounded-lg border border-transparent hover:bg-gray-700/50 transition flex justify-between items-center group">
-                    <div class="flex items-center gap-2.5">
-                        <span id="state-dot-${symbol}" class="w-2.5 h-2.5 rounded-full bg-gray-500 shrink-0"></span>
-                        <div class="flex flex-col">
-                            <span class="font-bold text-sm group-hover:text-blue-400 transition">${symbol}</span>
+                <div id="coin-${symbol}" data-symbol="${symbol}" 
+                     class="coin-item w-full text-left px-3 py-2.5 rounded-lg border border-transparent hover:bg-gray-700/50 transition flex justify-between items-center group ${!isActive ? 'disabled' : ''}">
+                    <div class="flex items-center gap-2.5 flex-1 min-w-0">
+                        <div id="toggle-${symbol}" 
+                             class="toggle-switch ${isActive ? 'active' : ''}"
+                             onclick="toggleCoin('${symbol}', event)"
+                             title="${isActive ? 'Desactivar' : 'Activar'} moneda"></div>
+                        <div class="flex flex-col min-w-0">
+                            <span class="font-bold text-sm group-hover:text-blue-400 transition truncate">${symbol}</span>
                             <span id="list-state-${symbol}" class="state-badge state-badge-monitoreo w-fit mt-0.5">MONITOREO</span>
                         </div>
                     </div>
-                    <div class="flex flex-col items-end">
+                    <div class="flex flex-col items-end shrink-0 ml-2">
                         <span id="list-price-${symbol}" class="font-mono text-sm text-gray-400">...</span>
                         <span id="list-dir-${symbol}" class="text-[9px] text-gray-600 font-mono mt-0.5 hidden">--</span>
                     </div>
-                </button>
+                </div>
             `;
             list.insertAdjacentHTML('beforeend', html);
             updateCoinCount();
@@ -1096,9 +1274,7 @@
                 stateEl.innerText = data.estado || 'MONITOREO';
                 stateEl.className = `state-badge w-fit mt-0.5 ${getStateBadgeClass(data.estado, cb)}`;
             }
-            if (dotEl) {
-                dotEl.className = `w-2.5 h-2.5 rounded-full shrink-0 ${getStateDot(data.estado, cb)}`;
-            }
+            // El dot ya no existe como elemento separado, ahora es el toggle
             if (dirEl && data.direccion_filtro) {
                 dirEl.innerText = data.direccion_filtro;
                 dirEl.className = `text-[9px] font-mono mt-0.5 ${data.direccion_filtro === 'LONG' ? 'text-green-500' : 'text-red-500'}`;
@@ -1107,8 +1283,9 @@
         }
 
         function updateCoinCount() {
-            const count = Object.keys(marketData).length;
-            document.getElementById('coin-count').innerText = count;
+            const total = Object.keys(coinConfig).length || Object.keys(marketData).length;
+            const active = Object.values(coinConfig).filter(c => c.active).length;
+            document.getElementById('coin-count').innerText = `${active}/${total}`;
         }
 
         // ============================================
@@ -1117,6 +1294,8 @@
         document.addEventListener('DOMContentLoaded', () => {
             renderAlertsFromStorage();
             window.dispatchEvent(new Event('resize'));
+            // NO cargar snapshot de velas históricas al inicio
+            // Solo cargamos el estado de las monedas y esperamos WebSocket
             loadSnapshot().then(() => {
                 connectWebSocket();
             });
