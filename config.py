@@ -1,7 +1,44 @@
-##v5.4
 from pydantic import BaseModel, Field
 from typing import List
 import os
+import json
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REGISTRO DE MONEDAS — JSON separado del config
+# ═══════════════════════════════════════════════════════════════════════════════
+def load_coin_registry():
+    """Carga el registro de monedas desde coins_registry.json."""
+    registry_path = "coins_registry.json"
+    default_symbols = ["TRXUSDT", "ZECUSDT", "WIFUSDT", "NEARUSDT", "MEMEUSDT", 
+                      "APTUSDT", "XLMUSDT", "ADAUSDT", "DOGEUSDT", "INJUSDT"]
+    
+    if not os.path.exists(registry_path):
+        # Crear archivo con defaults si no existe
+        registry = {s: {"active": 1, "category": "default"} for s in default_symbols}
+        with open(registry_path, 'w', encoding='utf-8') as f:
+            json.dump(registry, f, indent=2, ensure_ascii=False)
+        return default_symbols, registry
+    
+    try:
+        with open(registry_path, 'r', encoding='utf-8') as f:
+            registry = json.load(f)
+        
+        # Solo retornar las activas (active: 1) para el bot
+        active_symbols = [sym for sym, data in registry.items() if data.get("active", 0) == 1]
+        
+        # Si no hay activas, fallback a defaults
+        if not active_symbols:
+            print("⚠️ Ninguna moneda activa en registry. Usando defaults.")
+            return default_symbols, registry
+            
+        return active_symbols, registry
+        
+    except Exception as e:
+        print(f"❌ Error leyendo coins_registry.json: {e}. Usando defaults.")
+        return default_symbols, {}
+
+# Cargar al importar
+_ACTIVE_SYMBOLS, _COIN_REGISTRY = load_coin_registry()
 
 class Config(BaseModel):
     # ───────────────────────────────────────────────────────────────────────────────
@@ -12,11 +49,14 @@ class Config(BaseModel):
     # ───────────────────────────────────────────────────────────────────────────────
     timezone: str = "America/Caracas"  # UTC-4, sin horario de verano
 
-    # Monedas a monitorear (max 10)
+    # Monedas a monitorear (cargadas dinámicamente desde coins_registry.json)
     symbols: List[str] = Field(
-        default=["TRXUSDT", "ZECUSDT", "WIFUSDT", "NEARUSDT", "MEMEUSDT", "APTUSDT", "XLMUSDT", "ADAUSDT", "DOGEUSDT", "INJUSDT" ],
-        max_length=10
+        default=_ACTIVE_SYMBOLS,
+        max_length=50  # Aumentado a 50 para soportar el registro completo
     )
+    
+    # Registro completo de monedas (para referencia del dashboard)
+    coin_registry: dict = Field(default=_COIN_REGISTRY, exclude=True)
 
     # Timeframes
     tf_micro: str = "1m"       # Gatillo sniper
