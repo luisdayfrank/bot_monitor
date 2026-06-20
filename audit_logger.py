@@ -33,6 +33,10 @@ class AuditLogger:
         self._disparos_lock = asyncio.Lock()
         self._disparos_activos: Dict[str, dict] = {}
 
+        # FASE 5.6: Seguimiento virtual de near-misses
+        self._near_miss_lock = asyncio.Lock()
+        self._near_miss_activos: Dict[str, dict] = {}
+
     async def run(self):
         await self._recuperar_disparos_activos()
         while not self._shutdown.is_set():
@@ -472,3 +476,217 @@ class AuditLogger:
             await eliminar_disparo_activo(disparo['evento_id'])
         async with self._disparos_lock:
             self._disparos_activos.clear()
+
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 5.6: SEGUIMIENTO VIRTUAL DE NEAR-MISSES
+    # Rastrea el precio durante 2h post-near-miss para evaluar oportunidad perdida
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    async def iniciar_seguimiento_near_miss(self, symbol: str, score: int, umbral: int,
+                                             direccion: str, precio: float,
+                                             contexto: dict = None):
+        """
+        Inicia seguimiento virtual de un near-miss de alto score.
+        Similar al seguimiento post-FIRE, pero para trades que NO se ejecutaron.
+        Permite evaluar si flexibilizar filtros aumentaría rentabilidad o solo riesgo.
+        """
+        if not CONFIG.modo_auditoria:
+            return
+
+        async with self._near_miss_lock:
+            # Evitar duplicados: si ya hay seguimiento para este símbolo, reemplazar solo si es más reciente
+            ts_actual = now_utc()
+            if symbol in self._near_miss_activos:
+                existente = self._near_miss_activos[symbol]
+                minutos_desde_inicio = (ts_actual - existente['timestamp_utc']).total_seconds() / 60
+                if minutos_desde_inicio < CONFIG.near_miss_tracking_horas * 60:
+                    # Ya hay seguimiento activo, no duplicar
+                    return
+
+            near_miss_id = f"NM_{symbol}_{int(ts_actual.timestamp())}"
+
+            self._near_miss_activos[symbol] = {
+                'near_miss_id': near_miss_id,
+                'timestamp_utc': ts_actual,
+                'symbol': symbol,
+                'score': score,
+                'umbral': umbral,
+                'direccion': direccion,
+                'precio_inicial': precio,
+                'precio_maximo': precio,
+                'precio_minimo': precio,
+                'muestras': [],  # Lista de {timestamp, precio, minutos_desde}
+                'muestras_guardadas': 0,
+                'contexto_json': json.dumps(contexto) if contexto else None,
+            }
+
+            # Guardar evento de inicio de seguimiento virtual
+            contexto_seguimiento = {
+                'near_miss_id': near_miss_id,
+                'score': score,
+                'umbral': umbral,
+                'direccion': direccion,
+                'precio_inicial': precio,
+                'timestamp_local': utc_to_local(ts_actual).isoformat(),
+                'contexto_original': contexto,
+            }
+
+            evento = {
+                'symbol': symbol,
+                'timestamp_utc': ts_actual,
+                'tipo': 'NEAR_MISS_SEGUIMIENTO_INICIO',
+                'direccion': direccion,
+                'precio': precio,
+                'contexto_json': json.dumps(contexto_seguimiento),
+                'grid_params_json': None,
+                'score': score,
+                'rechazos_json': json.dumps([f"Umbral: {umbral}"]),
+                'estado_maquina': 'NEAR_MISS_TRACKING'
+            }
+
+            async with self._buffer_lock:
+                self._buffer_eventos.append(evento)
+
+            print(f"  🔍 {symbol} Seguimiento virtual NEAR-MISS iniciado | Score: {score} | Umbral: {umbral} | Dir: {direccion} | Precio: {precio}")
+
+    async def trackear_precio_near_miss(self, symbol: str, precio: float, timestamp_utc: datetime):
+        """
+        Trackea precio post-near-miss igual que se hace post-FIRE.
+        Se llama periódicamente (cada vela 15m o cada muestra de precio).
+        """
+        if not CONFIG.modo_auditoria:
+            return
+
+        async with self._near_miss_lock:
+            if symbol not in self._near_miss_activos:
+                return
+
+            if timestamp_utc.tzinfo is None:
+                timestamp_utc = timestamp_utc.replace(tzinfo=pytz.UTC)
+
+            near_miss = self._near_miss_activos[symbol]
+            minutos_desde = int((timestamp_utc - near_miss['timestamp_utc']).total_seconds() / 60)
+            horas_seguimiento = CONFIG.near_miss_tracking_horas
+            intervalo = CONFIG.near_miss_tracking_intervalo_min
+
+            # Actualizar máximos/mínimos
+            if precio > near_miss['precio_maximo']:
+                near_miss['precio_maximo'] = precio
+            if precio < near_miss['precio_minimo']:
+                near_miss['precio_minimo'] = precio
+
+            # Guardar muestra periódica
+            if minutos_desde <= horas_seguimiento * 60:
+                intervalo_actual = minutos_desde // intervalo
+                if intervalo_actual > near_miss['muestras_guardadas']:
+                    near_miss['muestras'].append({
+                        'timestamp_utc': timestamp_utc.isoformat(),
+                        'precio': precio,
+                        'minutos_desde': minutos_desde,
+                        'distancia_pct': round((precio - near_miss['precio_inicial']) / near_miss['precio_inicial'] * 100, 4)
+                    })
+                    near_miss['muestras_guardadas'] = intervalo_actual
+
+                    # Guardar evento de muestra
+                    muestra_evento = {
+                        'symbol': symbol,
+                        'timestamp_utc': timestamp_utc,
+                        'tipo': 'NEAR_MISS_MUESTRA',
+                        'direccion': near_miss['direccion'],
+                        'precio': precio,
+                        'contexto_json': json.dumps({
+                            'near_miss_id': near_miss['near_miss_id'],
+                            'minutos_desde': minutos_desde,
+                            'precio_inicial': near_miss['precio_inicial'],
+                            'distancia_pct': round((precio - near_miss['precio_inicial']) / near_miss['precio_inicial'] * 100, 4),
+                            'precio_maximo': near_miss['precio_maximo'],
+                            'precio_minimo': near_miss['precio_minimo'],
+                        }),
+                        'grid_params_json': None,
+                        'score': near_miss['score'],
+                        'rechazos_json': None,
+                        'estado_maquina': 'NEAR_MISS_TRACKING'
+                    }
+                    async with self._buffer_lock:
+                        self._buffer_eventos.append(muestra_evento)
+
+            # Si se cumplió el tiempo de seguimiento, guardar resultados finales
+            if minutos_desde > horas_seguimiento * 60:
+                await self._guardar_resultados_near_miss(symbol, near_miss, timestamp_utc)
+                del self._near_miss_activos[symbol]
+
+    async def _guardar_resultados_near_miss(self, symbol: str, near_miss: dict, timestamp_utc: datetime):
+        """Guarda resultados finales del seguimiento virtual de un near-miss."""
+        precio_inicial = near_miss['precio_inicial']
+        precio_max = near_miss['precio_maximo']
+        precio_min = near_miss['precio_minimo']
+        direccion = near_miss['direccion']
+
+        # Calcular métricas de rendimiento virtual
+        if direccion == 'SHORT':
+            # Para SHORT: el precio bajando es favorable
+            mejor_movimiento_pct = round((precio_inicial - precio_min) / precio_inicial * 100, 4)
+            peor_movimiento_pct = round((precio_max - precio_inicial) / precio_inicial * 100, 4)
+            precio_final_virtual = precio_min  # Asumimos entrada óptima
+            rentable = precio_min < precio_inicial  # Bajó = hubiera sido rentable
+        elif direccion == 'LONG':
+            # Para LONG: el precio subiendo es favorable
+            mejor_movimiento_pct = round((precio_max - precio_inicial) / precio_inicial * 100, 4)
+            peor_movimiento_pct = round((precio_inicial - precio_min) / precio_inicial * 100, 4)
+            precio_final_virtual = precio_max  # Asumimos entrada óptima
+            rentable = precio_max > precio_inicial  # Subió = hubiera sido rentable
+        else:
+            mejor_movimiento_pct = round(abs(precio_max - precio_inicial) / precio_inicial * 100, 4)
+            peor_movimiento_pct = round(abs(precio_min - precio_inicial) / precio_inicial * 100, 4)
+            precio_final_virtual = precio_max if precio_max > precio_inicial else precio_min
+            rentable = None
+
+        resultados = {
+            'near_miss_id': near_miss['near_miss_id'],
+            'symbol': symbol,
+            'direccion': direccion,
+            'score': near_miss['score'],
+            'umbral': near_miss['umbral'],
+            'precio_inicial': precio_inicial,
+            'precio_maximo': precio_max,
+            'precio_minimo': precio_min,
+            'mejor_movimiento_pct': mejor_movimiento_pct,
+            'peor_movimiento_pct': peor_movimiento_pct,
+            'rentable': rentable,
+            'duracion_minutos': CONFIG.near_miss_tracking_horas * 60,
+            'total_muestras': len(near_miss['muestras']),
+            'muestras': near_miss['muestras'],
+            'conclusion': 'HUBIERA SIDO RENTABLE' if rentable else 'NO HUBIERA SIDO RENTABLE' if rentable is not None else 'INDETERMINADO',
+            'timestamp_final_utc': timestamp_utc.isoformat(),
+            'timestamp_final_local': utc_to_local(timestamp_utc).isoformat(),
+        }
+
+        # Guardar evento final de seguimiento virtual
+        evento_final = {
+            'symbol': symbol,
+            'timestamp_utc': timestamp_utc,
+            'tipo': 'NEAR_MISS_SEGUIMIENTO_FIN',
+            'direccion': direccion,
+            'precio': precio_final_virtual,
+            'contexto_json': json.dumps(resultados),
+            'grid_params_json': None,
+            'score': near_miss['score'],
+            'rechazos_json': json.dumps([resultados['conclusion']]),
+            'estado_maquina': 'NEAR_MISS_TRACKING_FIN'
+        }
+
+        async with self._buffer_lock:
+            self._buffer_eventos.append(evento_final)
+
+        rentable_icon = "✅" if rentable else "❌" if rentable is not None else "⚪"
+        print(f"  📊 {symbol} Seguimiento virtual NEAR-MISS finalizado | {rentable_icon} {resultados['conclusion']} | Mejor mov: {mejor_movimiento_pct:+.4f}% | Peor mov: {peor_movimiento_pct:+.4f}%")
+
+    async def cerrar_seguimiento_near_miss_todos(self):
+        """Cierra todos los seguimientos virtuales de near-misses pendientes."""
+        async with self._near_miss_lock:
+            near_miss_copia = list(self._near_miss_activos.items())
+        for symbol, near_miss in near_miss_copia:
+            await self._guardar_resultados_near_miss(symbol, near_miss, now_utc())
+        async with self._near_miss_lock:
+            self._near_miss_activos.clear()

@@ -360,6 +360,31 @@ class SignalGenerator:
                 detalle=detalle
             )
 
+            # ═══════════════════════════════════════════════════════════════════════════════
+            # FASE 5.6: Iniciar seguimiento virtual para near-misses de alto score
+            # Solo cuando el score PASÓ el umbral pero fue bloqueado por otro filtro
+            # (ej: volumen, MFM, etc). Esto permite evaluar si flexibilizar el filtro
+            # hubiera resultado en una oportunidad rentable.
+            # ═══════════════════════════════════════════════════════════════════════════════
+            if tipo_near_miss == "SCORE_PASA_OTRO_FILTRO_NO" and self.audit_logger:
+                await self.audit_logger.iniciar_seguimiento_near_miss(
+                    symbol=symbol,
+                    score=score_macro,
+                    umbral=umbral_efectivo,
+                    direccion=direction,
+                    precio=i15.get('close', 0),
+                    contexto={
+                        'tipo_near_miss': tipo_near_miss,
+                        'rechazos': rechazos,
+                        'adx': i15.get('adx'),
+                        'atr': i15.get('atr'),
+                        'macd_hist': i15.get('macd_hist'),
+                        'rsi': i15.get('rsi'),
+                        'volumen_ratio': i15.get('volume') / i15.get('volume_sma20', 1) if i15.get('volume_sma20') else 0,
+                        'mfm_sma5': i15.get('mfm_sma5'),
+                    }
+                )
+
     # ================================================================
     # CAPA 1: FILTRO MACRO (V5.5 con auditoría granular)
     # ================================================================
@@ -488,38 +513,80 @@ class SignalGenerator:
         else:
             score_macro += 15
 
-        # MFM proporcional
-        if vol_ratio >= CONFIG.volume_min_ratio:
-            mfm_alineado = False
-            if direction == 'SHORT' and mfm_sma5 < -CONFIG.mfm_umbral_alineacion:
-                mfm_alineado = True
-                score_macro += CONFIG.mfm_bonus_alineado
-                print(f"  📊 {symbol} Volumen+MFM alineado SHORT | mfm={mfm_sma5:.3f} | +{CONFIG.mfm_bonus_alineado}pts")
-            elif direction == 'LONG' and mfm_sma5 > CONFIG.mfm_umbral_alineacion:
-                mfm_alineado = True
-                score_macro += CONFIG.mfm_bonus_alineado
-                print(f"  📊 {symbol} Volumen+MFM alineado LONG | mfm={mfm_sma5:.3f} | +{CONFIG.mfm_bonus_alineado}pts")
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # FASE 5.6: VOLUMEN DINÁMICO CONDICIONAL — Bypass por convicción alta
+        # ═══════════════════════════════════════════════════════════════════════════════
+
+        # Calcular condiciones de bypass ANTES de evaluar volumen
+        atr_historico_hoy = self._atr15m_historico.get(symbol, [])
+        atr_percentil_umbral = np.percentile(atr_historico_hoy, CONFIG.volumen_bypass_atr_percentil) if len(atr_historico_hoy) >= 10 else float('inf')
+        atr_en_percentil_75 = atr >= atr_percentil_umbral and len(atr_historico_hoy) >= 10
+
+        # MACD confirma dirección: acelerando en la dirección del trade
+        macd_confirma_direccion = False
+        if direction == 'SHORT' and macd_hist < 0 and macd_hist < macd_hist_prev:
+            macd_confirma_direccion = True  # MACD negativo y acelerando = confirma SHORT
+        elif direction == 'LONG' and macd_hist > 0 and macd_hist > macd_hist_prev:
+            macd_confirma_direccion = True  # MACD positivo y acelerando = confirma LONG
+
+        # Modo "Convicción Alta": score sobrado + tendencia confirmada + MACD alineado
+        conviccion_alta = (
+            score_macro >= umbral_entrada + CONFIG.volumen_bypass_score_extra and
+            adx > CONFIG.volumen_bypass_adx_min and
+            macd_confirma_direccion and
+            direction != 'NEUTRAL'
+        )
+
+        bypass_volumen = conviccion_alta or atr_en_percentil_75
+        bypass_razon = None
+
+        if bypass_volumen:
+            if conviccion_alta and atr_en_percentil_75:
+                bypass_razon = f"Conviccion Alta + ATR p75 | Score:{score_macro}>={umbral_entrada + CONFIG.volumen_bypass_score_extra} ADX:{adx:.1f}>{CONFIG.volumen_bypass_adx_min} MACD:{macd_hist:.6f}"
+            elif conviccion_alta:
+                bypass_razon = f"Conviccion Alta | Score:{score_macro}>={umbral_entrada + CONFIG.volumen_bypass_score_extra} ADX:{adx:.1f}>{CONFIG.volumen_bypass_adx_min}"
             else:
-                mfm_fuerza = abs(mfm_sma5)
-                if mfm_fuerza >= 0.5:
-                    penalizacion = 20
-                elif mfm_fuerza >= 0.3:
-                    penalizacion = 15
-                elif mfm_fuerza >= 0.1:
-                    penalizacion = 10
+                bypass_razon = f"ATR percentil {CONFIG.volumen_bypass_atr_percentil:.0f} | ATR:{atr:.6f} >= p{CONFIG.volumen_bypass_atr_percentil:.0f}:{atr_percentil_umbral:.6f}"
+
+            print(f"  🎯 {symbol} BYPASS VOLUMEN — {bypass_razon}")
+
+        # Evaluar volumen/MFM solo si NO hay bypass
+        if not bypass_volumen:
+            if vol_ratio >= CONFIG.volume_min_ratio:
+                mfm_alineado = False
+                if direction == 'SHORT' and mfm_sma5 < -CONFIG.mfm_umbral_alineacion:
+                    mfm_alineado = True
+                    score_macro += CONFIG.mfm_bonus_alineado
+                    print(f"  📊 {symbol} Volumen+MFM alineado SHORT | mfm={mfm_sma5:.3f} | +{CONFIG.mfm_bonus_alineado}pts")
+                elif direction == 'LONG' and mfm_sma5 > CONFIG.mfm_umbral_alineacion:
+                    mfm_alineado = True
+                    score_macro += CONFIG.mfm_bonus_alineado
+                    print(f"  📊 {symbol} Volumen+MFM alineado LONG | mfm={mfm_sma5:.3f} | +{CONFIG.mfm_bonus_alineado}pts")
                 else:
-                    penalizacion = 5
+                    mfm_fuerza = abs(mfm_sma5)
+                    if mfm_fuerza >= 0.5:
+                        penalizacion = 20
+                    elif mfm_fuerza >= 0.3:
+                        penalizacion = 15
+                    elif mfm_fuerza >= 0.1:
+                        penalizacion = 10
+                    else:
+                        penalizacion = 5
 
-                if adx > 40:
-                    penalizacion_antes = penalizacion
-                    penalizacion = penalizacion // 2
-                    print(f"  📊 {symbol} MFM contradictorio REDUCIDO por ADX>40 | {penalizacion_antes} → {penalizacion}pts")
+                    if adx > 40:
+                        penalizacion_antes = penalizacion
+                        penalizacion = penalizacion // 2
+                        print(f"  📊 {symbol} MFM contradictorio REDUCIDO por ADX>40 | {penalizacion_antes} → {penalizacion}pts")
 
-                score_macro -= penalizacion
-                rechazos.append(f"MFM contradictorio: mfm={mfm_sma5:.3f} vs {direction} (-{penalizacion}pts)")
-                print(f"  ⚠️ {symbol} Volumen+MFM CONTRADICTORIO | mfm={mfm_sma5:.3f} vs {direction} | -{penalizacion}pts")
+                    score_macro -= penalizacion
+                    rechazos.append(f"MFM contradictorio: mfm={mfm_sma5:.3f} vs {direction} (-{penalizacion}pts)")
+                    print(f"  ⚠️ {symbol} Volumen+MFM CONTRADICTORIO | mfm={mfm_sma5:.3f} vs {direction} | -{penalizacion}pts")
+            else:
+                rechazos.append(f"Volumen bajo: {vol_ratio:.1%}")
         else:
-            rechazos.append(f"Volumen bajo: {vol_ratio:.1%}")
+            # Bypass activo: otorgar puntos de volumen como si estuviera alineado
+            score_macro += CONFIG.mfm_bonus_alineado
+            print(f"  📊 {symbol} Volumen BYPASS (+{CONFIG.mfm_bonus_alineado}pts) | {bypass_razon}")
 
         score_macro = max(0, min(100, score_macro))
         state.score_macro_actual = score_macro
@@ -630,6 +697,13 @@ class SignalGenerator:
             elif state.estado in ('MONITOREO',):
                 if score_macro > 40:
                     print(f"  🟡 {symbol} Filtro Macro NO apto | Score: {score_macro} | {rechazos[:1]}")
+
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # FASE 5.6: Trackear precio para seguimiento virtual de near-misses
+        # ═══════════════════════════════════════════════════════════════════════════════
+        if self.audit_logger and i15.get('timestamp'):
+            ts = datetime.fromtimestamp(i15['timestamp'] / 1000, tz=pytz.UTC) if i15['timestamp'] > 1e12 else datetime.now(pytz.UTC)
+            await self.audit_logger.trackear_precio_near_miss(symbol, i15.get('close', 0), ts)
 
     def _calcular_umbral_filtro(self, symbol: str) -> int:
         """Calcula el umbral base del filtro macro."""

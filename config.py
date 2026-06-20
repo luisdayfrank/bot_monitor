@@ -189,6 +189,20 @@ class Config(BaseModel):
     score_min_expansion: int = 65
 
     # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 5.6: VOLUMEN DINÁMICO CONDICIONAL — Bypass por convicción alta
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # Puntos EXTRA sobre el umbral necesarios para activar bypass por convicción alta
+    volumen_bypass_score_extra: int = 5
+    # ADX mínimo para que el bypass por convicción alta sea válido
+    volumen_bypass_adx_min: float = 25.0
+    # Percentil del ATR diario para bypass por volatilidad (75 = percentil 75)
+    volumen_bypass_atr_percentil: float = 75.0
+    # Horas de seguimiento virtual post-near-miss
+    near_miss_tracking_horas: int = 2
+    # Intervalo de muestras del seguimiento virtual (minutos)
+    near_miss_tracking_intervalo_min: int = 5
+
+    # ═══════════════════════════════════════════════════════════════════════════════
     # FASE 4.5: MODO AUDITORÍA EXTERNA
     # ═══════════════════════════════════════════════════════════════════════════════
 
