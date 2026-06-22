@@ -71,7 +71,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from database_v5 import guardar_alerta
-from notifier import Notifier
+from notifier_v5 import Notifier
 from config import CONFIG
 
 app = FastAPI(title="Crypto Monitor V5.1 — Multi-Timeframe Sniper Dashboard")
