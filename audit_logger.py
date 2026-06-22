@@ -18,7 +18,13 @@ from database_v5 import (
 
 class AuditLogger:
     """
-    Logger de auditoria V5.7 — Seguimiento virtual post near-miss con persistencia SQLite.
+    Logger de auditoria V5.7.1 — Seguimiento virtual post near-miss con persistencia SQLite.
+
+    FASE V5.7.1 CAMBIOS (Fix I/O):
+    ———————————————————————————————
+    • FIX CRÍTICO: Near-miss muestras solo en RAM durante seguimiento
+    • Persistencia SQLite solo al finalizar (2h) o en stop() (crash-recovery)
+    • Eliminados 23 UPDATES intermedios por near-miss (95% menos I/O)
 
     FASE V5.7 CAMBIOS:
     —————————————————
@@ -694,16 +700,14 @@ class AuditLogger:
                     })
                     near_miss["muestras_guardadas"] = intervalo_actual
 
-                    # Persistir muestras en DB
-                    try:
-                        await actualizar_near_miss_muestras(
-                            seguimiento_id=near_miss["seguimiento_id"],
-                            muestras_json=near_miss["muestras"],
-                            precio_max=near_miss["precio_maximo"],
-                            precio_min=near_miss["precio_minimo"]
-                        )
-                    except Exception as e:
-                        print(f"  ⚠️ Error persistiendo muestras near-miss {symbol}: {e}")
+                    # V5.7.1: NO persistir muestras en DB aquí — solo acumular en RAM
+                    # La persistencia ocurre en _guardar_resultados_near_miss() al finalizar
+                    # o en _persistir_near_miss_activos() durante stop() para crash-recovery
+
+                    # V5.7.1: Log silencioso de acumulación RAM (cada hora)
+                    if len(near_miss["muestras"]) % 12 == 0:
+                        print(f"  [NM-RAM] {symbol} {len(near_miss['muestras'])} muestras en RAM | "
+                              f"Max:{near_miss['precio_maximo']:.4f} Min:{near_miss['precio_minimo']:.4f}")
 
                     # Guardar evento de muestra
                     muestra_evento = {
@@ -795,6 +799,18 @@ class AuditLogger:
             "timestamp_final_utc": timestamp_utc.isoformat(),
             "timestamp_final_local": utc_to_local(timestamp_utc).isoformat(),
         }
+
+        # V5.7.1: Persistir muestras acumuladas en RAM al finalizar
+        try:
+            await actualizar_near_miss_muestras(
+                seguimiento_id=near_miss["seguimiento_id"],
+                muestras_json=near_miss["muestras"],
+                precio_max=near_miss["precio_maximo"],
+                precio_min=near_miss["precio_minimo"],
+                precio_fin=precio_fin
+            )
+        except Exception as e:
+            print(f"  ⚠️ Error persistiendo muestras finales near-miss {symbol}: {e}")
 
         # Finalizar en base de datos
         try:
