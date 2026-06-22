@@ -9,35 +9,31 @@ import json
 def load_coin_registry():
     """Carga el registro de monedas desde coins_registry.json."""
     registry_path = "coins_registry.json"
-    default_symbols = ["TRXUSDT", "ZECUSDT", "WIFUSDT", "NEARUSDT", "MEMEUSDT", 
+    default_symbols = ["TRXUSDT", "ZECUSDT", "WIFUSDT", "NEARUSDT", "MEMEUSDT",
                       "APTUSDT", "XLMUSDT", "ADAUSDT", "DOGEUSDT", "INJUSDT"]
-    
+
     if not os.path.exists(registry_path):
-        # Crear archivo con defaults si no existe
         registry = {s: {"active": 1, "category": "default"} for s in default_symbols}
         with open(registry_path, 'w', encoding='utf-8') as f:
             json.dump(registry, f, indent=2, ensure_ascii=False)
         return default_symbols, registry
-    
+
     try:
         with open(registry_path, 'r', encoding='utf-8') as f:
             registry = json.load(f)
-        
-        # Solo retornar las activas (active: 1) para el bot
+
         active_symbols = [sym for sym, data in registry.items() if data.get("active", 0) == 1]
-        
-        # Si no hay activas, fallback a defaults
+
         if not active_symbols:
             print("⚠️ Ninguna moneda activa en registry. Usando defaults.")
             return default_symbols, registry
-            
+
         return active_symbols, registry
-        
+
     except Exception as e:
         print(f"❌ Error leyendo coins_registry.json: {e}. Usando defaults.")
         return default_symbols, {}
 
-# Cargar al importar
 _ACTIVE_SYMBOLS, _COIN_REGISTRY = load_coin_registry()
 
 class Config(BaseModel):
@@ -54,7 +50,7 @@ class Config(BaseModel):
         default=_ACTIVE_SYMBOLS,
         max_length=50  # Aumentado a 50 para soportar el registro completo
     )
-    
+
     # Registro completo de monedas (para referencia del dashboard)
     coin_registry: dict = Field(default=_COIN_REGISTRY, exclude=True)
 
@@ -107,7 +103,7 @@ class Config(BaseModel):
     # FASE 5.1: PAUSA DE INACTIVIDAD (antes hardcodeado en signals_v4.py)
     # ═══════════════════════════════════════════════════════════════════════════════
     # Horas de score bajo antes de auto-pausar una moneda
-    pausa_inactividad_horas: float = 1.0    # 1 hora (antes era 3 min en hardcodeo, luego 1h)
+    pausa_inactividad_horas: float = 1.0    # 1 hora
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # FASE 3: PARÁMETROS DE SEGURIDAD DEL GRID
@@ -179,7 +175,7 @@ class Config(BaseModel):
     mfm_bonus_alineado: int = 10
 
     # ═══════════════════════════════════════════════════════════════════════════════
-    # FASE 5.3 (PREPARACIÓN): UMBRAL DINÁMICO VÍA ATR
+    # FASE 5.3: UMBRAL DINÁMICO VÍA ATR
     # ═══════════════════════════════════════════════════════════════════════════════
     # Ventana de velas 15m para calcular percentiles del ATR
     atr_percentil_ventana: int = 100
@@ -189,7 +185,7 @@ class Config(BaseModel):
     score_min_expansion: int = 65
 
     # ═══════════════════════════════════════════════════════════════════════════════
-    # FASE 5.6: VOLUMEN DINÁMICO CONDICIONAL — Bypass por convicción alta
+    # FASE 5.4: VOLUMEN DINÁMICO CONDICIONAL — Bypass por convicción alta
     # ═══════════════════════════════════════════════════════════════════════════════
     # Puntos EXTRA sobre el umbral necesarios para activar bypass por convicción alta
     volumen_bypass_score_extra: int = 5
@@ -197,10 +193,34 @@ class Config(BaseModel):
     volumen_bypass_adx_min: float = 25.0
     # Percentil del ATR diario para bypass por volatilidad (75 = percentil 75)
     volumen_bypass_atr_percentil: float = 75.0
-    # Horas de seguimiento virtual post-near-miss
-    near_miss_tracking_horas: int = 2
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # V5.7 FASE 1: SEGUIMIENTO VIRTUAL POST NEAR-MISS
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # Horas de seguimiento virtual post near-miss
+    auditoria_near_miss_horas: int = 2
     # Intervalo de muestras del seguimiento virtual (minutos)
     near_miss_tracking_intervalo_min: int = 5
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # V5.7 FASE 5: GRID NEUTRAL (desactivado por defecto, solo Fases 1-4 activas)
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # Activar estrategia de grid en mercados neutrales
+    grid_neutral_enabled: bool = False  # Toggle global, sin confirmación manual
+    # Tiempo máximo en estado NEUTRAL_GRID antes de aborto automático
+    grid_neutral_timeout_min: int = 30
+    # Aborto si ADX sube +5 sobre umbral de entrada
+    grid_neutral_aborto_adx_delta: float = 5.0
+    # Aborto si precio se mueve >2% de EMA50/200
+    grid_neutral_aborto_precio_pct: float = 2.0
+    # ADX máximo para considerar mercado neutral (sin tendencia fuerte)
+    grid_neutral_adx_max: float = 25.0
+    # RSI rango para grid neutral (no extremos)
+    grid_neutral_rsi_min: float = 35.0
+    grid_neutral_rsi_max: float = 65.0
+    # Percentil ATR para grid neutral (30-70 = volatilidad moderada)
+    grid_neutral_atr_percentil_min: float = 30.0
+    grid_neutral_atr_percentil_max: float = 70.0
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # FASE 4.5: MODO AUDITORÍA EXTERNA

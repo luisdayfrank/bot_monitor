@@ -240,6 +240,33 @@ async def init_db():
             )
         """)
 
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # V5.7: TABLA PARA SEGUIMIENTOS VIRTUALES POST NEAR-MISS
+        # ═══════════════════════════════════════════════════════════════════════════════
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS near_miss_seguimientos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                timestamp_inicio REAL NOT NULL,
+                timestamp_fin REAL,
+                precio_inicio REAL NOT NULL,
+                direccion_nm TEXT NOT NULL,
+                score INTEGER NOT NULL,
+                umbral INTEGER NOT NULL,
+                filtros_rechazo TEXT,
+                muestras_json TEXT,
+                precio_max REAL,
+                precio_min REAL,
+                precio_fin REAL,
+                movimiento_pct REAL,
+                direccion_real TEXT,
+                acerto_bot INTEGER,
+                hubiera_sido_rentable INTEGER,
+                notas TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # Índices para consultas rápidas
         await db.execute("CREATE INDEX IF NOT EXISTS idx_auditoria_fecha ON auditoria_eventos(fecha)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_auditoria_symbol ON auditoria_eventos(symbol)")
@@ -250,9 +277,12 @@ async def init_db():
         # FASE 5.1: Índice para disparos activos
         await db.execute("CREATE INDEX IF NOT EXISTS idx_disparos_activos_symbol ON auditoria_disparos_activos(symbol)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_disparos_activos_evento ON auditoria_disparos_activos(evento_id)")
+        # V5.7: Índices para near-miss seguimientos
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_nm_symbol ON near_miss_seguimientos(symbol)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_nm_timestamp ON near_miss_seguimientos(timestamp_inicio)")
 
         await db.commit()
-    print("🗄️ Base de datos inicializada (WAL mode activado) + Tablas auditoría + Disparos activos persistentes")
+    print("🗄️ Base de datos inicializada (WAL mode activado) + Tablas auditoría + Disparos activos persistentes + Near-miss seguimientos")
 
 async def insertar_vela(symbol: str, tf: str, vela: dict):
     tabla = f"velas_{tf}"
@@ -501,5 +531,113 @@ async def cargar_velas_post_evento(evento_id: int):
             WHERE evento_id = ?
             ORDER BY minutos_desde_disparo ASC
         """, (evento_id,))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# V5.7: FUNCIONES DE SEGUIMIENTO VIRTUAL POST NEAR-MISS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def guardar_near_miss_seguimiento(symbol, timestamp_inicio, precio_inicio, direccion_nm,
+                                         score, umbral, filtros_rechazo=None):
+    """Inicia un seguimiento virtual post near-miss. Retorna el ID del seguimiento."""
+    db = await _get_db()
+    for attempt in range(5):
+        try:
+            async with _db_lock:
+                await db.execute("""
+                    INSERT INTO near_miss_seguimientos
+                    (symbol, timestamp_inicio, precio_inicio, direccion_nm, score, umbral, filtros_rechazo)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (symbol, timestamp_inicio, precio_inicio, direccion_nm, score, umbral,
+                        json.dumps(filtros_rechazo) if filtros_rechazo else None))
+
+                cursor = await db.execute("SELECT last_insert_rowid()")
+                row = await cursor.fetchone()
+                await db.commit()
+
+                if row and row[0]:
+                    return row[0]
+                else:
+                    cursor2 = await db.execute(
+                        "SELECT id FROM near_miss_seguimientos WHERE symbol = ? AND timestamp_inicio = ? ORDER BY id DESC LIMIT 1",
+                        (symbol, timestamp_inicio)
+                    )
+                    row2 = await cursor2.fetchone()
+                    return row2[0] if row2 else None
+
+        except Exception as e:
+            if "database is locked" in str(e).lower() and attempt < 4:
+                wait = 0.1 * (2 ** attempt)
+                print(f"  ⚠️ DB locked (near-miss seguimiento intento {attempt+1}/5), esperando {wait}s...")
+                await asyncio.sleep(wait)
+            else:
+                print(f"  ❌ Error guardando near-miss seguimiento: {e}")
+                return None
+    return None
+
+async def actualizar_near_miss_muestras(seguimiento_id, muestras_json, precio_max=None,
+                                         precio_min=None, precio_fin=None):
+    """Actualiza las muestras y precios extremos de un seguimiento activo."""
+    campos = ["muestras_json = ?"]
+    valores = [json.dumps(muestras_json)]
+    if precio_max is not None:
+        campos.append("precio_max = ?")
+        valores.append(precio_max)
+    if precio_min is not None:
+        campos.append("precio_min = ?")
+        valores.append(precio_min)
+    if precio_fin is not None:
+        campos.append("precio_fin = ?")
+        valores.append(precio_fin)
+
+    valores.append(seguimiento_id)
+    sql = f"UPDATE near_miss_seguimientos SET {', '.join(campos)} WHERE id = ?"
+    await _execute_with_retry(sql, tuple(valores))
+
+async def finalizar_near_miss_seguimiento(seguimiento_id, timestamp_fin, precio_fin,
+                                           movimiento_pct, direccion_real, acerto_bot,
+                                           hubiera_sido_rentable, notas=None):
+    """Finaliza un seguimiento virtual con los resultados de la evaluación."""
+    await _execute_with_retry("""
+        UPDATE near_miss_seguimientos
+        SET timestamp_fin = ?, precio_fin = ?, movimiento_pct = ?,
+            direccion_real = ?, acerto_bot = ?, hubiera_sido_rentable = ?, notas = ?
+        WHERE id = ?
+    """, (timestamp_fin, precio_fin, movimiento_pct, direccion_real,
+            1 if acerto_bot else 0, 1 if hubiera_sido_rentable else 0, notas, seguimiento_id))
+
+async def cargar_near_miss_seguimientos_dia(fecha_local: str):
+    """Carga todos los seguimientos de un día específico (fecha local)."""
+    db = await _get_db()
+    async with _db_lock:
+        db.row_factory = aiosqlite.Row
+        # Convertir fecha local a rango de timestamps UTC para la consulta
+        tz = get_tz()
+        fecha_inicio = datetime.strptime(fecha_local, "%Y-%m-%d")
+        fecha_inicio = tz.localize(fecha_inicio)
+        fecha_fin = fecha_inicio + timedelta(days=1)
+        
+        ts_inicio = fecha_inicio.astimezone(pytz.UTC).timestamp()
+        ts_fin = fecha_fin.astimezone(pytz.UTC).timestamp()
+        
+        cursor = await db.execute("""
+            SELECT * FROM near_miss_seguimientos
+            WHERE timestamp_inicio >= ? AND timestamp_inicio < ?
+            ORDER BY timestamp_inicio ASC
+        """, (ts_inicio, ts_fin))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def cargar_near_miss_seguimientos_activos():
+    """Carga seguimientos que aún no han finalizado (timestamp_fin IS NULL)."""
+    db = await _get_db()
+    async with _db_lock:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT * FROM near_miss_seguimientos
+            WHERE timestamp_fin IS NULL
+            ORDER BY timestamp_inicio ASC
+        """)
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]

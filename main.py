@@ -8,9 +8,9 @@ from config import CONFIG
 from database_v5 import init_db, close_db
 from collector import DataCollector
 from indicators_v3 import IndicatorEngineV3 as IndicatorEngine
-from signals_v4 import SignalGenerator
+from signals_v5 import SignalGenerator
 from web.server_v5 import app, orquestador_eventos
-from notifier import Notifier
+from notifier_v5 import Notifier
 
 from audit_logger import AuditLogger
 from audit_reporter import AuditReporter
