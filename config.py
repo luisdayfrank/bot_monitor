@@ -206,7 +206,7 @@ class Config(BaseModel):
     # V5.7 FASE 5: GRID NEUTRAL (desactivado por defecto, solo Fases 1-4 activas)
     # ═══════════════════════════════════════════════════════════════════════════════
     # Activar estrategia de grid en mercados neutrales
-    grid_neutral_enabled: bool = False  # Toggle global, sin confirmación manual
+    grid_neutral_enabled: bool = True  # Toggle global, sin confirmación manual
     # Tiempo máximo en estado NEUTRAL_GRID antes de aborto automático
     grid_neutral_timeout_min: int = 30
     # Aborto si ADX sube +5 sobre umbral de entrada
