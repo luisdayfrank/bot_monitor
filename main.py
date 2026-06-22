@@ -13,7 +13,7 @@ from web.server_v5 import app, orquestador_eventos
 from notifier_v5 import Notifier
 
 from audit_logger import AuditLogger
-from audit_reporter import AuditReporter
+from audit_reporter_v5 import AuditReporter
 
 background_tasks = set()
 
