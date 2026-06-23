@@ -2,8 +2,8 @@
 <html lang="es" class="dark">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Crypto Monitor V5.1 — Multi-Timeframe Sniper</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Crypto Monitor V5.7 — Multi-Timeframe Sniper</title>
     <link rel="icon" href="data:,">
 
     <script src="https://cdn.tailwindcss.com"></script>
@@ -18,6 +18,7 @@
         ::-webkit-scrollbar-track { background: #1f2937; }
         ::-webkit-scrollbar-thumb { background: #374151; border-radius: 4px; }
         ::-webkit-scrollbar-thumb:hover { background: #4b5563; }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
 
         .toast-enter { animation: slideInRight 0.3s cubic-bezier(0.4, 0, 0.2, 1) forwards; }
         .toast-exit { animation: fadeOutRight 0.4s ease-in forwards; }
@@ -113,7 +114,6 @@
             filter: grayscale(0.6);
         }
 
-        /* Toggle switch */
         .toggle-switch {
             position: relative;
             width: 36px;
@@ -142,27 +142,42 @@
             transform: translateX(16px);
         }
 
+        /* Glassmorphism panels */
+        .glass-panel {
+            background: rgba(17, 24, 39, 0.85);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+
         #tvchart { min-height: 400px; position: relative; }
     </style>
 <base target="_blank">
+<base target="_blank">
 </head>
-<body class="bg-gray-900 text-white font-sans h-screen flex overflow-hidden">
+<body class="bg-[#0b0e14] text-white font-sans h-screen flex overflow-hidden">
+
+    <!-- OVERLAY MÓVIL -->
+    <div id="sidebar-overlay" onclick="toggleMobileMenu()" class="fixed inset-0 bg-black/70 z-40 hidden md:hidden backdrop-blur-sm transition-opacity"></div>
 
     <!-- SIDEBAR -->
-    <aside class="w-80 bg-gray-800 border-r border-gray-700 flex flex-col h-full z-10 shrink-0">
-        <div class="p-4 border-b border-gray-700 flex justify-between items-center bg-gray-900">
-            <h1 class="text-lg font-bold flex items-center gap-2">
+    <aside id="sidebar" class="fixed inset-y-0 left-0 transform -translate-x-full md:relative md:translate-x-0 transition-transform duration-300 ease-in-out w-80 bg-gray-900 border-r border-gray-800 flex flex-col h-full z-50 shadow-2xl md:shadow-none">
+        <div class="p-4 border-b border-gray-800 flex justify-between items-center bg-gray-900/50">
+            <h1 class="text-lg font-bold flex items-center gap-2 tracking-wide">
                 <span id="status-dot" class="w-3 h-3 rounded-full bg-yellow-500"></span>
-                Sniper V5.1
+                Sniper <span class="text-blue-500">V5.7</span>
             </h1>
             <div class="flex flex-col items-end gap-0.5">
                 <span id="ws-status" class="text-xs text-yellow-500 font-mono">Conectando...</span>
                 <span id="conn-quality" class="text-[9px] text-gray-600 font-mono">--ms</span>
             </div>
+            <button onclick="toggleMobileMenu()" class="md:hidden text-gray-400 hover:text-white p-1 ml-2">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+            </button>
         </div>
 
         <!-- FILTROS Y CONTROLES -->
-        <div class="p-2 border-b border-gray-700 bg-gray-800/80">
+        <div class="p-2 border-b border-gray-800 bg-gray-900/30">
             <div class="flex items-center justify-between mb-2">
                 <span class="text-xs text-gray-400 font-semibold uppercase tracking-wider">Activos</span>
                 <div class="flex items-center gap-2">
@@ -197,7 +212,7 @@
             </div>
         </div>
 
-        <div class="p-3 border-t border-gray-700 text-xs text-gray-500 text-center">
+        <div class="p-3 border-t border-gray-800 text-xs text-gray-500 text-center">
             <span id="conn-attempts" class="hidden">Reconexión en <span id="reconnect-timer">3</span>s...</span>
             <div id="last-update" class="text-gray-600 mt-1">--:--:--</div>
         </div>
@@ -206,96 +221,179 @@
     <!-- MAIN -->
     <main class="flex-1 flex flex-col h-full relative min-w-0">
 
-        <!-- HEADER -->
-        <header class="h-24 bg-gray-900 border-b border-gray-700 p-4 flex items-center justify-between shrink-0 z-20">
-            <div class="flex items-end gap-4 min-w-0">
-                <h2 id="active-coin-title" class="text-3xl font-bold text-blue-400 truncate">SELECCIONA MONEDA</h2>
-                <span id="active-coin-price" class="text-2xl font-mono text-gray-300 whitespace-nowrap">--.----</span>
-                <span id="active-coin-state" class="text-xs font-bold px-2 py-1 rounded bg-gray-700 text-gray-400">MONITOREO</span>
-                <span id="active-coin-dir" class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-gray-800 text-gray-500 hidden">DIR</span>
-                <span id="active-coin-cb" class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-purple-900 text-purple-400 hidden">🔒CB</span>
-            </div>
-
-            <div class="flex items-center gap-4 shrink-0">
-                <div class="flex gap-3 bg-gray-800 p-2 rounded-lg border border-gray-700">
-                    <div class="text-center px-2">
-                        <div class="text-[10px] text-gray-400 uppercase tracking-wider">RSI 1M</div>
-                        <div id="ind-rsi-1m" class="font-bold font-mono text-lg">--.-</div>
-                    </div>
-                    <div class="text-center px-2 border-l border-gray-700">
-                        <div class="text-[10px] text-gray-400 uppercase tracking-wider">RSI 15M</div>
-                        <div id="ind-rsi-15m" class="font-bold font-mono text-lg">--.-</div>
-                    </div>
-                    <div class="text-center px-2 border-l border-gray-700">
-                        <div class="text-[10px] text-gray-400 uppercase tracking-wider">ADX</div>
-                        <div id="ind-adx" class="font-bold font-mono text-lg">--.-</div>
-                    </div>
-                    <div class="text-center px-2 border-l border-gray-700">
-                        <div class="text-[10px] text-gray-400 uppercase tracking-wider">Mecha</div>
-                        <div id="ind-wick" class="font-bold font-mono text-lg">--.--</div>
-                    </div>
-                    <div class="text-center px-2 border-l border-gray-700">
-                        <div class="text-[10px] text-gray-400 uppercase tracking-wider">EMA 300</div>
-                        <div id="ind-ema300" class="font-bold font-mono text-sm">--.----</div>
-                    </div>
-                    <div class="text-center px-2 border-l border-gray-700">
-                        <div class="text-[10px] text-gray-400 uppercase tracking-wider">Dist EMA</div>
-                        <div id="ind-ema-dist" class="font-bold font-mono text-sm">--.--%</div>
-                    </div>
-                    <div class="text-center px-2 border-l border-gray-700">
-                        <div class="text-[10px] text-gray-400 uppercase tracking-wider">ATR 1m</div>
-                        <div id="ind-atr-1m" class="font-bold font-mono text-sm">--.--</div>
-                    </div>
-                    <div class="text-center px-2 border-l border-gray-700">
-                        <div class="text-[10px] text-gray-400 uppercase tracking-wider">4H Trend</div>
-                        <div id="ind-macro" class="font-bold text-sm mt-1 px-2 py-0.5 rounded bg-gray-700 text-gray-400 border border-transparent">ESPERANDO</div>
-                    </div>
-                </div>
-
-                <div class="relative">
-                    <button onclick="toggleAlertMenu()" class="relative p-2 bg-gray-800 hover:bg-gray-700 rounded-lg border border-gray-700 transition">
-                        <svg class="w-6 h-6 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"></path>
-                        </svg>
-                        <span id="alert-badge" class="hidden absolute -top-1 -right-1 bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full border-2 border-gray-900">0</span>
-                    </button>
-
-                    <div id="alert-dropdown" class="hidden absolute right-0 mt-2 w-96 bg-gray-800 rounded-xl border border-gray-700 shadow-2xl flex flex-col z-50">
-                        <div class="p-3 border-b border-gray-700 font-semibold text-sm flex justify-between items-center">
-                            <span>Registro de Disparos</span>
-                            <button onclick="clearAlerts()" class="text-xs text-gray-400 hover:text-red-400 transition">Limpiar</button>
-                        </div>
-                        <div id="alerts-log" class="p-3 space-y-2 overflow-y-auto max-h-96">
-                            <div class="text-xs text-gray-500 italic text-center py-4">Sin alertas recientes</div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </header>
-
-        <!-- Selector de Timeframe -->
-        <div class="flex gap-2 p-2 bg-gray-800 border-b border-gray-700">
-            <button onclick="switchTimeframe('1m')" id="btn-1m" class="px-3 py-1 text-xs font-bold rounded bg-blue-600 text-white">1M</button>
-            <button onclick="switchTimeframe('15m')" id="btn-15m" class="px-3 py-1 text-xs font-bold rounded bg-gray-700 text-gray-400 hover:bg-gray-600">15M</button>
-            <button onclick="switchTimeframe('4h')" id="btn-4h" class="px-3 py-1 text-xs font-bold rounded bg-gray-700 text-gray-400 hover:bg-gray-600">4H</button>
-            <div class="flex-1"></div>
-            <span id="chart-info" class="text-[10px] text-gray-500 font-mono self-center mr-2">-- velas cargadas</span>
+        <!-- HEADER MÓVIL (solo visible en móvil) -->
+        <div class="md:hidden glass-panel flex items-center justify-between p-3 shrink-0 z-30">
+            <button onclick="toggleMobileMenu()" class="text-gray-300 p-1">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path></svg>
+            </button>
+            <div class="font-bold text-lg text-white truncate max-w-[120px]" id="mobile-coin-title">SELECCIONA</div>
+            <button onclick="toggleAlertMenu()" class="relative p-1 text-gray-300">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"></path></svg>
+                <span id="alert-badge" class="hidden absolute top-0 right-0 w-2.5 h-2.5 bg-red-500 rounded-full border border-gray-900"></span>
+            </button>
         </div>
 
-        <div id="tvchart" class="flex-1 w-full bg-gray-900 relative min-h-0"></div>
+        <!-- NAV TABS -->
+        <nav class="flex border-b border-gray-800 bg-gray-900/50 shrink-0">
+            <button onclick="switchTab('chart-view')" id="tab-chart" class="tab-btn flex-1 py-3 text-sm font-semibold text-blue-400 border-b-2 border-blue-500 bg-gray-800/50">📈 Gráfico</button>
+            <button onclick="switchTab('stats-view')" id="tab-stats" class="tab-btn flex-1 py-3 text-sm font-semibold text-gray-400 hover:text-gray-200 border-b-2 border-transparent">📊 Estadísticas</button>
+        </nav>
 
-        <div id="toast-container" class="absolute top-28 right-6 z-50 flex flex-col gap-3 pointer-events-none"></div>
+        <div class="flex-1 relative overflow-hidden">
+
+            <!-- VISTA GRÁFICO -->
+            <div id="chart-view" class="absolute inset-0 flex flex-col">
+
+                <!-- HEADER DESKTOP -->
+                <header class="h-24 bg-gray-900 border-b border-gray-700 p-4 flex items-center justify-between shrink-0 z-20">
+                    <div class="flex items-end gap-4 min-w-0">
+                        <h2 id="active-coin-title" class="text-3xl font-bold text-blue-400 truncate">SELECCIONA MONEDA</h2>
+                        <span id="active-coin-price" class="text-2xl font-mono text-gray-300 whitespace-nowrap">--.----</span>
+                        <span id="active-coin-state" class="text-xs font-bold px-2 py-1 rounded bg-gray-700 text-gray-400">MONITOREO</span>
+                        <span id="active-coin-dir" class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-gray-800 text-gray-500 hidden">DIR</span>
+                        <span id="active-coin-cb" class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-purple-900 text-purple-400 hidden">🔒CB</span>
+                    </div>
+
+                    <div class="flex items-center gap-4 shrink-0">
+                        <div class="flex gap-3 bg-gray-800 p-2 rounded-lg border border-gray-700">
+                            <div class="text-center px-2">
+                                <div class="text-[10px] text-gray-400 uppercase tracking-wider">RSI 1M</div>
+                                <div id="ind-rsi-1m" class="font-bold font-mono text-lg">--.-</div>
+                            </div>
+                            <div class="text-center px-2 border-l border-gray-700">
+                                <div class="text-[10px] text-gray-400 uppercase tracking-wider">RSI 15M</div>
+                                <div id="ind-rsi-15m" class="font-bold font-mono text-lg">--.-</div>
+                            </div>
+                            <div class="text-center px-2 border-l border-gray-700">
+                                <div class="text-[10px] text-gray-400 uppercase tracking-wider">ADX</div>
+                                <div id="ind-adx" class="font-bold font-mono text-lg">--.-</div>
+                            </div>
+                            <div class="text-center px-2 border-l border-gray-700">
+                                <div class="text-[10px] text-gray-400 uppercase tracking-wider">Mecha</div>
+                                <div id="ind-wick" class="font-bold font-mono text-lg">--.--</div>
+                            </div>
+                            <div class="text-center px-2 border-l border-gray-700">
+                                <div class="text-[10px] text-gray-400 uppercase tracking-wider">EMA 300</div>
+                                <div id="ind-ema300" class="font-bold font-mono text-sm">--.----</div>
+                            </div>
+                            <div class="text-center px-2 border-l border-gray-700">
+                                <div class="text-[10px] text-gray-400 uppercase tracking-wider">Dist EMA</div>
+                                <div id="ind-ema-dist" class="font-bold font-mono text-sm">--.--%</div>
+                            </div>
+                            <div class="text-center px-2 border-l border-gray-700">
+                                <div class="text-[10px] text-gray-400 uppercase tracking-wider">ATR 1m</div>
+                                <div id="ind-atr-1m" class="font-bold font-mono text-sm">--.--</div>
+                            </div>
+                            <div class="text-center px-2 border-l border-gray-700">
+                                <div class="text-[10px] text-gray-400 uppercase tracking-wider">4H Trend</div>
+                                <div id="ind-macro" class="font-bold text-sm mt-1 px-2 py-0.5 rounded bg-gray-700 text-gray-400 border border-transparent">ESPERANDO</div>
+                            </div>
+                        </div>
+
+                        <div class="relative">
+                            <button onclick="toggleAlertMenu()" class="relative p-2 bg-gray-800 hover:bg-gray-700 rounded-lg border border-gray-700 transition">
+                                <svg class="w-6 h-6 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"></path>
+                                </svg>
+                                <span id="alert-badge-desktop" class="hidden absolute -top-1 -right-1 bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full border-2 border-gray-900">0</span>
+                            </button>
+
+                            <div id="alert-dropdown" class="hidden absolute top-14 right-0 w-96 bg-gray-800 rounded-xl border border-gray-700 shadow-2xl flex flex-col z-50">
+                                <div class="p-3 border-b border-gray-700 font-semibold text-sm flex justify-between items-center">
+                                    <span>Registro de Disparos</span>
+                                    <button onclick="clearAlerts()" class="text-xs text-gray-400 hover:text-red-400 transition">Limpiar</button>
+                                </div>
+                                <div id="alerts-log" class="p-3 space-y-2 overflow-y-auto max-h-96">
+                                    <div class="text-xs text-gray-500 italic text-center py-4">Sin alertas recientes</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </header>
+
+                <!-- V5.7: BOTÓN DE PAUSA RÁPIDA -->
+                <div class="px-4 py-2 bg-gray-900/80 border-b border-gray-800 flex items-center gap-3 shrink-0">
+                    <button onclick="pauseCurrentCoin()" id="btn-pause" class="px-3 py-1.5 bg-orange-500/10 hover:bg-orange-500/20 text-orange-400 border border-orange-500/20 rounded-lg text-xs font-bold transition flex items-center gap-1.5 disabled:opacity-30 disabled:cursor-not-allowed" disabled>
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                        PAUSAR MONEDA
+                    </button>
+                    <span class="text-[10px] text-gray-500">Pausa temporal (no afecta el registro)</span>
+                </div>
+
+                <!-- Selector de Timeframe -->
+                <div class="flex gap-2 p-2 bg-gray-800 border-b border-gray-700">
+                    <button onclick="switchTimeframe('1m')" id="btn-1m" class="px-3 py-1 text-xs font-bold rounded bg-blue-600 text-white">1M</button>
+                    <button onclick="switchTimeframe('15m')" id="btn-15m" class="px-3 py-1 text-xs font-bold rounded bg-gray-700 text-gray-400 hover:bg-gray-600">15M</button>
+                    <button onclick="switchTimeframe('4h')" id="btn-4h" class="px-3 py-1 text-xs font-bold rounded bg-gray-700 text-gray-400 hover:bg-gray-600">4H</button>
+                    <div class="flex-1"></div>
+                    <span id="chart-info" class="text-[10px] text-gray-500 font-mono self-center mr-2">-- velas cargadas</span>
+                </div>
+
+                <div id="tvchart" class="flex-1 w-full bg-gray-900 relative min-h-0"></div>
+
+                <div id="toast-container" class="absolute top-28 right-6 z-50 flex flex-col gap-3 pointer-events-none"></div>
+            </div>
+
+            <!-- VISTA ESTADÍSTICAS -->
+            <div id="stats-view" class="hidden absolute inset-0 overflow-y-auto p-4 md:p-8 bg-[#0b0e14]">
+                <h2 class="text-2xl font-bold text-white mb-2">Rendimiento del Bot</h2>
+                <p class="text-xs text-gray-500 mb-6">Datos extraídos directamente de la base de datos SQLite</p>
+
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+                    <div class="bg-gray-800/40 p-5 rounded-xl border border-gray-700/50 hover:border-blue-500/30 transition">
+                        <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
+                            <span class="w-2 h-2 rounded-full bg-red-500"></span>
+                            Disparos Hoy (FIRE)
+                        </div>
+                        <div class="text-3xl font-mono text-white" id="stat-fires">--</div>
+                        <div class="text-xs text-gray-600 mt-1">Desde la tabla auditoria_eventos</div>
+                    </div>
+                    <div class="bg-gray-800/40 p-5 rounded-xl border border-gray-700/50 hover:border-yellow-500/30 transition">
+                        <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
+                            <span class="w-2 h-2 rounded-full bg-yellow-500"></span>
+                            Total Near-Misses
+                        </div>
+                        <div class="text-3xl font-mono text-yellow-400" id="stat-nearmiss">--</div>
+                        <div class="text-xs text-gray-600 mt-1">Seguimientos virtuales registrados</div>
+                    </div>
+                    <div class="bg-gray-800/40 p-5 rounded-xl border border-gray-700/50 hover:border-green-500/30 transition">
+                        <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
+                            <span class="w-2 h-2 rounded-full bg-green-500"></span>
+                            Win Rate Rechazos
+                        </div>
+                        <div class="text-3xl font-mono text-green-400" id="stat-winrate">--%</div>
+                        <div class="text-xs text-gray-500 mt-1">El bot acertó al rechazar (acerto_bot = 1)</div>
+                    </div>
+                </div>
+
+                <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50 mb-6">
+                    <h3 class="text-sm font-bold text-gray-300 mb-2">ℹ️ Sobre estas métricas</h3>
+                    <ul class="text-xs text-gray-500 space-y-1 list-disc list-inside">
+                        <li><b>Disparos Hoy:</b> Eventos FIRE registrados hoy (hora local).</li>
+                        <li><b>Near-Misses:</b> Oportunidades que pasaron el umbral pero fueron rechazadas por filtros.</li>
+                        <li><b>Win Rate:</b> Porcentaje donde el rechazo fue correcto (precio se movió en contra de la dirección propuesta).</li>
+                    </ul>
+                </div>
+
+                <button onclick="fetchStats()" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm transition flex items-center gap-2">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                    Actualizar Datos
+                </button>
+            </div>
+
+        </div>
 
     </main>
 
     <script>
+
         // ============================================
-        // ESTADO GLOBAL V5.1
+        // ESTADO GLOBAL V5.7
         // ============================================
         let activeSymbol = null;
         let activeTimeframe = '1m';
         let marketData = {};
-        let coinConfig = {};      // { symbol: { active: true/false, ... } }
+        let coinConfig = {};
         let ws = null;
         let reconnectTimer = null;
         let reconnectDelay = 3000;
@@ -374,7 +472,140 @@
         }
 
         // ============================================
-        // SISTEMA DE ALERTAS
+        // V5.7: SISTEMA DE TABS
+        // ============================================
+        function switchTab(tabId) {
+            document.getElementById('chart-view').classList.add('hidden');
+            document.getElementById('stats-view').classList.add('hidden');
+            document.getElementById(tabId).classList.remove('hidden');
+
+            const btnChart = document.getElementById('tab-chart');
+            const btnStats = document.getElementById('tab-stats');
+
+            if (tabId === 'chart-view') {
+                btnChart.classList.add('text-blue-400', 'border-blue-500', 'bg-gray-800/50');
+                btnChart.classList.remove('text-gray-400', 'border-transparent');
+                btnStats.classList.remove('text-blue-400', 'border-blue-500', 'bg-gray-800/50');
+                btnStats.classList.add('text-gray-400', 'border-transparent');
+                // Resize chart when switching back
+                setTimeout(() => {
+                    if (chartContainer.clientWidth > 0 && chartContainer.clientHeight > 0) {
+                        chart.applyOptions({
+                            width: chartContainer.clientWidth,
+                            height: chartContainer.clientHeight
+                        });
+                    }
+                }, 50);
+            } else {
+                btnStats.classList.add('text-blue-400', 'border-blue-500', 'bg-gray-800/50');
+                btnStats.classList.remove('text-gray-400', 'border-transparent');
+                btnChart.classList.remove('text-blue-400', 'border-blue-500', 'bg-gray-800/50');
+                btnChart.classList.add('text-gray-400', 'border-transparent');
+                fetchStats();
+            }
+        }
+
+        // ============================================
+        // V5.7: MENÚ MÓVIL
+        // ============================================
+        function toggleMobileMenu() {
+            const sidebar = document.getElementById('sidebar');
+            const overlay = document.getElementById('sidebar-overlay');
+            sidebar.classList.toggle('-translate-x-full');
+            overlay.classList.toggle('hidden');
+        }
+
+        // ============================================
+        // V5.7: ESTADÍSTICAS DESDE DB
+        // ============================================
+        async function fetchStats() {
+            try {
+                const res = await fetch('/api/stats/summary');
+                const data = await res.json();
+                if (data.estado === 'success') {
+                    document.getElementById('stat-fires').innerText = data.fires_hoy;
+                    document.getElementById('stat-nearmiss').innerText = data.total_near_miss;
+                    document.getElementById('stat-winrate').innerText = data.win_rate_rechazos + '%';
+                } else {
+                    document.getElementById('stat-fires').innerText = 'ERR';
+                    document.getElementById('stat-nearmiss').innerText = 'ERR';
+                    document.getElementById('stat-winrate').innerText = 'ERR';
+                }
+            } catch (e) {
+                console.error("[STATS] Error cargando estadísticas:", e);
+                document.getElementById('stat-fires').innerText = 'ERR';
+                document.getElementById('stat-nearmiss').innerText = 'ERR';
+                document.getElementById('stat-winrate').innerText = 'ERR';
+            }
+        }
+
+        // ============================================
+        // V5.7: PAUSA RÁPIDA DE MONEDA
+        // ============================================
+        async function pauseCurrentCoin() {
+            if (!activeSymbol) return;
+            try {
+                const res = await fetch(`/api/pause/${activeSymbol}`, { method: 'POST' });
+                const data = await res.json();
+                if (data.paused) {
+                    showToast({
+                        symbol: activeSymbol,
+                        tipo: 'PAUSA_MANUAL',
+                        direction: marketData[activeSymbol]?.direccion_filtro || 'N/A',
+                        score: 0,
+                        rechazos: ['Moneda pausada manualmente desde el dashboard'],
+                        params: null
+                    });
+                }
+            } catch (e) {
+                console.error("[PAUSE] Error:", e);
+            }
+        }
+
+        function updatePauseButton() {
+            const btn = document.getElementById('btn-pause');
+            if (!btn) return;
+            if (activeSymbol && marketData[activeSymbol]) {
+                btn.disabled = false;
+                const isPaused = marketData[activeSymbol].moneda_pausada || marketData[activeSymbol].moneda_pausada_manual;
+                if (isPaused) {
+                    btn.innerHTML = `<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg> REANUDAR`;
+                    btn.classList.remove('text-orange-400', 'border-orange-500/20', 'bg-orange-500/10', 'hover:bg-orange-500/20');
+                    btn.classList.add('text-green-400', 'border-green-500/20', 'bg-green-500/10', 'hover:bg-green-500/20');
+                    btn.onclick = resumeCurrentCoin;
+                } else {
+                    btn.innerHTML = `<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg> PAUSAR MONEDA`;
+                    btn.classList.remove('text-green-400', 'border-green-500/20', 'bg-green-500/10', 'hover:bg-green-500/20');
+                    btn.classList.add('text-orange-400', 'border-orange-500/20', 'bg-orange-500/10', 'hover:bg-orange-500/20');
+                    btn.onclick = pauseCurrentCoin;
+                }
+            } else {
+                btn.disabled = true;
+            }
+        }
+
+        async function resumeCurrentCoin() {
+            if (!activeSymbol) return;
+            try {
+                const res = await fetch(`/api/resume/${activeSymbol}`, { method: 'POST' });
+                const data = await res.json();
+                if (data.resumed) {
+                    showToast({
+                        symbol: activeSymbol,
+                        tipo: 'REANUDAR',
+                        direction: marketData[activeSymbol]?.direccion_filtro || 'N/A',
+                        score: 0,
+                        rechazos: ['Moneda reanudada manualmente'],
+                        params: null
+                    });
+                }
+            } catch (e) {
+                console.error("[RESUME] Error:", e);
+            }
+        }
+
+        // ============================================
+        // SISTEMA DE ALERTAS (ORIGINAL - SIN CAMBIOS)
         // ============================================
         function toggleAlertMenu() {
             const dropdown = document.getElementById('alert-dropdown');
@@ -395,11 +626,14 @@
 
         function updateBadge() {
             const badge = document.getElementById('alert-badge');
+            const badgeDesktop = document.getElementById('alert-badge-desktop');
+            const count = unreadAlerts > 99 ? '99+' : unreadAlerts;
             if (unreadAlerts > 0) {
-                badge.innerText = unreadAlerts > 99 ? '99+' : unreadAlerts;
-                badge.classList.remove('hidden');
+                if (badge) { badge.classList.remove('hidden'); }
+                if (badgeDesktop) { badgeDesktop.innerText = count; badgeDesktop.classList.remove('hidden'); }
             } else {
-                badge.classList.add('hidden');
+                if (badge) { badge.classList.add('hidden'); }
+                if (badgeDesktop) { badgeDesktop.classList.add('hidden'); }
             }
         }
 
@@ -408,6 +642,7 @@
             const isFire = alertData.tipo === 'FIRE';
             const isRechazado = alertData.tipo === 'RECHAZADO';
             const isCB = alertData.tipo === 'CIRCUIT_BREAKER';
+            const isPause = alertData.tipo === 'PAUSA_MANUAL';
 
             let bgColor, borderColor, textColor;
             if (isFire) {
@@ -416,6 +651,8 @@
                 bgColor = 'bg-orange-900/90'; borderColor = 'border-orange-500'; textColor = 'text-orange-400';
             } else if (isCB) {
                 bgColor = 'bg-purple-900/90'; borderColor = 'border-purple-500'; textColor = 'text-purple-400';
+            } else if (isPause) {
+                bgColor = 'bg-orange-900/90'; borderColor = 'border-orange-500'; textColor = 'text-orange-400';
             } else {
                 bgColor = 'bg-yellow-900/90'; borderColor = 'border-yellow-500'; textColor = 'text-yellow-400';
             }
@@ -440,6 +677,8 @@
                 msg = `❌ RECHAZADO <b>${alertData.direction}</b> | ${alertData.rechazos[0]}`;
             } else if (isCB) {
                 msg = `🔒 CIRCUIT BREAKER | ${alertData.rechazos[0]}`;
+            } else if (isPause) {
+                msg = `⏸️ PAUSADA MANUALMENTE | ${alertData.rechazos[0]}`;
             } else {
                 msg = alertData.tipo;
             }
@@ -567,29 +806,25 @@
         }
 
         // ============================================
-        // TOGGLE MONEDAS
+        // TOGGLE MONEDAS (ORIGINAL - SIN CAMBIOS)
         // ============================================
         function toggleCoin(symbol, event) {
             if (event) event.stopPropagation();
-            
+
             const isActive = coinConfig[symbol] ? coinConfig[symbol].active : true;
             const newState = !isActive;
-            
-            // Actualizar estado local
+
             if (!coinConfig[symbol]) coinConfig[symbol] = {};
             coinConfig[symbol].active = newState;
-            
-            // Actualizar UI
+
             updateCoinToggleUI(symbol, newState);
-            
-            // Enviar al servidor
+
             fetch('/api/toggle-coin', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ symbol: symbol, active: newState })
             }).catch(e => console.error('[TOGGLE] Error:', e));
-            
-            // Si la moneda activa se desactiva, limpiar gráfico
+
             if (activeSymbol === symbol && !newState) {
                 candleSeries.setData([]);
                 emaSeries.setData([]);
@@ -598,7 +833,7 @@
                 document.getElementById('active-coin-price').innerText = '--.----';
                 activeSymbol = null;
             }
-            
+
             filterCoinList();
         }
 
@@ -626,31 +861,29 @@
                 coinConfig[sym].active = state;
                 updateCoinToggleUI(sym, state);
             });
-            
+
             fetch('/api/toggle-all-coins', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ active: state })
             }).catch(e => console.error('[TOGGLE ALL] Error:', e));
-            
+
             filterCoinList();
         }
 
         function filterCoinList() {
             const textFilter = document.getElementById('coin-filter').value.toLowerCase();
             const stateFilter = document.getElementById('state-filter').value;
-            
+
             document.querySelectorAll('.coin-item').forEach(item => {
                 const symbol = item.dataset.symbol;
                 const data = marketData[symbol];
                 let visible = true;
-                
-                // Filtro de texto
+
                 if (textFilter && !symbol.toLowerCase().includes(textFilter)) {
                     visible = false;
                 }
-                
-                // Filtro de estado
+
                 if (stateFilter === 'active') {
                     if (!coinConfig[symbol] || !coinConfig[symbol].active) visible = false;
                 } else if (stateFilter === 'paused') {
@@ -658,7 +891,7 @@
                 } else if (stateFilter !== 'all') {
                     if (!data || data.estado !== stateFilter) visible = false;
                 }
-                
+
                 item.style.display = visible ? '' : 'none';
             });
         }
@@ -677,7 +910,6 @@
                     return;
                 }
 
-                // Cargar configuración de monedas (activo/pausado)
                 if (data.coin_config) {
                     coinConfig = data.coin_config;
                 }
@@ -694,6 +926,8 @@
                         marketData[sym].filtro_aprobado = symData.estado.filtro_aprobado;
                         marketData[sym].velas_confirmacion = symData.estado.velas_confirmacion;
                         marketData[sym].circuit_breaker = symData.estado.circuit_breaker_activo;
+                        marketData[sym].moneda_pausada = symData.estado.moneda_pausada;
+                        marketData[sym].moneda_pausada_manual = symData.estado.moneda_pausada_manual;
                     }
 
                     if (symData.indicadores_1m) {
@@ -731,7 +965,6 @@
                 }
 
                 if (!activeSymbol && Object.keys(marketData).length > 0) {
-                    // Seleccionar primera moneda activa
                     const firstActive = Object.keys(marketData).find(s => 
                         coinConfig[s] && coinConfig[s].active
                     );
@@ -822,14 +1055,14 @@
 
         function selectCoin(symbol) {
             if (!symbol) return;
-            
-            // No permitir seleccionar moneda pausada
+
             if (coinConfig[symbol] && !coinConfig[symbol].active) {
                 return;
             }
-            
+
             activeSymbol = symbol;
             document.getElementById('active-coin-title').innerText = symbol;
+            document.getElementById('mobile-coin-title').innerText = symbol;
 
             document.querySelectorAll('.coin-item').forEach(el => {
                 el.classList.remove('active');
@@ -839,13 +1072,15 @@
                 activeEl.classList.add('active');
             }
 
-            if (marketData[symbol]) updateIndicatorsUI(marketData[symbol]);
-            // Cargar velas solo al seleccionar explícitamente
+            if (marketData[symbol]) {
+                updateIndicatorsUI(marketData[symbol]);
+                updatePauseButton();
+            }
             loadChartData(symbol, activeTimeframe);
         }
 
         // ============================================
-        // COLORES DE ESTADO
+        // COLORES DE ESTADO (ORIGINAL - SIN CAMBIOS)
         // ============================================
         function getStateColor(estado, circuitBreaker = false) {
             if (circuitBreaker) return 'bg-purple-600 text-white';
@@ -881,7 +1116,7 @@
         }
 
         // ============================================
-        // ACTUALIZAR UI DE INDICADORES
+        // ACTUALIZAR UI DE INDICADORES (ORIGINAL - SIN CAMBIOS)
         // ============================================
         function updateIndicatorsUI(data) {
             if (!data) {
@@ -1005,7 +1240,7 @@
         setInterval(updateConnectionQuality, 5000);
 
         // ============================================
-        // WEBSOCKET
+        // WEBSOCKET (ORIGINAL - SIN CAMBIOS)
         // ============================================
         function setStatus(connected, msg) {
             const dot = document.getElementById('status-dot');
@@ -1121,7 +1356,7 @@
         }, 20000);
 
         // ============================================
-        // MANEJADOR DE MENSAJES WS
+        // MANEJADOR DE MENSAJES WS (ORIGINAL - CON ADICIONES V5.7)
         // ============================================
         function handleMessage(data) {
             try {
@@ -1189,6 +1424,8 @@
                         marketData[sym].filtro_aprobado = p.estado.filtro_aprobado;
                         marketData[sym].velas_confirmacion = p.estado.velas_confirmacion;
                         marketData[sym].circuit_breaker = p.estado.circuit_breaker_activo;
+                        marketData[sym].moneda_pausada = p.estado.moneda_pausada;
+                        marketData[sym].moneda_pausada_manual = p.estado.moneda_pausada_manual;
 
                         updateCoinListItem(sym);
 
@@ -1197,7 +1434,10 @@
                         }
                     }
 
-                    if (sym === activeSymbol) updateIndicatorsUI(marketData[sym]);
+                    if (sym === activeSymbol) {
+                        updateIndicatorsUI(marketData[sym]);
+                        updatePauseButton();
+                    }
                     document.getElementById('last-update').innerText = new Date().toLocaleTimeString();
                     return;
                 }
@@ -1210,7 +1450,6 @@
                 } else if (data.msg_type === 'alerta' && data.payload) {
                     logAlert(data.payload);
                 } else if (data.msg_type === 'coin_config_update') {
-                    // Actualización de configuración de moneda desde el servidor
                     if (data.coin_config) {
                         coinConfig = { ...coinConfig, ...data.coin_config };
                         Object.keys(data.coin_config).forEach(s => {
@@ -1222,7 +1461,10 @@
                     console.log('[WS] Tipo no manejado:', data.msg_type);
                 }
 
-                if (sym === activeSymbol) updateIndicatorsUI(marketData[sym]);
+                if (sym === activeSymbol) {
+                    updateIndicatorsUI(marketData[sym]);
+                    updatePauseButton();
+                }
                 document.getElementById('last-update').innerText = new Date().toLocaleTimeString();
             } catch (err) {
                 console.error('[WS] ERROR en handleMessage:', err, 'Data:', data);
@@ -1230,7 +1472,7 @@
         }
 
         // ============================================
-        // CREAR / ACTUALIZAR ITEM DE MONEDA
+        // CREAR / ACTUALIZAR ITEM DE MONEDA (ORIGINAL)
         // ============================================
         function createCoinListItem(symbol) {
             const list = document.getElementById('coin-list');
@@ -1266,7 +1508,6 @@
             if (!data) return;
 
             const stateEl = document.getElementById(`list-state-${symbol}`);
-            const dotEl = document.getElementById(`state-dot-${symbol}`);
             const dirEl = document.getElementById(`list-dir-${symbol}`);
             const cb = data.circuit_breaker || false;
 
@@ -1274,7 +1515,6 @@
                 stateEl.innerText = data.estado || 'MONITOREO';
                 stateEl.className = `state-badge w-fit mt-0.5 ${getStateBadgeClass(data.estado, cb)}`;
             }
-            // El dot ya no existe como elemento separado, ahora es el toggle
             if (dirEl && data.direccion_filtro) {
                 dirEl.innerText = data.direccion_filtro;
                 dirEl.className = `text-[9px] font-mono mt-0.5 ${data.direccion_filtro === 'LONG' ? 'text-green-500' : 'text-red-500'}`;
@@ -1294,8 +1534,6 @@
         document.addEventListener('DOMContentLoaded', () => {
             renderAlertsFromStorage();
             window.dispatchEvent(new Event('resize'));
-            // NO cargar snapshot de velas históricas al inicio
-            // Solo cargamos el estado de las monedas y esperamos WebSocket
             loadSnapshot().then(() => {
                 connectWebSocket();
             });
