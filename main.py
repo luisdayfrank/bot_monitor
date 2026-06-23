@@ -139,6 +139,8 @@ async def lifespan(fastapi_app):
         estados=signals.states,
         precios=precios_vivo,
         indicadores_15m=signals.indicadores_15m,
+        indicadores_1m=signals.indicadores_1m,
+        indicadores_4h=signals.indicadores_4h,
         signal_generator=signals
     ))
     background_tasks.add(t8)
