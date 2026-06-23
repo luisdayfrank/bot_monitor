@@ -3,6 +3,7 @@ import json
 import logging
 import numpy as np
 import os
+import datetime
 
 REGISTRY_PATH = "coins_registry.json"
 
@@ -20,6 +21,7 @@ def _save_registry(registry):
     """Guarda el registro de monedas a disco."""
     with open(REGISTRY_PATH, 'w', encoding='utf-8') as f:
         json.dump(registry, f, indent=2, ensure_ascii=False)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -70,11 +72,11 @@ import time
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from database_v5 import guardar_alerta
+from database_v5 import guardar_alerta, _get_db, now_local, _get_db, now_local
 from notifier_v5 import Notifier
 from config import CONFIG
 
-app = FastAPI(title="Crypto Monitor V5.1 — Multi-Timeframe Sniper Dashboard")
+app = FastAPI(title="Crypto Monitor V5.7 — Multi-Timeframe Sniper Dashboard")
 
 app.add_middleware(
     CORSMiddleware,
@@ -190,7 +192,6 @@ async def get_estado(symbol: str, request: Request):
             "filtro_macro_aprobado": s.filtro_macro_aprobado,
             "circuit_breaker_activo": getattr(s, 'circuit_breaker_activo', False),
             "circuit_breaker_hasta": getattr(s, 'circuit_breaker_hasta', 0),
-            # V4.2: Exponer estado de pausa
             "moneda_pausada": getattr(s, 'moneda_pausada', False),
             "moneda_pausada_manual": getattr(s, 'moneda_pausada_manual', False),
             "moneda_pausada_razon": getattr(s, 'moneda_pausada_razon', None),
@@ -212,7 +213,6 @@ async def get_estados(request: Request):
             "ultimo_disparo": s.ultimo_disparo_timestamp_15m,
             "filtro_macro_aprobado": s.filtro_macro_aprobado,
             "circuit_breaker_activo": getattr(s, 'circuit_breaker_activo', False),
-            # V4.2: Exponer estado de pausa
             "moneda_pausada": getattr(s, 'moneda_pausada', False),
             "moneda_pausada_manual": getattr(s, 'moneda_pausada_manual', False),
         }))
@@ -288,7 +288,6 @@ async def get_indicadores(symbol: str, request: Request):
             "filtro_aprobado": estado.filtro_macro_aprobado if estado else False,
             "velas_confirmacion": estado.velas_confirmacion if estado else 0,
             "circuit_breaker_activo": getattr(estado, 'circuit_breaker_activo', False) if estado else False,
-            # V4.2: Estado de pausa
             "moneda_pausada": getattr(estado, 'moneda_pausada', False) if estado else False,
             "moneda_pausada_manual": getattr(estado, 'moneda_pausada_manual', False) if estado else False,
             "moneda_pausada_razon": getattr(estado, 'moneda_pausada_razon', None) if estado else None,
@@ -305,11 +304,9 @@ async def get_snapshot(request: Request):
     indicadores_15m = getattr(request.app.state, 'indicadores_15m', {})
     indicadores_4h = getattr(request.app.state, 'indicadores_4h', {})
 
-    # Cargar registry actual
     registry = _load_registry()
 
     result = {}
-    # Incluir TODAS las monedas del registry, no solo las activas
     for symbol in registry.keys():
         st = estados.get(symbol)
         i1m = indicadores_1m.get(symbol, {})
@@ -360,8 +357,7 @@ async def get_snapshot(request: Request):
                 "close": i4h.get("close"),
             },
         }
-    
-    # Incluir coin_config en la respuesta
+
     return _sanitize_numpy({
         "snapshot": result,
         "coin_config": {
@@ -372,6 +368,50 @@ async def get_snapshot(request: Request):
         "active_count": sum(1 for d in registry.values() if d.get("active", 0) == 1),
         "timestamp": int(time.time() * 1000)
     })
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# V5.7: ENDPOINT DE ESTADÍSTICAS DESDE LA BASE DE DATOS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/stats/summary")
+async def get_stats_summary(request: Request):
+    """Obtiene un resumen de rendimiento usando la base de datos de auditoría."""
+    try:
+        db = await _get_db()
+        hoy_local = now_local().strftime("%Y-%m-%d")
+
+        # 1. Conteo de alertas FIRE de hoy (usando columna fecha en hora local)
+        cursor = await db.execute(
+            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'FIRE' AND fecha = ?",
+            (hoy_local,)
+        )
+        fires_hoy = (await cursor.fetchone())[0]
+
+        # 2. Conteo total de Near Misses
+        cursor = await db.execute("SELECT count(*) FROM near_miss_seguimientos")
+        total_near_miss = (await cursor.fetchone())[0]
+
+        # 3. Tasa de acierto de los rechazos (acerto_bot = 1 significa que el bot acertó al rechazar)
+        aciertos = 0
+        if total_near_miss > 0:
+            cursor = await db.execute(
+                "SELECT count(*) FROM near_miss_seguimientos WHERE acerto_bot = 1"
+            )
+            aciertos = (await cursor.fetchone())[0]
+
+        win_rate = (aciertos / total_near_miss * 100) if total_near_miss > 0 else 0.0
+
+        return {
+            "fires_hoy": fires_hoy,
+            "total_near_miss": total_near_miss,
+            "win_rate_rechazos": round(win_rate, 2),
+            "estado": "success"
+        }
+    except Exception as e:
+        logger.error(f"Error obteniendo stats: {e}")
+        return {"error": str(e), "estado": "failed"}
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # V4.2: NUEVOS ENDPOINTS REST PARA PAUSA MANUAL
@@ -485,30 +525,28 @@ async def toggle_coin(request: Request):
         data = await request.json()
         symbol = data.get("symbol")
         active = data.get("active")
-        
+
         if symbol is None or active is None:
             return {"error": "Faltan 'symbol' o 'active'", "success": False}
-        
+
         registry = _load_registry()
         if symbol not in registry:
             return {"error": f"{symbol} no existe en el registro", "success": False}
-        
+
         registry[symbol]["active"] = 1 if active else 0
         _save_registry(registry)
-        
-        # Notificar por Telegram que se necesita /restart
+
         await notifier.enviar_telegram(
             f"🔄 <b>Registro actualizado</b>\n"
             f"{symbol}: {'✅ ACTIVADA' if active else '❌ DESACTIVADA'}\n"
             f"⚠️ Ejecuta <code>/restart</code> para aplicar cambios."
         )
-        
-        # Broadcast a WebSocket para actualizar dashboard inmediatamente
+
         await manager.broadcast_json({
             "msg_type": "coin_config_update",
             "coin_config": {symbol: {"active": active}}
         })
-        
+
         return {
             "symbol": symbol,
             "active": active,
@@ -516,7 +554,7 @@ async def toggle_coin(request: Request):
             "needs_restart": True,
             "message": "Cambio guardado. Ejecuta /restart para aplicar."
         }
-        
+
     except Exception as e:
         return {"error": str(e), "success": False}
 
@@ -527,40 +565,36 @@ async def toggle_all_coins(request: Request):
     try:
         data = await request.json()
         active = data.get("active")
-        category = data.get("category")  # Opcional: filtrar por categoría
-        
+        category = data.get("category")
+
         if active is None:
             return {"error": "Falta 'active'", "success": False}
-        
+
         registry = _load_registry()
         changed = []
-        
+
         for symbol, data_coin in registry.items():
             if category and data_coin.get("category") != category:
                 continue
             if data_coin.get("active", 0) != (1 if active else 0):
                 data_coin["active"] = 1 if active else 0
                 changed.append(symbol)
-        
+
         _save_registry(registry)
-        
+
         cat_msg = f" en categoría '{category}'" if category else ""
         await notifier.enviar_telegram(
             f"🔄 <b>Todas {'ACTIVADAS' if active else 'DESACTIVADAS'}{cat_msg}</b>\n"
             f"Monedas afectadas: {len(changed)}\n"
             f"⚠️ Ejecuta <code>/restart</code> para aplicar cambios."
         )
-        
-        # Broadcast update
-        update_payload = {
-            symbol: {"active": active} 
-            for symbol in changed
-        }
+
+        update_payload = {symbol: {"active": active} for symbol in changed}
         await manager.broadcast_json({
             "msg_type": "coin_config_update",
             "coin_config": update_payload
         })
-        
+
         return {
             "changed": changed,
             "count": len(changed),
@@ -568,7 +602,7 @@ async def toggle_all_coins(request: Request):
             "success": True,
             "needs_restart": True
         }
-        
+
     except Exception as e:
         return {"error": str(e), "success": False}
 
@@ -666,7 +700,6 @@ async def orquestador_eventos(queue_eventos: asyncio.Queue, precios_vivo: dict,
                             "filtro_aprobado": st.filtro_macro_aprobado if st else False,
                             "velas_confirmacion": st.velas_confirmacion if st else 0,
                             "circuit_breaker_activo": getattr(st, 'circuit_breaker_activo', False) if st else False,
-                            # V4.2: Estado de pausa en broadcast
                             "moneda_pausada": getattr(st, 'moneda_pausada', False) if st else False,
                             "moneda_pausada_manual": getattr(st, 'moneda_pausada_manual', False) if st else False,
                         }
