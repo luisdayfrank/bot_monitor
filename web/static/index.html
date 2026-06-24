@@ -52,6 +52,11 @@
             box-shadow: 0 0 0 0 rgba(168, 85, 247, 0.7);
             animation: pulse-purple 1.0s infinite;
         }
+        /* V5.7 FIX: Estilos para NEUTRAL_GRID (Grid Neutral) */
+        .pulse-dot-neutral {
+            box-shadow: 0 0 0 0 rgba(6, 182, 212, 0.7);
+            animation: pulse-cyan 1.5s infinite;
+        }
 
         @keyframes pulse-green {
             0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7); }
@@ -78,6 +83,12 @@
             70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(168, 85, 247, 0); }
             100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(168, 85, 247, 0); }
         }
+        /* V5.7 FIX: Keyframes para animación de NEUTRAL_GRID */
+        @keyframes pulse-cyan {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(6, 182, 212, 0.7); }
+            70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(6, 182, 212, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(6, 182, 212, 0); }
+        }
 
         .state-badge {
             font-size: 9px;
@@ -92,6 +103,12 @@
         .state-badge-fire { background: #7f1d1d; color: #fca5a5; border: 1px solid #ef4444; animation: shake 0.5s infinite; }
         .state-badge-cooldown { background: #431407; color: #fdba74; border: 1px solid #f97316; }
         .state-badge-circuit { background: #581c87; color: #e9d5ff; border: 1px solid #a855f7; }
+        /* V5.7 FIX: Badge para estado NEUTRAL_GRID */
+        .state-badge-neutral { 
+            background: #164e63;
+            color: #67e8f9;
+            border: 1px solid #06b6d4;
+        }
 
         @keyframes shake {
             0%, 100% { transform: translateX(0); }
@@ -198,6 +215,8 @@
                     <option value="FIRE">FIRE</option>
                     <option value="ARMED">ARMED</option>
                     <option value="COOLDOWN">COOLDOWN</option>
+                    <!-- V5.7 FIX: Opción para filtrar monedas en Grid Neutral -->
+                    <option value="NEUTRAL_GRID">GRID NEUTRAL</option>
                 </select>
             </div>
         </div>
@@ -339,7 +358,8 @@
                 <h2 class="text-2xl font-bold text-white mb-2">Rendimiento del Bot</h2>
                 <p class="text-xs text-gray-500 mb-6">Datos extraídos directamente de la base de datos SQLite</p>
 
-                <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+                <!-- V5.7 FIX: Grid ampliado a 2x2 para métricas adicionales -->
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
                     <div class="bg-gray-800/40 p-5 rounded-xl border border-gray-700/50 hover:border-blue-500/30 transition">
                         <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
                             <span class="w-2 h-2 rounded-full bg-red-500"></span>
@@ -351,10 +371,10 @@
                     <div class="bg-gray-800/40 p-5 rounded-xl border border-gray-700/50 hover:border-yellow-500/30 transition">
                         <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
                             <span class="w-2 h-2 rounded-full bg-yellow-500"></span>
-                            Total Near-Misses
+                            Near-Misses Hoy
                         </div>
                         <div class="text-3xl font-mono text-yellow-400" id="stat-nearmiss">--</div>
-                        <div class="text-xs text-gray-600 mt-1">Seguimientos virtuales registrados</div>
+                        <div class="text-xs text-gray-600 mt-1">Seguimientos iniciados hoy (incluye activos)</div>
                     </div>
                     <div class="bg-gray-800/40 p-5 rounded-xl border border-gray-700/50 hover:border-green-500/30 transition">
                         <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
@@ -362,16 +382,20 @@
                             Win Rate Rechazos
                         </div>
                         <div class="text-3xl font-mono text-green-400" id="stat-winrate">--%</div>
-                        <div class="text-xs text-gray-500 mt-1">El bot acertó al rechazar (acerto_bot = 1)</div>
+                        <!-- V5.7 FIX: Leyenda corregida para reflejar cálculo real -->
+                        <div class="text-xs text-gray-500 mt-1">Tasa de acierto de seguimientos finalizados hoy</div>
                     </div>
                 </div>
 
+                <!-- V5.7 FIX: Información actualizada sobre el cálculo del Win Rate -->
                 <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50 mb-6">
-                    <h3 class="text-sm font-bold text-gray-300 mb-2">ℹ️ Sobre estas métricas</h3>
+                    <h3 class="text-sm font-bold text-gray-300 mb-2">ℹ️ Sobre estas métricas (V5.7)</h3>
                     <ul class="text-xs text-gray-500 space-y-1 list-disc list-inside">
                         <li><b>Disparos Hoy:</b> Eventos FIRE registrados hoy (hora local).</li>
-                        <li><b>Near-Misses:</b> Oportunidades que pasaron el umbral pero fueron rechazadas por filtros.</li>
-                        <li><b>Win Rate:</b> Porcentaje donde el rechazo fue correcto (precio se movió en contra de la dirección propuesta).</li>
+                        <li><b>Near-Misses Hoy:</b> Seguimientos iniciados hoy (incluye los que aún están en curso de sus 2h).</li>
+                        <li><b>Finalizados Hoy:</b> Seguimientos que completaron sus 2h de tracking y tienen veredicto.</li>
+                        <!-- V5.7 FIX: Explicación corregida del Win Rate -->
+                        <li><b>Win Rate:</b> <span class="text-cyan-400">Aciertos ÷ Finalizados</span> (NO incluye seguimientos en curso). Un seguimiento "acierta" cuando el bot rechazó correctamente (precio se movió en contra).</li>
                     </ul>
                 </div>
 
@@ -518,6 +542,7 @@
         // ============================================
         // V5.7: ESTADÍSTICAS DESDE DB
         // ============================================
+        /* V5.7 FIX: fetchStats actualizado para mostrar métricas de transparencia */
         async function fetchStats() {
             try {
                 const res = await fetch('/api/stats/summary');
@@ -525,16 +550,23 @@
                 if (data.estado === 'success') {
                     document.getElementById('stat-fires').innerText = data.fires_hoy;
                     document.getElementById('stat-nearmiss').innerText = data.total_near_miss;
+                    /* V5.7 FIX: Mostrar seguimientos finalizados si el elemento existe */
+                    const elFinalizados = document.getElementById('stat-finalizados');
+                    if (elFinalizados) elFinalizados.innerText = data.finalizados_hoy || 0;
                     document.getElementById('stat-winrate').innerText = data.win_rate_rechazos + '%';
                 } else {
                     document.getElementById('stat-fires').innerText = 'ERR';
                     document.getElementById('stat-nearmiss').innerText = 'ERR';
+                    const elFinalizados = document.getElementById('stat-finalizados');
+                    if (elFinalizados) elFinalizados.innerText = 'ERR';
                     document.getElementById('stat-winrate').innerText = 'ERR';
                 }
             } catch (e) {
                 console.error("[STATS] Error cargando estadísticas:", e);
                 document.getElementById('stat-fires').innerText = 'ERR';
                 document.getElementById('stat-nearmiss').innerText = 'ERR';
+                const elFinalizados = document.getElementById('stat-finalizados');
+                if (elFinalizados) elFinalizados.innerText = 'ERR';
                 document.getElementById('stat-winrate').innerText = 'ERR';
             }
         }
@@ -643,6 +675,8 @@
             const isRechazado = alertData.tipo === 'RECHAZADO';
             const isCB = alertData.tipo === 'CIRCUIT_BREAKER';
             const isPause = alertData.tipo === 'PAUSA_MANUAL';
+            /* V5.7 FIX: Detectar alertas de Grid Neutral */
+            const isNeutralGrid = alertData.tipo === 'NEUTRAL_GRID';
 
             let bgColor, borderColor, textColor;
             if (isFire) {
@@ -653,6 +687,9 @@
                 bgColor = 'bg-purple-900/90'; borderColor = 'border-purple-500'; textColor = 'text-purple-400';
             } else if (isPause) {
                 bgColor = 'bg-orange-900/90'; borderColor = 'border-orange-500'; textColor = 'text-orange-400';
+            /* V5.7 FIX: Color cyan para toast de NEUTRAL_GRID */
+            } else if (isNeutralGrid) {
+                bgColor = 'bg-cyan-900/90'; borderColor = 'border-cyan-500'; textColor = 'text-cyan-400';
             } else {
                 bgColor = 'bg-yellow-900/90'; borderColor = 'border-yellow-500'; textColor = 'text-yellow-400';
             }
@@ -679,6 +716,9 @@
                 msg = `🔒 CIRCUIT BREAKER | ${alertData.rechazos[0]}`;
             } else if (isPause) {
                 msg = `⏸️ PAUSADA MANUALMENTE | ${alertData.rechazos[0]}`;
+            /* V5.7 FIX: Mensaje específico para Grid Neutral */
+            } else if (isNeutralGrid) {
+                msg = `💠 GRID NEUTRAL ACTIVADO | El bot asume control lateral`;
             } else {
                 msg = alertData.tipo;
             }
@@ -747,6 +787,8 @@
             if (isFire) { color = 'text-red-400'; borderColor = 'border-red-800'; bgColor = 'bg-red-900/20'; }
             else if (isRechazado) { color = 'text-orange-400'; borderColor = 'border-orange-800'; bgColor = 'bg-orange-900/20'; }
             else if (isCB) { color = 'text-purple-400'; borderColor = 'border-purple-800'; bgColor = 'bg-purple-900/20'; }
+            /* V5.7 FIX: Estilo cyan para alertas NEUTRAL_GRID en el log */
+            else if (isNeutralGrid) { color = 'text-cyan-400'; borderColor = 'border-cyan-800'; bgColor = 'bg-cyan-900/20'; }
             else { color = 'text-yellow-400'; borderColor = 'border-yellow-800'; bgColor = 'bg-yellow-900/20'; }
 
             let msg;
@@ -759,6 +801,9 @@
                 msg = `❌ RECHAZADO <span class="font-bold">${alertData.direction}</span> | ${alertData.rechazos[0]}`;
             } else if (isCB) {
                 msg = `🔒 CIRCUIT BREAKER | ${alertData.rechazos[0]}`;
+            /* V5.7 FIX: Mensaje para alertas NEUTRAL_GRID en el log */
+            } else if (isNeutralGrid) {
+                msg = `💠 GRID NEUTRAL ACTIVADO | El bot asume control lateral`;
             } else {
                 msg = `Estado: ${alertData.tipo}`;
             }
@@ -1088,6 +1133,8 @@
                 case 'FIRE': return 'bg-red-600 text-white';
                 case 'ARMED': return 'bg-yellow-600 text-black';
                 case 'COOLDOWN': return 'bg-orange-700 text-white';
+                /* V5.7 FIX: Color cyan para NEUTRAL_GRID */
+                case 'NEUTRAL_GRID': return 'bg-cyan-700 text-white';
                 case 'MONITOREO': return 'bg-gray-700 text-gray-400';
                 default: return 'bg-gray-700 text-gray-400';
             }
@@ -1099,6 +1146,8 @@
                 case 'FIRE': return 'bg-red-500 pulse-dot-fire';
                 case 'ARMED': return 'bg-yellow-500 pulse-dot-armed';
                 case 'COOLDOWN': return 'bg-orange-500 pulse-dot-cooldown';
+                /* V5.7 FIX: Punto cyan pulsante para NEUTRAL_GRID */
+                case 'NEUTRAL_GRID': return 'bg-cyan-500 pulse-dot-neutral';
                 case 'MONITOREO': return 'bg-gray-500';
                 default: return 'bg-gray-500';
             }
@@ -1110,6 +1159,8 @@
                 case 'FIRE': return 'state-badge-fire';
                 case 'ARMED': return 'state-badge-armed';
                 case 'COOLDOWN': return 'state-badge-cooldown';
+                /* V5.7 FIX: Badge cyan para NEUTRAL_GRID */
+                case 'NEUTRAL_GRID': return 'state-badge-neutral';
                 case 'MONITOREO': return 'state-badge-monitoreo';
                 default: return 'state-badge-monitoreo';
             }
