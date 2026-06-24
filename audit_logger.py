@@ -806,11 +806,15 @@ class AuditLogger:
         else:
             direccion_real = "LATERAL"
 
-        # ¿El bot acerto al rechazar?
+        # ¿El bot acerto al rechazar? (Acierta si te salvó de entrar a un mal trade)
         if direccion == "NEUTRAL":
             acerto = (abs(mejor_movimiento_pct) < 2.0)  # Si se quedo lateral, acerto
+        elif direccion == "LONG":
+            acerto = (direccion_real != "ALCISTA")      # Acertó al rechazar si el precio NO subió
+        elif direccion == "SHORT":
+            acerto = (direccion_real != "BAJISTA")      # Acertó al rechazar si el precio NO bajó
         else:
-            acerto = (direccion == direccion_real)
+            acerto = False
 
         resultados = {
             "seguimiento_id": near_miss["seguimiento_id"],
