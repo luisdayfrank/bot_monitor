@@ -1482,11 +1482,12 @@
 
             const html = `
                 <div id="coin-${symbol}" data-symbol="${symbol}" 
+                     onclick="selectCoin('${symbol}')"
                      class="coin-item w-full text-left px-3 py-2.5 rounded-lg border border-transparent hover:bg-gray-700/50 transition flex justify-between items-center group ${!isActive ? 'disabled' : ''}">
                     <div class="flex items-center gap-2.5 flex-1 min-w-0">
                         <div id="toggle-${symbol}" 
                              class="toggle-switch ${isActive ? 'active' : ''}"
-                             onclick="toggleCoin('${symbol}', event)"
+                             onclick="event.stopPropagation(); toggleCoin('${symbol}', event)"
                              title="${isActive ? 'Desactivar' : 'Activar'} moneda"></div>
                         <div class="flex flex-col min-w-0">
                             <span class="font-bold text-sm group-hover:text-blue-400 transition truncate">${symbol}</span>
@@ -1498,6 +1499,7 @@
                         <span id="list-dir-${symbol}" class="text-[9px] text-gray-600 font-mono mt-0.5 hidden">--</span>
                     </div>
                 </div>
+            
             `;
             list.insertAdjacentHTML('beforeend', html);
             updateCoinCount();
