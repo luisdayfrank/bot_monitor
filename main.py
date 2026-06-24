@@ -166,6 +166,7 @@ async def lifespan(fastapi_app):
                 monedas_pausadas_auto = 0
                 monedas_armed = 0
                 monedas_fire = 0
+                monedas_neutral_grid = 0  # FIX #7: Contador NEUTRAL_GRID
 
                 for symbol in CONFIG.symbols:
                     st = signals.states[symbol]
@@ -197,6 +198,9 @@ async def lifespan(fastapi_app):
                     if st.estado == 'FIRE':
                         monedas_fire += 1
 
+                    if st.estado == 'NEUTRAL_GRID':
+                        monedas_neutral_grid += 1
+
                     # V4.2: Score con indicador visual
                     score_visual = score
                     if score >= 70:
@@ -219,6 +223,7 @@ async def lifespan(fastapi_app):
                     f"Total:{total_monedas} | "
                     f"🔥FIRE:{monedas_fire} | "
                     f"🎯ARMED:{monedas_armed} | "
+                    f"💠N-GRID:{monedas_neutral_grid} | "  # FIX #7: Mostrar NEUTRAL_GRID
                     f"⏸️Manual:{monedas_pausadas_manual} | "
                     f"⏸️Auto:{monedas_pausadas_auto}"
                 )

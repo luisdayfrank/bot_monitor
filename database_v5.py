@@ -49,7 +49,7 @@ async def _get_db():
         # Activar WAL mode para mejor concurrencia (lectura/escritura simultánea)
         await _db_conn.execute("PRAGMA journal_mode=WAL")
         await _db_conn.execute("PRAGMA synchronous=NORMAL")
-        await _db_conn.execute("PRAGMA busy_timeout=10000")  # 10s de espera antes de "database is locked"
+        await _db_conn.execute("PRAGMA busy_timeout=60000")  # 60s de espera antes de "database is locked"
         await _db_conn.commit()
     return _db_conn
 
@@ -60,7 +60,7 @@ async def close_db():
         await _db_conn.close()
         _db_conn = None
 
-async def _execute_with_retry(sql, params=(), max_retries=5):
+async def _execute_with_retry(sql, params=(), max_retries=10):
     """Ejecuta SQL con retry automático ante 'database is locked'."""
     db = await _get_db()
     for attempt in range(max_retries):
@@ -71,7 +71,7 @@ async def _execute_with_retry(sql, params=(), max_retries=5):
             return True
         except Exception as e:
             if "database is locked" in str(e).lower() and attempt < max_retries - 1:
-                wait = 0.1 * (2 ** attempt)  # 0.1, 0.2, 0.4, 0.8, 1.6s
+                wait = 0.5 * (2 ** attempt)  # 0.5, 1.0, 2.0, 4.0, 8.0s
                 print(f"  ⚠️ DB locked (intento {attempt+1}/{max_retries}), esperando {wait}s...")
                 await asyncio.sleep(wait)
             else:

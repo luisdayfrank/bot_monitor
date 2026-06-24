@@ -432,9 +432,34 @@ class SignalGenerator:
     # ═══════════════════════════════════════════════════════════════════════════════
     # FASE 5.5: LOG CONTINUO Y NEAR-MISSES
     # ═══════════════════════════════════════════════════════════════════════════════
+    async def _reiniciar_metricas_dia(self, symbol: str):
+        """FIX #3: Reinicia métricas diarias si cambió el día."""
+        state = self.states[symbol]
+        ahora = datetime.now(pytz.UTC).strftime('%Y-%m-%d')
+        if state.metricas_dia.get('fecha') != ahora:
+            state.metricas_dia = {
+                'fecha': ahora,
+                'score_max': 0,
+                'score_min': 100,
+                'score_sum': 0,
+                'score_count': 0,
+                'veces_cerca_umbral': 0,
+                'veces_muy_cerca': 0,
+                'veces_paso_umbral': 0,
+                'score_max_timestamp': None,
+                'score_min_timestamp': None,
+                'estados_visitados': set(),
+                'direcciones_detectadas': set(),
+                'rechazos_frecuentes': {},
+                'ultimo_log_continuo_ts': 0,
+            }
+
     async def _log_continuo(self, symbol: str, data: dict):
         if not self.audit_logger:
             return
+
+        # FIX #3: Reiniciar métricas si cambió el día
+        await self._reiniciar_metricas_dia(symbol)
 
         state = self.states[symbol]
         i15 = self.indicadores_15m.get(symbol, {})
@@ -582,18 +607,21 @@ class SignalGenerator:
 
         if not i15 or not i4h:
             state.filtro_macro_aprobado = False
-            await self._evaluar_despausa_automatica(symbol, state, score_macro=0)
+            # FIX #5: NO evaluar despausa durante cold start (evita pausa prematura)
+            # await self._evaluar_despausa_automatica(symbol, state, score_macro=0)
             return
 
         required_15m = ['rsi', 'adx', 'atr', 'ema200_15m', 'macd_hist',
                         'macd_hist_prev', 'volume', 'volume_sma20']
         if any(i15.get(k) is None for k in required_15m):
             state.filtro_macro_aprobado = False
-            await self._evaluar_despausa_automatica(symbol, state, score_macro=0)
+            # FIX #5: NO evaluar despausa durante cold start
+            # await self._evaluar_despausa_automatica(symbol, state, score_macro=0)
             return
         if i4h.get('ema200_4h') is None:
             state.filtro_macro_aprobado = False
-            await self._evaluar_despausa_automatica(symbol, state, score_macro=0)
+            # FIX #5: NO evaluar despausa durante cold start
+            # await self._evaluar_despausa_automatica(symbol, state, score_macro=0)
             return
 
         price = i15['close']
@@ -823,6 +851,8 @@ class SignalGenerator:
         # Si la direccion es NEUTRAL y el grid neutral esta habilitado,
         # evaluar si las condiciones de grid neutral se cumplen
         # ═══════════════════════════════════════════════════════════════════════════════
+        # FIX #2: Flag para controlar flujo sin bloquear métricas
+        entro_neutral_grid = False
         if direction == 'NEUTRAL' and CONFIG.grid_neutral_enabled:
             coin_config = CONFIG.coin_registry.get(symbol, {})
             entrar_grid, razon_grid = self.evaluar_grid_neutro(symbol, i15, coin_config)
@@ -840,7 +870,7 @@ class SignalGenerator:
                     )
                     state._prev_estado = 'NEUTRAL_GRID'
                 await self.emitir_alerta(symbol, 'NEUTRAL_GRID', 'NEUTRAL', score_macro, [], None, price)
-                return  # Salir sin evaluar filtro macro tradicional
+                entro_neutral_grid = True  # FIX #2: No retornar, dejar que fluya a métricas
             elif not entrar_grid:
                 # No cumple condiciones de grid neutral, seguir con logica normal
                 pass
@@ -877,6 +907,10 @@ class SignalGenerator:
         # Auditoria granular
         await self._log_continuo(symbol, i15)
         await self._evaluar_near_misses(symbol, score_macro, score_minimo, rechazos, direction, filtro_aprobado)
+
+        # FIX #2: Si entró a NEUTRAL_GRID, retornar aquí (después de métricas)
+        if entro_neutral_grid:
+            return
 
         if self.audit_logger:
             estado_previo = state._prev_filtro_aprobado

@@ -55,18 +55,18 @@ class AuditReporter:
         return (hora_target - ahora).total_seconds()
 
     async def _generar_y_enviar_reporte(self):
-        fecha_ayer = (now_local() - timedelta(days=1)).strftime("%Y-%m-%d")
-        print(f"[AUDITORIA] Generando reporte para {fecha_ayer}...")
+        fecha_reporte = now_local().strftime("%Y-%m-%d")
+        print(f"[AUDITORIA] Generando reporte para {fecha_reporte}...")
 
         try:
-            eventos_raw = await cargar_eventos_dia(fecha_ayer)
+            eventos_raw = await cargar_eventos_dia(fecha_reporte)
             # V5.7: Cargar near-miss seguimientos tambien
-            near_miss_seguimientos = await cargar_near_miss_seguimientos_dia(fecha_ayer)
+            near_miss_seguimientos = await cargar_near_miss_seguimientos_dia(fecha_reporte)
 
             if not eventos_raw and not near_miss_seguimientos:
-                print(f"  [AVISO] Sin eventos para {fecha_ayer}")
+                print(f"  [AVISO] Sin eventos para {fecha_reporte}")
                 await self.notifier.enviar_telegram(
-                    f"[AUDITORIA] <b>Auditoria {fecha_ayer}</b>\n"
+                    f"[AUDITORIA] <b>Auditoria {fecha_reporte}</b>\n"
                     f"Sin eventos registrados para este dia."
                 )
                 return
@@ -84,11 +84,11 @@ class AuditReporter:
             for symbol, eventos in eventos_por_moneda.items():
                 # V5.7: Filtrar near-miss seguimientos por moneda
                 nm_seguimientos_moneda = [nm for nm in near_miss_seguimientos if nm.get('symbol') == symbol]
-                json_data = await self._generar_json_moneda(symbol, fecha_ayer, eventos, nm_seguimientos_moneda)
+                json_data = await self._generar_json_moneda(symbol, fecha_reporte, eventos, nm_seguimientos_moneda)
 
                 db_dir = os.path.dirname(os.path.abspath(CONFIG.db_path))
                 os.makedirs(db_dir, exist_ok=True)
-                filename = f"auditoria_{symbol}_{fecha_ayer}.json"
+                filename = f"auditoria_{symbol}_{fecha_reporte}.json"
                 filepath = os.path.join(db_dir, filename)
 
                 with open(filepath, 'w', encoding='utf-8') as f:
@@ -97,7 +97,7 @@ class AuditReporter:
                 archivos_generados.append((filepath, filename))
 
             # Enviar resumen por Telegram
-            resumen = self._generar_resumen_texto(fecha_ayer, eventos_por_moneda, near_miss_seguimientos)
+            resumen = self._generar_resumen_texto(fecha_reporte, eventos_por_moneda, near_miss_seguimientos)
             await self.notifier.enviar_telegram(resumen)
 
             # Enviar archivos JSON + limpieza post-envio
@@ -136,7 +136,7 @@ class AuditReporter:
             # Alerta si quedan archivos sin enviar (posible problema con Telegram)
             if archivos_conservados > 0:
                 await self.notifier.enviar_telegram(
-                    f"[AVISO] <b>Auditoria {fecha_ayer}</b>\n"
+                    f"[AVISO] <b>Auditoria {fecha_reporte}</b>\n"
                     f"{archivos_conservados} archivo(s) JSON no pudieron enviarse y permanecen en el VPS.\n"
                     f"Ubicacion: <code>{db_dir}</code>\n"
                     f"Revisa conectividad con Telegram o envia manualmente."
@@ -147,7 +147,7 @@ class AuditReporter:
         except Exception as e:
             print(f"  [ERROR] Error generando reporte: {e}")
             await self.notifier.enviar_telegram(
-                f"[ERROR] <b>Error en auditoria {fecha_ayer}</b>\n{e}"
+                f"[ERROR] <b>Error en auditoria {fecha_reporte}</b>\n{e}"
             )
 
     async def _generar_json_moneda(self, symbol: str, fecha: str, eventos: List[dict],

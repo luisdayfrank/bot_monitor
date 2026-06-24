@@ -43,6 +43,10 @@ class AuditLogger:
         self._disparos_lock = asyncio.Lock()
         self._disparos_activos: Dict[str, dict] = {}
 
+        # V5.7.1 FIX #1: Buffer para acumular updates de disparos en RAM (reduce I/O 95%)
+        self._disparos_updates_buffer: Dict[str, dict] = {}
+        self._disparos_last_flush = 0
+
         # V5.7: Seguimiento virtual de near-misses con persistencia
         self._near_miss_lock = asyncio.Lock()
         self._near_miss_activos: Dict[str, dict] = {}
@@ -126,6 +130,21 @@ class AuditLogger:
             )
         except Exception as e:
             print(f"  ⚠️ Error persistiendo disparo activo {symbol}: {e}")
+
+    async def _flush_disparos_updates(self):
+        """V5.7.1 FIX #1: Flush acumulado de updates de disparos a SQLite."""
+        if not self._disparos_updates_buffer:
+            return
+        updates_copia = dict(self._disparos_updates_buffer)
+        self._disparos_updates_buffer.clear()
+        self._disparos_last_flush = int(datetime.now(pytz.UTC).timestamp())
+
+        for evento_id, campos in updates_copia.items():
+            try:
+                await actualizar_disparo_activo(evento_id, **campos)
+            except Exception as e:
+                print(f"  ⚠️ Error en flush acumulado disparo {evento_id}: {e}")
+
 
     async def _recuperar_disparos_activos(self):
         try:
@@ -449,12 +468,17 @@ class AuditLogger:
                 if intervalo_actual > disparo["muestras_guardadas"]:
                     await guardar_muestra_post(evento_id, symbol, timestamp_utc, precio, minutos_desde)
                     disparo["muestras_guardadas"] = intervalo_actual
-                    await actualizar_disparo_activo(
-                        evento_id,
-                        maximo_visto=disparo["maximo_visto"],
-                        minimo_visto=disparo["minimo_visto"],
-                        muestras_guardadas=disparo["muestras_guardadas"]
-                    )
+                    # V5.7.1 FIX #1: Acumular update en RAM en lugar de UPDATE inmediato
+                    self._disparos_updates_buffer[evento_id] = {
+                        "maximo_visto": disparo["maximo_visto"],
+                        "minimo_visto": disparo["minimo_visto"],
+                        "muestras_guardadas": disparo["muestras_guardadas"]
+                    }
+                    # Flush cada 30 minutos o cuando hay muchos acumulados
+                    ahora = int(datetime.now(pytz.UTC).timestamp())
+                    if (ahora - self._disparos_last_flush > 1800 or
+                        len(self._disparos_updates_buffer) > 50):
+                        await self._flush_disparos_updates()
             if minutos_desde > horas_seguimiento * 60:
                 await self._guardar_eventos_finales(symbol, disparo, timestamp_utc)
                 await eliminar_disparo_activo(evento_id)
@@ -704,10 +728,20 @@ class AuditLogger:
                     # La persistencia ocurre en _guardar_resultados_near_miss() al finalizar
                     # o en _persistir_near_miss_activos() durante stop() para crash-recovery
 
-                    # V5.7.1: Log silencioso de acumulación RAM (cada hora)
+                    # V5.7.1 FIX #4: Persistir muestras acumuladas cada 12 muestras (60 min)
                     if len(near_miss["muestras"]) % 12 == 0:
                         print(f"  [NM-RAM] {symbol} {len(near_miss['muestras'])} muestras en RAM | "
                               f"Max:{near_miss['precio_maximo']:.4f} Min:{near_miss['precio_minimo']:.4f}")
+                        # Persistir muestras acumuladas para crash-recovery
+                        try:
+                            await actualizar_near_miss_muestras(
+                                seguimiento_id=near_miss["seguimiento_id"],
+                                muestras_json=near_miss["muestras"],
+                                precio_max=near_miss["precio_maximo"],
+                                precio_min=near_miss["precio_minimo"]
+                            )
+                        except Exception as e:
+                            print(f"  ⚠️ Error persistiendo near-miss muestras {symbol}: {e}")
 
                     # Guardar evento de muestra
                     muestra_evento = {
