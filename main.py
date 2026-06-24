@@ -112,12 +112,14 @@ async def lifespan(fastapi_app):
                     break
                 for symbol, precio in list(precios_vivo.items()):
                     try:
-                        await audit_logger.trackear_precio_post_disparo(
-                            symbol, precio, datetime.now(pytz.UTC)
-                        )
+                        ts = datetime.now(pytz.UTC)
+                        await audit_logger.trackear_precio_post_disparo(symbol, precio, ts)
+                        # ✅ AÑADIR ESTA LÍNEA:
+                        await audit_logger.trackear_precio_near_miss(symbol, precio, ts)
                     except Exception as e:
                         print(f"  ⚠️ Error trackeando {symbol}: {e}")
                     await asyncio.sleep(0)
+
 
         t7 = asyncio.create_task(trackear_precios_post())
         background_tasks.add(t7)
