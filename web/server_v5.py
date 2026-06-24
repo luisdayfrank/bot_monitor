@@ -69,6 +69,7 @@ def _sanitize_numpy(obj):
 
 import os
 import time
+import pytz  # V5.7 FIX: Necesario para cálculo de timestamps UTC en estadísticas
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -376,7 +377,12 @@ async def get_snapshot(request: Request):
 
 @app.get("/api/stats/summary")
 async def get_stats_summary(request: Request):
-    """Obtiene un resumen de rendimiento usando la base de datos de auditoría."""
+    """Obtiene un resumen de rendimiento usando la base de datos de auditoría.
+
+    V5.7 FIX: Win Rate calculado SOLO sobre seguimientos FINALIZADOS del día,
+    no sobre el total histórico. Esto evita que seguimientos en curso (2h)
+    distorsionen la métrica mostrando 0% win rate falsamente.
+    """
     try:
         db = await _get_db()
         hoy_local = now_local().strftime("%Y-%m-%d")
@@ -388,23 +394,49 @@ async def get_stats_summary(request: Request):
         )
         fires_hoy = (await cursor.fetchone())[0]
 
-        # 2. Conteo total de Near Misses
-        cursor = await db.execute("SELECT count(*) FROM near_miss_seguimientos")
+        # V5.7 FIX: Convertir fecha local a timestamp UTC para near-misses
+        # Esto estandariza las métricas del dashboard al día en curso
+        tz = get_tz()
+        fecha_inicio = datetime.datetime.strptime(hoy_local, "%Y-%m-%d")
+        fecha_inicio = tz.localize(fecha_inicio)
+        ts_inicio_dia = fecha_inicio.astimezone(pytz.UTC).timestamp()
+
+        # 2. Conteo de Near Misses INICIADOS HOY (no toda la historia)
+        cursor = await db.execute(
+            "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ?",
+            (ts_inicio_dia,)
+        )
         total_near_miss = (await cursor.fetchone())[0]
 
-        # 3. Tasa de acierto de los rechazos (acerto_bot = 1 significa que el bot acertó al rechazar)
+        # 3. V5.7 FIX: Win Rate SOLO sobre seguimientos FINALIZADOS del día
+        # Los seguimientos en curso (timestamp_fin IS NULL) NO se cuentan
+        # como fracasos, evitando distorsión del 0% win rate
+        cursor = await db.execute(
+            "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND timestamp_fin IS NOT NULL",
+            (ts_inicio_dia,)
+        )
+        finalizados_hoy = (await cursor.fetchone())[0]
+
         aciertos = 0
-        if total_near_miss > 0:
+        if finalizados_hoy > 0:
             cursor = await db.execute(
-                "SELECT count(*) FROM near_miss_seguimientos WHERE acerto_bot = 1"
+                "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND acerto_bot = 1",
+                (ts_inicio_dia,)
             )
             aciertos = (await cursor.fetchone())[0]
 
-        win_rate = (aciertos / total_near_miss * 100) if total_near_miss > 0 else 0.0
+        # Win Rate REAL: Aciertos / Seguimientos Terminados (no total)
+        win_rate = (aciertos / finalizados_hoy * 100) if finalizados_hoy > 0 else 0.0
+
+        # Métricas adicionales para transparencia
+        seguimientos_activos = total_near_miss - finalizados_hoy
 
         return {
             "fires_hoy": fires_hoy,
             "total_near_miss": total_near_miss,
+            "finalizados_hoy": finalizados_hoy,
+            "seguimientos_activos": seguimientos_activos,
+            "aciertos_bot": aciertos,
             "win_rate_rechazos": round(win_rate, 2),
             "estado": "success"
         }
