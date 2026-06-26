@@ -387,6 +387,56 @@ class AuditLogger:
             self._buffer_eventos.append(evento)
 
     # ═══════════════════════════════════════════════════════════════════════════════
+    # V5.9.2 MEJORA #7: EVENTOS DE SIMULACIÓN GRID NEUTRAL EN AUDITORÍA
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    async def log_evento_grid_simulacion(self, symbol: str, tipo: str, grid_id: int,
+                                          evento_simulacion: dict, pnl_acumulado: float):
+        """
+        Registra eventos de simulación grid neutral en auditoria_eventos.
+        Esto garantiza que el reporte JSON diario incluya:
+          "neutral_grid_eventos": [
+            {"tipo": "GRID_BUY_SIM", "nivel": 1.2345, "slippage": 0.0008, ...},
+            {"tipo": "KILL_SWITCH_CLOSE", "razon": "max_posiciones", ...}
+          ]
+
+        Tipos: GRID_INICIADO, GRID_BUY_SIM, GRID_SELL_SIM, POSICION_TIMEOUT,
+               KILL_SWITCH_CLOSE, POSICION_ATRAPADA
+        """
+        if not CONFIG.modo_auditoria:
+            return
+
+        timestamp_utc = now_utc()
+        contexto_json = json.dumps({
+            "grid_id": grid_id,
+            "evento_simulacion": evento_simulacion,
+            "pnl_acumulado": pnl_acumulado,
+            "version": "5.9.2"
+        })
+
+        # Mapear tipos internos a tipos de auditoría válidos
+        tipo_auditoria = tipo
+        if tipo not in ('GRID_INICIADO', 'GRID_BUY_SIM', 'GRID_SELL_SIM',
+                        'POSICION_TIMEOUT', 'KILL_SWITCH_CLOSE', 'POSICION_ATRAPADA'):
+            tipo_auditoria = 'GRID_NEUTRAL_EVENTO'
+
+        evento = {
+            "symbol": symbol,
+            "timestamp_utc": timestamp_utc,
+            "tipo": tipo_auditoria,
+            "direccion": None,
+            "precio": evento_simulacion.get('precio_ejecucion') if evento_simulacion else None,
+            "contexto_json": contexto_json,
+            "grid_params_json": json.dumps({"grid_id": grid_id}),
+            "score": None,
+            "rechazos_json": None,
+            "estado_maquina": "NEUTRAL_GRID_SIM"
+        }
+
+        async with self._buffer_lock:
+            self._buffer_eventos.append(evento)
+
+    # ═══════════════════════════════════════════════════════════════════════════════
     # SEGUIMIENTO POST-DISPARO (sin cambios)
     # ═══════════════════════════════════════════════════════════════════════════════
 

@@ -67,14 +67,17 @@ class Config(BaseModel):
 
     # ─── Filtro Macro (15m) ───
     adx_ideal: tuple = (25, 35)
-    adx_reject: float = 45.0
+    adx_reject: float = 55.0
+
+    #nuevo valor asx
+    adx_min_trend: float = 17.0
 
     # RSI Macro 15m: Oxígeno (no gatillo).
     rsi_macro_min: float = 45.0
     rsi_macro_max: float = 80.0
 
     # Para LONG (simetría)
-    rsi_macro_long_max: float = 55.0
+    rsi_macro_long_max: float = 60.0
     rsi_macro_long_min: float = 20.0
 
     # ─── Gatillo Micro (1m) ───
@@ -92,7 +95,7 @@ class Config(BaseModel):
     atr_min_pct: float = 0.15
     atr_max_pct: float = 2.0
     macd_stable_threshold: float = 0.3
-    macd_danger_threshold: float = 0.5
+    macd_danger_threshold: float = 0.7
     volume_min_ratio: float = 1.0
 
     # Histéresis y cooldown
@@ -168,11 +171,11 @@ class Config(BaseModel):
     # Umbral de MFM para considerar volumen alineado con dirección
     # MFM > 0.2  → presión alcista (volumen comprador dominante)
     # MFM < -0.2 → presión bajista (volumen vendedor dominante)
-    mfm_umbral_alineacion: float = 0.2
+    mfm_umbral_alineacion: float = 0.15
     # Puntos que resta el MFM cuando contradice la dirección
-    mfm_penalizacion_contrario: int = 5
+    mfm_penalizacion_contrario: int = 3
     # Puntos que suma el MFM cuando alinea con dirección (reemplaza bonus volumen genérico)
-    mfm_bonus_alineado: int = 10
+    mfm_bonus_alineado: int = 15
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # FASE 5.3: UMBRAL DINÁMICO VÍA ATR
@@ -180,9 +183,9 @@ class Config(BaseModel):
     # Ventana de velas 15m para calcular percentiles del ATR
     atr_percentil_ventana: int = 100
     # Score mínimo en consolidación (ATR bajo = más selectivo)
-    score_min_consolidacion: int = 85
+    score_min_consolidacion: int = 75
     # Score mínimo en expansión (ATR alto = más permisivo)
-    score_min_expansion: int = 65
+    score_min_expansion: int = 60
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # FASE 5.4: VOLUMEN DINÁMICO CONDICIONAL — Bypass por convicción alta
@@ -190,7 +193,7 @@ class Config(BaseModel):
     # Puntos EXTRA sobre el umbral necesarios para activar bypass por convicción alta
     volumen_bypass_score_extra: int = 5
     # ADX mínimo para que el bypass por convicción alta sea válido
-    volumen_bypass_adx_min: float = 25.0
+    volumen_bypass_adx_min: float = 20.0
     # Percentil del ATR diario para bypass por volatilidad (75 = percentil 75)
     volumen_bypass_atr_percentil: float = 75.0
 
@@ -208,13 +211,13 @@ class Config(BaseModel):
     # Activar estrategia de grid en mercados neutrales
     grid_neutral_enabled: bool = True  # Toggle global, sin confirmación manual
     # Tiempo máximo en estado NEUTRAL_GRID antes de aborto automático
-    grid_neutral_timeout_min: int = 30
+    grid_neutral_timeout_min: int = 15
     # Aborto si ADX sube +5 sobre umbral de entrada
     grid_neutral_aborto_adx_delta: float = 5.0
     # Aborto si precio se mueve >2% de EMA50/200
-    grid_neutral_aborto_precio_pct: float = 2.0
+    grid_neutral_aborto_precio_pct: float = 1.2
     # ADX máximo para considerar mercado neutral (sin tendencia fuerte)
-    grid_neutral_adx_max: float = 25.0
+    grid_neutral_adx_max: float = 22.0
     # RSI rango para grid neutral (no extremos)
     grid_neutral_rsi_min: float = 35.0
     grid_neutral_rsi_max: float = 65.0
@@ -267,6 +270,47 @@ class Config(BaseModel):
     # No afecta el funcionamiento del bot. Solo lectura, cero interferencia.
     heartbeat_debug: bool = True
     heartbeat_intervalo_min: int = 15  # Minutos entre heartbeats
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # V5.9.2: PARÁMETROS DE SIMULACIÓN VIRTUAL GRID NEUTRAL
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    # V5.9.2 MEJORA #1: Timeout por posición abierta (FIFO)
+    # Cerrar posición si lleva N minutos abierta (evita posiciones eternas)
+    grid_neutral_posicion_timeout_min: int = 30
+
+    # V5.9.2 MEJORA #2: Slippage absoluto de último recurso
+    # Si el kill switch falla tras 10 intentos, market order con max 2% slippage
+    grid_neutral_kill_switch_slippage_absoluto: float = 0.02  # 2%
+    grid_neutral_kill_switch_slippage_max: float = 0.005  # 0.5% normal
+    grid_neutral_kill_switch_intervalo_seg: int = 3  # 3s entre reintentos
+    grid_neutral_kill_switch_max_intentos: int = 10  # 10 intentos = 30s max
+
+    # V5.9.2 MEJORA #3: Modo tolerancia API REST para testnet
+    # Multiplicador de timeout en API REST testnet (2x = más tolerante)
+    grid_neutral_testnet_api_timeout_mult: float = 2.0
+    grid_neutral_testnet_api_retry_max: int = 5  # Reintentos en testnet
+    grid_neutral_testnet_api_retry_delay_base: float = 2.0  # Segundos base
+
+    # V5.9.2 MEJORA #4: Gestión de órdenes parcialmente llenadas
+    # Ajustar orden opuesta según filled_qty de la primera
+    grid_neutral_gestion_parcial: bool = True
+
+    # V5.9.2 MEJORA #6: Cleaner de grids huérfanos
+    # Marcar ABORTADO si grid ACTIVO sin actividad durante > N horas
+    grid_neutral_huerfano_timeout_horas: int = 4
+
+    # V5.9.2 MEJORA #6: Heartbeat de simulación (cada 15 min)
+    grid_neutral_heartbeat_intervalo_min: int = 15
+
+    # V5.9.2 MEJORA #9: Circuit Breaker afecta Grid Neutral
+    # Si True, CB bloquea también grids neutral (comparte capital)
+    circuit_breaker_afecta_grid_neutral: bool = True
+
+    # V5.9.2: Parámetros de simulación virtual
+    grid_neutral_sim_max_posiciones: int = 10  # Max posiciones simultáneas en sim
+    grid_neutral_sim_fee_rate: float = 0.0005  # 0.05% fee Binance Futures
+    grid_neutral_sim_slippage_base: float = 0.0005  # 0.05% slippage base simulado
 
 
 CONFIG = Config()

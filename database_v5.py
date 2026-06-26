@@ -281,8 +281,55 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_nm_symbol ON near_miss_seguimientos(symbol)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_nm_timestamp ON near_miss_seguimientos(timestamp_inicio)")
 
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # V5.9.2: TABLAS DE GRID NEUTRAL (simulación virtual)
+        # ═══════════════════════════════════════════════════════════════════════════════
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS grid_estados (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                timestamp_inicio REAL NOT NULL,
+                timestamp_fin REAL,
+                estado TEXT NOT NULL DEFAULT 'ACTIVO',
+                direccion TEXT,
+                precio_entrada REAL,
+                grid_params_json TEXT,
+                evento_auditoria_id INTEGER,
+                FOREIGN KEY (evento_auditoria_id) REFERENCES auditoria_eventos(id)
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS grid_simulaciones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                grid_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                timestamp_inicio REAL NOT NULL,
+                timestamp_fin REAL,
+                precio_inicio REAL NOT NULL,
+                precio_fin REAL,
+                pnl_bruto REAL DEFAULT 0.0,
+                pnl_neto REAL DEFAULT 0.0,
+                fees_totales REAL DEFAULT 0.0,
+                slippage_total REAL DEFAULT 0.0,
+                trades_completados INTEGER DEFAULT 0,
+                trades_kill_switch INTEGER DEFAULT 0,
+                posiciones_abiertas_json TEXT,
+                max_posiciones_simultaneas INTEGER DEFAULT 0,
+                posiciones_atrapadas_json TEXT,
+                estado TEXT NOT NULL DEFAULT 'SIMULANDO',
+                FOREIGN KEY (grid_id) REFERENCES grid_estados(id)
+            )
+        """)
+
+        # Índices para grids
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_grid_estados_symbol ON grid_estados(symbol)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_grid_estados_estado ON grid_estados(estado)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_grid_sim_grid_id ON grid_simulaciones(grid_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_grid_sim_estado ON grid_simulaciones(estado)")
+
         await db.commit()
-    print("🗄️ Base de datos inicializada (WAL mode activado) + Tablas auditoría + Disparos activos persistentes + Near-miss seguimientos")
+    print("🗄️ Base de datos inicializada (WAL mode) + Auditoría + Disparos + Near-miss + V5.9.2 Grid Neutral")
 
 async def insertar_vela(symbol: str, tf: str, vela: dict):
     tabla = f"velas_{tf}"
@@ -641,3 +688,303 @@ async def cargar_near_miss_seguimientos_activos():
         """)
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# V5.9.2: FUNCIONES DE GRID NEUTRAL (Simulación Virtual)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def guardar_grid_estado(symbol, timestamp_inicio, estado='ACTIVO', direccion='NEUTRAL',
+                               precio_entrada=None, grid_params_json=None, evento_auditoria_id=None):
+    """Crea un nuevo grid estado. Retorna el ID del grid."""
+    db = await _get_db()
+    for attempt in range(5):
+        try:
+            async with _db_lock:
+                await db.execute("""
+                    INSERT INTO grid_estados
+                    (symbol, timestamp_inicio, estado, direccion, precio_entrada, grid_params_json, evento_auditoria_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (symbol, timestamp_inicio, estado, direccion, precio_entrada, grid_params_json, evento_auditoria_id))
+
+                cursor = await db.execute("SELECT last_insert_rowid()")
+                row = await cursor.fetchone()
+                await db.commit()
+
+                if row and row[0]:
+                    return row[0]
+                else:
+                    cursor2 = await db.execute(
+                        "SELECT id FROM grid_estados WHERE symbol = ? AND timestamp_inicio = ? ORDER BY id DESC LIMIT 1",
+                        (symbol, timestamp_inicio)
+                    )
+                    row2 = await cursor2.fetchone()
+                    return row2[0] if row2 else None
+
+        except Exception as e:
+            if "database is locked" in str(e).lower() and attempt < 4:
+                wait = 0.1 * (2 ** attempt)
+                print(f"  ⚠️ DB locked (grid estado intento {attempt+1}/5), esperando {wait}s...")
+                await asyncio.sleep(wait)
+            else:
+                print(f"  ❌ Error guardando grid estado: {e}")
+                return None
+    return None
+
+
+async def actualizar_grid_estado(grid_id, estado=None, timestamp_fin=None):
+    """Actualiza el estado de un grid existente."""
+    campos = []
+    valores = []
+    if estado is not None:
+        campos.append("estado = ?")
+        valores.append(estado)
+    if timestamp_fin is not None:
+        campos.append("timestamp_fin = ?")
+        valores.append(timestamp_fin)
+
+    if not campos:
+        return
+
+    valores.append(grid_id)
+    sql = f"UPDATE grid_estados SET {', '.join(campos)} WHERE id = ?"
+    await _execute_with_retry(sql, tuple(valores))
+
+
+async def guardar_grid_simulacion(grid_id, symbol, timestamp_inicio, precio_inicio,
+                                   posiciones_abiertas_json=None, estado='SIMULANDO'):
+    """Crea una nueva simulación de grid. Retorna el ID de la simulación."""
+    db = await _get_db()
+    for attempt in range(5):
+        try:
+            async with _db_lock:
+                await db.execute("""
+                    INSERT INTO grid_simulaciones
+                    (grid_id, symbol, timestamp_inicio, precio_inicio, posiciones_abiertas_json, estado)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (grid_id, symbol, timestamp_inicio, precio_inicio, posiciones_abiertas_json, estado))
+
+                cursor = await db.execute("SELECT last_insert_rowid()")
+                row = await cursor.fetchone()
+                await db.commit()
+
+                if row and row[0]:
+                    return row[0]
+                else:
+                    cursor2 = await db.execute(
+                        "SELECT id FROM grid_simulaciones WHERE grid_id = ? AND timestamp_inicio = ? ORDER BY id DESC LIMIT 1",
+                        (grid_id, timestamp_inicio)
+                    )
+                    row2 = await cursor2.fetchone()
+                    return row2[0] if row2 else None
+
+        except Exception as e:
+            if "database is locked" in str(e).lower() and attempt < 4:
+                wait = 0.1 * (2 ** attempt)
+                print(f"  ⚠️ DB locked (grid sim intento {attempt+1}/5), esperando {wait}s...")
+                await asyncio.sleep(wait)
+            else:
+                print(f"  ❌ Error guardando grid simulación: {e}")
+                return None
+    return None
+
+
+async def actualizar_grid_simulacion(grid_id, estado=None, timestamp_fin=None, precio_fin=None,
+                                      pnl_bruto=None, pnl_neto=None, fees_totales=None,
+                                      slippage_total=None, trades_completados=None,
+                                      trades_kill_switch=None, posiciones_abiertas_json=None,
+                                      posiciones_atrapadas_json=None):
+    """Actualiza una simulación de grid existente."""
+    campos = []
+    valores = []
+    if estado is not None:
+        campos.append("estado = ?")
+        valores.append(estado)
+    if timestamp_fin is not None:
+        campos.append("timestamp_fin = ?")
+        valores.append(timestamp_fin)
+    if precio_fin is not None:
+        campos.append("precio_fin = ?")
+        valores.append(precio_fin)
+    if pnl_bruto is not None:
+        campos.append("pnl_bruto = ?")
+        valores.append(pnl_bruto)
+    if pnl_neto is not None:
+        campos.append("pnl_neto = ?")
+        valores.append(pnl_neto)
+    if fees_totales is not None:
+        campos.append("fees_totales = ?")
+        valores.append(fees_totales)
+    if slippage_total is not None:
+        campos.append("slippage_total = ?")
+        valores.append(slippage_total)
+    if trades_completados is not None:
+        campos.append("trades_completados = ?")
+        valores.append(trades_completados)
+    if trades_kill_switch is not None:
+        campos.append("trades_kill_switch = ?")
+        valores.append(trades_kill_switch)
+    if posiciones_abiertas_json is not None:
+        campos.append("posiciones_abiertas_json = ?")
+        valores.append(posiciones_abiertas_json)
+    if posiciones_atrapadas_json is not None:
+        campos.append("posiciones_atrapadas_json = ?")
+        valores.append(posiciones_atrapadas_json)
+
+    if not campos:
+        return
+
+    valores.append(grid_id)
+    sql = f"UPDATE grid_simulaciones SET {', '.join(campos)} WHERE grid_id = ?"
+    await _execute_with_retry(sql, tuple(valores))
+
+
+async def cargar_grid_activo(symbol):
+    """Carga el grid activo más reciente para un símbolo."""
+    db = await _get_db()
+    async with _db_lock:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT * FROM grid_estados
+            WHERE symbol = ? AND estado = 'ACTIVO'
+            ORDER BY timestamp_inicio DESC LIMIT 1
+        """, (symbol,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def cargar_simulacion_activa(grid_id):
+    """Carga la simulación activa para un grid_id."""
+    db = await _get_db()
+    async with _db_lock:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT * FROM grid_simulaciones
+            WHERE grid_id = ? AND estado = 'SIMULANDO'
+            ORDER BY timestamp_inicio DESC LIMIT 1
+        """, (grid_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def cargar_grids_huerfanos(timeout_seg):
+    """Carga grids ACTIVOS sin simulación activa durante más de timeout_seg."""
+    db = await _get_db()
+    ahora = int(datetime.now(pytz.UTC).timestamp())
+    async with _db_lock:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT g.id, g.symbol, g.timestamp_inicio
+            FROM grid_estados g
+            WHERE g.estado = 'ACTIVO'
+            AND (
+                NOT EXISTS (
+                    SELECT 1 FROM grid_simulaciones s
+                    WHERE s.grid_id = g.id AND s.estado = 'SIMULANDO'
+                )
+                OR EXISTS (
+                    SELECT 1 FROM grid_simulaciones s2
+                    WHERE s2.grid_id = g.id AND s2.estado = 'SIMULANDO'
+                    AND (? - s2.timestamp_inicio) > ?
+                )
+            )
+        """, (ahora, timeout_seg))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def forzar_aborto_grid_huerfano(grid_id, sim_id=None):
+    """Marca un grid huérfano y su simulación como ABORTADO."""
+    db = await _get_db()
+    async with _db_lock:
+        await db.execute(
+            "UPDATE grid_estados SET estado = 'ABORTADO', timestamp_fin = ? WHERE id = ?",
+            (int(datetime.now(pytz.UTC).timestamp()), grid_id)
+        )
+        if sim_id:
+            await db.execute(
+                "UPDATE grid_simulaciones SET estado = 'ABORTADO', timestamp_fin = ? WHERE id = ?",
+                (int(datetime.now(pytz.UTC).timestamp()), sim_id)
+            )
+        await db.commit()
+
+
+async def guardar_grid_estado_atomico(symbol, timestamp_inicio, precio_inicio, grid_params_json,
+                                       posiciones_abiertas_json, evento_auditoria_id=None):
+    """Transacción atómica: grid_estado + grid_simulacion en una sola transacción."""
+    db = await _get_db()
+    ts = int(datetime.now(pytz.UTC).timestamp())
+    for attempt in range(5):
+        try:
+            async with _db_lock:
+                # 1. Insertar grid_estado
+                await db.execute("""
+                    INSERT INTO grid_estados
+                    (symbol, timestamp_inicio, estado, direccion, precio_entrada, grid_params_json, evento_auditoria_id)
+                    VALUES (?, ?, 'ACTIVO', 'NEUTRAL', ?, ?, ?)
+                """, (symbol, timestamp_inicio, precio_inicio, grid_params_json, evento_auditoria_id))
+
+                cursor = await db.execute("SELECT last_insert_rowid()")
+                row = await cursor.fetchone()
+                grid_id = row[0] if row else None
+
+                if not grid_id:
+                    await db.rollback()
+                    return None
+
+                # 2. Insertar grid_simulacion
+                await db.execute("""
+                    INSERT INTO grid_simulaciones
+                    (grid_id, symbol, timestamp_inicio, precio_inicio, posiciones_abiertas_json, estado)
+                    VALUES (?, ?, ?, ?, ?, 'SIMULANDO')
+                """, (grid_id, symbol, timestamp_inicio, precio_inicio, posiciones_abiertas_json))
+
+                cursor2 = await db.execute("SELECT last_insert_rowid()")
+                row2 = await cursor2.fetchone()
+                sim_id = row2[0] if row2 else None
+
+                await db.commit()
+                return {"grid_id": grid_id, "sim_id": sim_id}
+
+        except Exception as e:
+            if "database is locked" in str(e).lower() and attempt < 4:
+                wait = 0.1 * (2 ** attempt)
+                print(f"  ⚠️ DB locked (transacción atómica intento {attempt+1}/5), esperando {wait}s...")
+                await asyncio.sleep(wait)
+            else:
+                print(f"  ❌ Error transacción atómica grid: {e}")
+                try:
+                    await db.rollback()
+                except:
+                    pass
+                return None
+    return None
+
+
+async def cargar_todos_grids_activos():
+    """Carga todos los grids activos con su simulación."""
+    db = await _get_db()
+    async with _db_lock:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT g.id as grid_id, g.symbol, g.timestamp_inicio, g.estado as grid_estado,
+                   g.precio_entrada, g.grid_params_json,
+                   s.id as sim_id, s.posiciones_abiertas_json, s.posiciones_atrapadas_json,
+                   s.pnl_neto, s.estado as sim_estado
+            FROM grid_estados g
+            LEFT JOIN grid_simulaciones s ON g.id = s.grid_id
+            WHERE g.estado = 'ACTIVO'
+        """)
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def actualizar_posiciones_abiertas(grid_id, posiciones_json, posiciones_atrapadas_json=None):
+    """Actualiza las posiciones abiertas de una simulación."""
+    campos = ["posiciones_abiertas_json = ?"]
+    valores = [posiciones_json]
+    if posiciones_atrapadas_json is not None:
+        campos.append("posiciones_atrapadas_json = ?")
+        valores.append(posiciones_atrapadas_json)
+    valores.append(grid_id)
+    sql = f"UPDATE grid_simulaciones SET {', '.join(campos)} WHERE grid_id = ?"
+    await _execute_with_retry(sql, tuple(valores))

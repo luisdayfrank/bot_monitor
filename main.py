@@ -14,6 +14,7 @@ from notifier_v5 import Notifier
 
 from audit_logger import AuditLogger
 from audit_reporter_v5 import AuditReporter
+from grid_simulator import GridSimulator  # V5.9.2: Motor de simulación grid neutral
 
 background_tasks = set()
 
@@ -31,6 +32,16 @@ async def lifespan(fastapi_app):
     engine = IndicatorEngine(queue_velas, queue_indicadores)
     signals = SignalGenerator(queue_indicadores, queue_eventos)
     notifier = Notifier()
+
+    # V5.9.2: Crear simulador de grid neutral
+    grid_simulator = GridSimulator(
+        precios_vivo=precios_vivo,
+        indicadores_1m=signals.indicadores_1m,
+        signal_states=signals.states,
+    )
+    signals.grid_simulator = grid_simulator  # Conectar con signals para CB→aborto grid
+    grid_simulator.audit_logger = None
+    grid_simulator.notifier = notifier
 
     # V4.2: Guardar referencia para comandos Telegram
     notifier.signal_generator = signals
@@ -68,8 +79,18 @@ async def lifespan(fastapi_app):
     app.state.indicadores_4h = signals.indicadores_4h
     # V4.2: Exponer signal_generator para endpoints REST
     app.state.signal_generator = signals
+    # V5.9.2: Exponer grid_simulator para endpoint /api/grid-neutral/{symbol}
+    app.state.grid_simulator = grid_simulator
 
-    print("✅ Precálculo completado. Arrancando pipeline...")
+    # V5.9.2: Conectar audit_logger al simulador si está activo
+    if CONFIG.modo_auditoria and audit_logger:
+        grid_simulator.audit_logger = audit_logger
+
+    # V5.9.2 MEJORA #6: Limpiar grids huérfanos al arranque
+    print("  🧹 V5.9.2: Limpiando grids huérfanos...")
+    await grid_simulator.limpiar_grids_huerfanos()
+
+    print("✅ Precálculo completado. Arrancando pipeline V5.9.2...")
 
     t1 = asyncio.create_task(collector.run())
     t2 = asyncio.create_task(engine.run())
@@ -83,7 +104,51 @@ async def lifespan(fastapi_app):
         signal_states=signals.states
     ))
 
-    background_tasks.update([t1, t2, t3, t4])
+    # V5.9.2: Tarea del simulador de grid neutral
+    t_grid_sim = asyncio.create_task(grid_simulator.run())
+
+    # V5.9.2: Ticker que inyecta ticks de precio al simulador cada 1 minuto
+    async def grid_ticker():
+        """Inyecta ticks de precio al simulador usando velas 1m."""
+        while True:
+            await asyncio.sleep(60)  # Cada minuto
+            try:
+                for symbol in CONFIG.symbols:
+                    st = signals.states.get(symbol)
+                    if st and st.estado == 'NEUTRAL_GRID' and symbol in precios_vivo:
+                        i1m = signals.indicadores_1m.get(symbol, {})
+                        precio = precios_vivo[symbol]
+                        # Usar high/low del indicador 1m o estimar desde precio
+                        high = i1m.get('high', precio * 1.001)
+                        low = i1m.get('low', precio * 0.999)
+                        close = i1m.get('close', precio)
+                        ts = int(datetime.now(pytz.UTC).timestamp())
+                        await grid_simulator.queue.put({
+                            'tipo': 'TICK',
+                            'symbol': symbol,
+                            'high': high,
+                            'low': low,
+                            'close': close,
+                            'timestamp': ts
+                        })
+            except Exception as e:
+                print(f"  ⚠️ [GRID_TICKER] Error: {e}")
+
+    t_grid_ticker = asyncio.create_task(grid_ticker())
+
+    # V5.9.2 MEJORA #6: Heartbeat del simulador cada 15 minutos
+    async def grid_heartbeat():
+        """Verifica salud de grids activos cada 15 minutos."""
+        while True:
+            await asyncio.sleep(CONFIG.grid_neutral_heartbeat_intervalo_min * 60)
+            try:
+                await grid_simulator.heartbeat()
+            except Exception as e:
+                print(f"  ⚠️ [GRID_HEARTBEAT] Error: {e}")
+
+    t_grid_heartbeat = asyncio.create_task(grid_heartbeat())
+
+    background_tasks.update([t1, t2, t3, t4, t_grid_sim, t_grid_ticker, t_grid_heartbeat])
 
     def task_done_callback(t):
         try:
@@ -247,6 +312,9 @@ async def lifespan(fastapi_app):
     yield
 
     print("⏹️ Apagando procesos de forma segura...")
+
+    # V5.9.2: Detener simulador de grid neutral
+    grid_simulator.stop()
 
     if CONFIG.modo_auditoria and audit_logger:
         await audit_logger.cerrar_seguimiento_todos()

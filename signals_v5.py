@@ -93,6 +93,7 @@ class SignalGenerator:
         self._historial_1m: Dict[str, list] = {s: [] for s in CONFIG.symbols}
 
         self.audit_logger = None
+        self.grid_simulator = None  # V5.9.2: Referencia al simulador de grid neutral
 
     ARMED_TIMEOUT_MIN = 30
     SCORE_DISPARO_MIN = 70
@@ -685,7 +686,7 @@ class SignalGenerator:
             umbral_entrada = self.UMBRAL_BLOQUEADO_ADX_EXTREMO
             umbral_mantenimiento = self.UMBRAL_BLOQUEADO_ADX_EXTREMO
             umbral_bloqueado = True
-        elif adx < self.ADX_RECHAZO_MIN:
+        elif adx < CONFIG.adx_min_trend:  # Ahora usa 17.0 de tu config
             rechazos.append(f"ADX sin tendencia: {adx:.1f}")
             umbral_entrada = self.UMBRAL_BLOQUEADO_ADX_BAJO
             umbral_mantenimiento = self.UMBRAL_BLOQUEADO_ADX_BAJO
@@ -854,31 +855,65 @@ class SignalGenerator:
         # FIX #2: Flag para controlar flujo sin bloquear métricas
         entro_neutral_grid = False
         if direction == 'NEUTRAL' and CONFIG.grid_neutral_enabled:
-            coin_config = CONFIG.coin_registry.get(symbol, {})
-            entrar_grid, razon_grid = self.evaluar_grid_neutro(symbol, i15, coin_config)
-            if entrar_grid and state.estado != 'NEUTRAL_GRID':
-                state.estado = 'NEUTRAL_GRID'
-                state.neutral_grid_timestamp = int(datetime.now(pytz.UTC).timestamp())
-                print(f"  [NEUTRAL_GRID] {symbol} -> NEUTRAL_GRID | {razon_grid}")
-                if self.audit_logger:
-                    await self.audit_logger.log_cambio_estado(
-                        symbol=symbol,
-                        de=state._prev_estado if state._prev_estado != 'NEUTRAL_GRID' else 'MONITOREO',
-                        a='NEUTRAL_GRID',
-                        direccion='NEUTRAL',
-                        score_macro=score_macro
+            # V5.9.2 MEJORA #9: Circuit Breaker puede bloquear grid neutral
+            cb_bloquea_grid = (
+                CONFIG.circuit_breaker_afecta_grid_neutral and
+                state.circuit_breaker_activo
+            )
+            if cb_bloquea_grid:
+                print(f"  [NEUTRAL_GRID] {symbol} Grid neutral BLOQUEADO por Circuit Breaker activo")
+            else:
+                coin_config = CONFIG.coin_registry.get(symbol, {})
+                entrar_grid, razon_grid = self.evaluar_grid_neutro(symbol, i15, coin_config)
+                if entrar_grid and state.estado != 'NEUTRAL_GRID':
+                    state.estado = 'NEUTRAL_GRID'
+                    state.neutral_grid_timestamp = int(datetime.now(pytz.UTC).timestamp())
+                    print(f"  [NEUTRAL_GRID] {symbol} -> NEUTRAL_GRID | {razon_grid}")
+
+                    # V5.9.2: Calcular parámetros del grid e iniciar simulación
+                    i15_gp = self.indicadores_15m.get(symbol, {})
+                    i4h_gp = self.indicadores_4h.get(symbol, {})
+                    atr_gp = i15_gp.get('atr', price * 0.01)
+                    grid_params, gp_rechazos = self.calcular_parametros_grid_blindado(
+                        price=price, direction='NEUTRAL', atr=atr_gp, i15=i15_gp, i4h=i4h_gp,
+                        symbol=symbol, state=state
                     )
-                    state._prev_estado = 'NEUTRAL_GRID'
-                await self.emitir_alerta(symbol, 'NEUTRAL_GRID', 'NEUTRAL', score_macro, [], None, price)
-                entro_neutral_grid = True  # FIX #2: No retornar, dejar que fluya a métricas
-            elif not entrar_grid:
-                # No cumple condiciones de grid neutral, seguir con logica normal
-                pass
+                    if grid_params and self.grid_simulator:
+                        await self.grid_simulator.queue.put({
+                            'tipo': 'INICIAR_GRID',
+                            'symbol': symbol,
+                            'grid_params': grid_params,
+                            'precio_actual': price,
+                        })
+                    elif not grid_params:
+                        print(f"  [NEUTRAL_GRID] {symbol} No se pudieron calcular params del grid: {gp_rechazos}")
+
+                    if self.audit_logger:
+                        await self.audit_logger.log_cambio_estado(
+                            symbol=symbol,
+                            de=state._prev_estado if state._prev_estado != 'NEUTRAL_GRID' else 'MONITOREO',
+                            a='NEUTRAL_GRID',
+                            direccion='NEUTRAL',
+                            score_macro=score_macro
+                        )
+                        state._prev_estado = 'NEUTRAL_GRID'
+                    await self.emitir_alerta(symbol, 'NEUTRAL_GRID', 'NEUTRAL', score_macro, [], grid_params, price)
+                    entro_neutral_grid = True  # FIX #2: No retornar, dejar que fluya a métricas
+                elif not entrar_grid:
+                    # No cumple condiciones de grid neutral, seguir con logica normal
+                    pass
 
         # Si ya estaba en NEUTRAL_GRID pero ahora hay direccion, salir del grid
         if state.estado == 'NEUTRAL_GRID' and direction != 'NEUTRAL':
             state.estado = 'MONITOREO'
             state.neutral_grid_timestamp = 0
+            # V5.9.2: Notificar al simulador para finalizar grid
+            if self.grid_simulator:
+                await self.grid_simulator.queue.put({
+                    'tipo': 'FINALIZAR_GRID',
+                    'symbol': symbol,
+                    'razon': 'direccion_detectada'
+                })
             print(f"  [NEUTRAL_GRID] {symbol} -> MONITOREO (direccion detectada: {direction})")
 
         if filtro_aprobado:
@@ -1475,6 +1510,28 @@ class SignalGenerator:
 
         print(f"  [CB] {symbol} CIRCUIT BREAKER ACTIVADO | Pausa: {CONFIG.circuit_breaker_pausa_seg}s | "
               f"Capital reducido: ${state.capital_actual:.2f}")
+
+        # V5.9.2 MEJORA #9: Si CB afecta grid neutral, abortar grid activo
+        if CONFIG.circuit_breaker_afecta_grid_neutral and state.estado == 'NEUTRAL_GRID':
+            state.estado = 'MONITOREO'
+            state.neutral_grid_timestamp = 0
+            print(f"  [CB] {symbol} Grid neutral ABORTADO por Circuit Breaker")
+            if self.audit_logger:
+                await self.audit_logger.log_cambio_estado(
+                    symbol=symbol,
+                    de='NEUTRAL_GRID',
+                    a='MONITOREO',
+                    direccion='NEUTRAL',
+                    score_macro=0,
+                    contexto_macro={'razon': 'Circuit Breaker activado - aborto grid neutral'}
+                )
+            # Notificar al simulador para finalizar grid
+            if self.grid_simulator:
+                await self.grid_simulator.queue.put({
+                    'tipo': 'FINALIZAR_GRID',
+                    'symbol': symbol,
+                    'razon': 'circuit_breaker'
+                })
 
         if self.audit_logger:
             await self.audit_logger.log_circuit_breaker(
