@@ -1628,6 +1628,7 @@ class SignalGenerator:
             'params': params,
             'price': price,
             'timestamp': datetime.now(pytz.UTC).isoformat(),
-            'estado_maquina': self.states[symbol].estado
+            'estado_maquina': self.states[symbol].estado,
+            'indicadores_15m': self.indicadores_15m.get(symbol, {})  # V6.0: Para notificaciones enriquecidas
         }
         await self.queue_out.put(evento)

@@ -97,34 +97,69 @@ class Notifier:
             auto_comp = "📐 <i>Auto-comprimido</i>\n" if p.get('auto_compressed') else ""
             pos_ext = "⚠️ <i>Posición extrema en rango</i>\n" if p.get('posicion_extrema') else ""
             dir_icon = "🟢" if dir_ == "LONG" else "🔴"
+            
+            # V6.0: Parámetros formateados para copiar-pegar en Binance
+            params_binance = (
+                f"<code>"
+                f"Tipo: {dir_}\n"
+                f"Rango: {p['lower_limit']} - {p['upper_limit']}\n"
+                f"Grids: {p['grid_count']}\n"
+                f"Step: {p['step_pct']}%\n"
+                f"Capital: ${p['capital_sugerido']}\n"
+                f"Apalancamiento: {p['apalancamiento_sugerido']}x\n"
+                f"Notional/orden: ${p['notional_por_orden']}\n"
+                f"Breakeven: {p['breakeven_pct']}%\n"
+                f"Margen seguro: +{p['margen_sobre_breakeven']:.3f}%"
+                f"</code>"
+            )
+            
             msg = (
                 f"<b>🔥 DISPARO {dir_icon} {dir_} - {symbol}</b>\n"
                 f"Estado: <b>{estado}</b>\n"
                 f"Precio: 💲{price:.4f} | Score: 🎯 {score}/100\n\n"
                 f"{auto_comp}"
                 f"{pos_ext}"
-                f"<b>⚙️ Grid Config:</b>\n"
-                f"Rango: 💲{p['lower_limit']} - 💲{p['upper_limit']}\n"
-                f"Grids: {p['grid_count']}"
-            )
-            if p.get('auto_compressed'):
-                msg += f" (comprimido de más)"
-            msg += (
-                f"\nPaso: {p['step_pct']}%\n"
-                f"Apalancamiento: {p['apalancamiento_sugerido']}x\n"
+                f"<b>⚙️ PARÁMETROS PARA REPLICAR EN BINANCE:</b>\n"
+                f"{params_binance}\n\n"
+                f"<b>📊 Stats del grid:</b>\n"
                 f"Posición en rango: {p['posicion_en_rango']:.0%}\n"
-                f"Breakeven: {p['breakeven_pct']}%\n"
-                f"Margen seguro: +{p['margen_sobre_breakeven']:.3f}%"
+                f"ATR seguro: {p.get('atr_seguro', 'N/A')}\n"
+                f"Rango mult: {p.get('rango_mult', 'N/A')}x"
             )
 
         elif tipo == 'NEUTRAL_GRID':
             titulo = f"GRID NEUTRAL {symbol}"
             i15 = evento.get('indicadores_15m', {})
+            p = evento.get('params', {})
             adx = i15.get('adx')
             rsi = i15.get('rsi')
             
             adx_str = f"{adx:.1f}" if isinstance(adx, (int, float)) else "N/A"
             rsi_str = f"{rsi:.1f}" if isinstance(rsi, (int, float)) else "N/A"
+            
+            # V6.0: Parámetros formateados para copiar-pegar en Binance
+            params_binance = ""
+            if p:
+                params_binance = (
+                    f"\n\n<b>⚙️ PARÁMETROS PARA REPLICAR EN BINANCE:</b>\n"
+                    f"<code>"
+                    f"Tipo: NEUTRAL\n"
+                    f"Rango: {p.get('lower_limit', 'N/A')} - {p.get('upper_limit', 'N/A')}\n"
+                    f"Grids: {p.get('grid_count', 'N/A')}\n"
+                    f"Step: {p.get('step_pct', 'N/A')}%\n"
+                    f"Capital: ${p.get('capital_sugerido', 'N/A')}\n"
+                    f"Apalancamiento: {p.get('apalancamiento_sugerido', 'N/A')}x\n"
+                    f"Notional/orden: ${p.get('notional_por_orden', 'N/A')}\n"
+                    f"Breakeven: {p.get('breakeven_pct', 'N/A')}%\n"
+                    f"Margen seguro: +{p.get('margen_sobre_breakeven', 'N/A')}%"
+                    f"</code>"
+                )
+                if p.get('auto_compressed'):
+                    params_binance += "\n<i>⚠️ Grid auto-comprimido por bajo ATR</i>"
+                if p.get('posicion_extrema'):
+                    params_binance += "\n<i>⚠️ Posición extrema en rango</i>"
+            else:
+                params_binance = "\n\n<i>⚠️ Parámetros del grid no disponibles</i>"
             
             msg = (
                 f"<b>💠 GRID NEUTRAL ACTIVADO - {symbol}</b>\n"
@@ -134,7 +169,8 @@ class Notifier:
                 f"• ADX: {adx_str} (< 25, sin tendencia fuerte)\n"
                 f"• RSI: {rsi_str} (40-60, neutral)\n"
                 f"• Precio cerca de EMA50\n"
-                f"• Volatilidad moderada\n\n"
+                f"• Volatilidad moderada"
+                f"{params_binance}\n\n"
                 f"<b>🛑 Aborto automático en:</b>\n"
                 f"• Timeout: ⏳ {CONFIG.grid_neutral_timeout_min} min\n"
                 f"• ADX > {CONFIG.grid_neutral_adx_max}\n"
