@@ -4,6 +4,11 @@ import os
 import json
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# PLAN 3.1: FEATURE FLAGS DE ARQUITECTURA ADAPTATIVA
+# ═══════════════════════════════════════════════════════════════════════════════
+use_per_coin_params: bool = True   # False = usa globals, ignora registry por moneda
+
 # REGISTRO DE MONEDAS — JSON separado del config
 # ═══════════════════════════════════════════════════════════════════════════════
 def load_coin_registry():
@@ -44,6 +49,9 @@ class Config(BaseModel):
     # Lista completa: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
     # ───────────────────────────────────────────────────────────────────────────────
     timezone: str = "America/Caracas"  # UTC-4, sin horario de verano
+
+    # --- PLAN 3.1: Parametros globales (fallbacks) ---
+    adx_reject_global: float = 55.0          # Fallback si no hay registry
 
     # Monedas a monitorear (cargadas dinámicamente desde coins_registry.json)
     symbols: List[str] = Field(

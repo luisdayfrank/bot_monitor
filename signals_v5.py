@@ -4,6 +4,7 @@ import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple, Set
 from config import CONFIG
+from coin_config_adapter import get_coin_config, get_category_emoji
 import pytz
 
 
@@ -262,11 +263,14 @@ class SignalGenerator:
         """
         ahora = int(datetime.now(pytz.UTC).timestamp())
 
-        # 1. Timeout
+        # 1. Timeout adaptativo por moneda
         if state.neutral_grid_timestamp > 0:
             tiempo_min = (ahora - state.neutral_grid_timestamp) / 60
-            if tiempo_min > CONFIG.grid_neutral_timeout_min:
-                return True, f"Timeout: {tiempo_min:.0f}min > {CONFIG.grid_neutral_timeout_min}min"
+            # PLAN 3.1: Timeout adaptativo desde el adapter
+            coin_cfg = get_coin_config(symbol)
+            timeout_moneda = coin_cfg['grid_timeout']
+            if tiempo_min > timeout_moneda:
+                return True, f"Timeout: {tiempo_min:.0f}min > {timeout_moneda}min (categoria: {coin_cfg['category']})"
 
         # 2. ADX explosivo
         adx = i15.get('adx', 0)
@@ -597,10 +601,17 @@ class SignalGenerator:
     # CAPA 1: FILTRO MACRO (V5.7 con Fases 1-5)
     # ================================================================
     async def evaluar_filtro_macro(self, symbol: str):
-        """Evalua filtro macro con Fases 1-5 integradas."""
+        """Evalua filtro macro con Plan 3.1 - Parametros adaptativos por moneda."""
         i15 = self.indicadores_15m.get(symbol)
         i4h = self.indicadores_4h.get(symbol)
         state = self.states[symbol]
+
+        # PLAN 3.1: Extraer parametros adaptativos O(1)
+        coin_cfg = get_coin_config(symbol)
+        adx_techo = coin_cfg['adx_reject']
+        mfm_umb = coin_cfg['mfm_umbral']
+        grid_timeout = coin_cfg['grid_timeout']
+        adx_piso = CONFIG.adx_min_trend  # Global (mismo para todas)
 
         if state.moneda_pausada_manual:
             state.filtro_macro_aprobado = False
@@ -680,14 +691,14 @@ class SignalGenerator:
         umbral_mantenimiento = self.SCORE_MANTENIMIENTO_ARMED
         umbral_bloqueado = False
 
-        # ADX scoring
-        if adx is None or np.isnan(adx) or adx > 45:
-            rechazos.append(f"ADX extremo: {adx:.1f}")
+        # PLAN 3.1: ADX scoring con umbral adaptativo por moneda
+        if adx is None or np.isnan(adx) or adx > adx_techo:
+            rechazos.append(f"ADX extremo (>{adx_techo}): {adx:.1f}")
             umbral_entrada = self.UMBRAL_BLOQUEADO_ADX_EXTREMO
             umbral_mantenimiento = self.UMBRAL_BLOQUEADO_ADX_EXTREMO
             umbral_bloqueado = True
-        elif adx < CONFIG.adx_min_trend:  # Ahora usa 17.0 de tu config
-            rechazos.append(f"ADX sin tendencia: {adx:.1f}")
+        elif adx < adx_piso:
+            rechazos.append(f"ADX sin tendencia (<{adx_piso}): {adx:.1f}")
             umbral_entrada = self.UMBRAL_BLOQUEADO_ADX_BAJO
             umbral_mantenimiento = self.UMBRAL_BLOQUEADO_ADX_BAJO
             umbral_bloqueado = True
@@ -782,14 +793,14 @@ class SignalGenerator:
         if not bypass_volumen:
             if vol_ratio >= volume_threshold:
                 mfm_alineado = False
-                if direction == 'SHORT' and mfm_sma5 < -CONFIG.mfm_umbral_alineacion:
+                if direction == 'SHORT' and mfm_sma5 < -mfm_umb:
                     mfm_alineado = True
                     score_macro += CONFIG.mfm_bonus_alineado
-                    print(f"  [VOLUMEN] {symbol} Volumen+MFM alineado SHORT | mfm={mfm_sma5:.3f} | +{CONFIG.mfm_bonus_alineado}pts")
-                elif direction == 'LONG' and mfm_sma5 > CONFIG.mfm_umbral_alineacion:
+                    print(f"  [VOLUMEN] {symbol} Volumen+MFM alineado SHORT | mfm={mfm_sma5:.3f} (umbral: {mfm_umb}) | +{CONFIG.mfm_bonus_alineado}pts")
+                elif direction == 'LONG' and mfm_sma5 > mfm_umb:
                     mfm_alineado = True
                     score_macro += CONFIG.mfm_bonus_alineado
-                    print(f"  [VOLUMEN] {symbol} Volumen+MFM alineado LONG | mfm={mfm_sma5:.3f} | +{CONFIG.mfm_bonus_alineado}pts")
+                    print(f"  [VOLUMEN] {symbol} Volumen+MFM alineado LONG | mfm={mfm_sma5:.3f} (umbral: {mfm_umb}) | +{CONFIG.mfm_bonus_alineado}pts")
                 else:
                     mfm_fuerza = abs(mfm_sma5)
                     if mfm_fuerza >= 0.5:
@@ -976,6 +987,12 @@ class SignalGenerator:
                     'pausa_manual': state.moneda_pausada_manual,
                     'trend_strength': trend_strength,
                     'atr_percentil': self._get_atr_percentil(symbol),
+                    # PLAN 3.1: Telemetria de parametros adaptativos
+                    'categoria': coin_cfg['category'],
+                    'adx_reject_aplicado': adx_techo,
+                    'mfm_umbral_aplicado': mfm_umb,
+                    'grid_timeout_aplicado': grid_timeout,
+                    'volume_threshold_aplicado': coin_cfg['volume_threshold'],
                 }
                 await self.audit_logger.log_cambio_estado(
                     symbol=symbol,

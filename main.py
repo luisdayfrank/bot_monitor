@@ -325,8 +325,109 @@ async def lifespan(fastapi_app):
 app.router.lifespan_context = lifespan
 
 if __name__ == "__main__":
-    print("🚀 Iniciando Crypto Monitor V5.4 — Multi-Timeframe Sniper Dashboard + MFM...")
+    print("🚀 Iniciando Crypto Monitor V6.0 — Multi-Timeframe Sniper Dashboard + MFM...")
     if CONFIG.modo_auditoria:
         print(f"📋 MODO AUDITORÍA: Reportes a las {CONFIG.auditoria_hora_reporte} {CONFIG.timezone}")
         print(f"📊 MODO MFM: Volumen inteligente con Money Flow Multiplier")
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
+
+    if CONFIG.heartbeat_debug:
+        async def heartbeat_validacion():
+            """Log periódico del estado interno de todas las monedas. Solo lectura."""
+            from datetime import datetime
+            while True:
+                await asyncio.sleep(CONFIG.heartbeat_intervalo_min * 60)
+                lineas = []
+                ahora = datetime.now(pytz.UTC).strftime('%H:%M:%S')
+
+                # Contadores para resumen
+                total_monedas = len(CONFIG.symbols)
+                monedas_pausadas_manual = 0
+                monedas_pausadas_auto = 0
+                monedas_armed = 0
+                monedas_fire = 0
+                monedas_neutral_grid = 0
+
+                for symbol in CONFIG.symbols:
+                    st = signals.states[symbol]
+                    i15 = signals.indicadores_15m.get(symbol, {})
+
+                    # PLAN 3.1: Parametros adaptativos
+                    from coin_config_adapter import get_coin_config, get_category_emoji
+                    coin_cfg = get_coin_config(symbol)
+                    cat = coin_cfg['category']
+                    cat_emoji = get_category_emoji(cat)
+                    adx_t = coin_cfg['adx_reject']
+
+                    adx = i15.get('adx', 'N/A')
+                    rsi = i15.get('rsi', 'N/A')
+                    score = st.score_macro_actual
+                    dir_valida = st.direccion_ultima_valida or 'None'
+
+                    # PLAN 3.1: Score visual con umbral real
+                    umbral_actual = adx_t if (isinstance(adx, (int, float)) and adx > adx_t) else (
+                        70 if (isinstance(adx, (int, float)) and 25 <= adx <= 35) else 75
+                    )
+                    if score >= umbral_actual:
+                        score_str = f"{score}✅(>{umbral_actual})"
+                    elif score >= umbral_actual * 0.85:
+                        score_str = f"{score}🟡(~{umbral_actual})"
+                    elif score > 0:
+                        score_str = f"{score}🔴"
+                    else:
+                        score_str = f"{score}⚪"
+
+                    # PLAN 3.1: Filtro aprobado/rechazado
+                    filtro_str = "✅FILTRO" if st.filtro_macro_aprobado else "❌SIN_FILTRO"
+
+                    pausa_info = ''
+                    if st.moneda_pausada_manual:
+                        pausa_info = ' [PAUSADA-MANUAL]'
+                        monedas_pausadas_manual += 1
+                    elif st.moneda_pausada:
+                        pausa_info = ' [PAUSADA-AUTO]'
+                        monedas_pausadas_auto += 1
+                    elif st.score_bajo_desde:
+                        mins_bajo = (int(datetime.now(pytz.UTC).timestamp()) - st.score_bajo_desde) // 60
+                        pausa_info = f' [bajo:{mins_bajo}min→pausa en {max(0, int(CONFIG.pausa_inactividad_horas*60)-mins_bajo)}min]'
+
+                    armed_age = ''
+                    if st.estado == 'ARMED' and st.armed_timestamp > 0:
+                        mins = (int(datetime.now(pytz.UTC).timestamp() * 1000) - st.armed_timestamp) // 60000
+                        armed_age = f' armed:{mins}min'
+                        monedas_armed += 1
+
+                    if st.estado == 'FIRE':
+                        monedas_fire += 1
+                    if st.estado == 'NEUTRAL_GRID':
+                        monedas_neutral_grid += 1
+
+                    lineas.append(
+                        f"{symbol} {cat_emoji}[{cat}] ADXlim:{adx_t} | "
+                        f"score={score_str} | adx={adx} | {filtro_str} | {st.estado}{armed_age}{pausa_info}"
+                    )
+
+                # V4.2: Resumen al inicio del heartbeat
+                resumen = (
+                    f"💓 [{ahora}] HEARTBEAT | "
+                    f"Total:{total_monedas} | "
+                    f"🔥FIRE:{monedas_fire} | "
+                    f"🎯ARMED:{monedas_armed} | "
+                    f"💠N-GRID:{monedas_neutral_grid} | "
+                    f"⏸️Manual:{monedas_pausadas_manual} | "
+                    f"⏸️Auto:{monedas_pausadas_auto}"
+                )
+                print(resumen)
+                print(f"  💓 [{ahora}] DETALLE | {' | '.join(lineas)}")
+
+                # V4.2: Leyenda cada 4 ciclos (1 hora)
+                ciclo_actual = int(datetime.now(pytz.UTC).timestamp()) // (CONFIG.heartbeat_intervalo_min * 60)
+                if ciclo_actual % 4 == 0:
+                    print("  📖 LEYENDA: [PAUSADA-MANUAL]=solo /resume la reactiva | "
+                          "[PAUSADA-AUTO]=se reactiva sola cuando score>=50 | "
+                          "[bajo:Xmin→pausa en Ymin]=cuenta regresiva a pausa auto | "
+                          "armed:Xmin=tiempo en ARMED | score✅>=70 🟡>=50 🔴>0 ⚪=0 | "
+                          "ADXlim=umbral adaptativo por categoria | "
+                          "✅FILTRO=filtro macro aprobado | ❌SIN_FILTRO=filtro rechazado")
+
+

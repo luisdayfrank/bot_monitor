@@ -1,52 +1,402 @@
 {
-  "BTCUSDT":  {"active": 0, "category": "peso_pesado", "volume_threshold": 0.8},
-  "ETHUSDT":  {"active": 0, "category": "peso_pesado", "volume_threshold": 0.8},
-  "BNBUSDT":  {"active": 1, "category": "peso_pesado", "volume_threshold": 0.8},
-  "SOLUSDT":  {"active": 0, "category": "peso_pesado", "volume_threshold": 0.8},
-  "XRPUSDT":  {"active": 1, "category": "peso_pesado", "volume_threshold": 0.8},
-  "ADAUSDT":  {"active": 1, "category": "peso_pesado", "volume_threshold": 0.8},
-  "LINKUSDT": {"active": 0, "category": "peso_pesado", "volume_threshold": 0.8},
-  "AVAXUSDT": {"active": 0, "category": "peso_pesado", "volume_threshold": 0.8},
-  "DOTUSDT":  {"active": 1, "category": "peso_pesado", "volume_threshold": 0.8},
-  "TRXUSDT":  {"active": 1, "category": "peso_pesado", "volume_threshold": 0.8},
-  "ARBUSDT":  {"active": 1, "category": "capa1_capa2", "volume_threshold": 0.4},
-  "OPUSDT":   {"active": 1, "category": "capa1_capa2", "volume_threshold": 0.4},
-  "LDOUSDT":  {"active": 1, "category": "capa1_capa2", "volume_threshold": 0.4},
-  "POLUSDT":  {"active": 1, "category": "capa1_capa2", "volume_threshold": 0.4},
-  "NEARUSDT": {"active": 1, "category": "capa1_capa2", "volume_threshold": 0.4},
-  "FTMUSDT":  {"active": 1, "category": "capa1_capa2", "volume_threshold": 0.4},
-  "INJUSDT":  {"active": 1, "category": "capa1_capa2", "volume_threshold": 0.4},
-  "APTUSDT":  {"active": 1, "category": "capa1_capa2", "volume_threshold": 0.4},
-  "SUIUSDT":  {"active": 1, "category": "capa1_capa2", "volume_threshold": 0.4},
-  "SEIUSDT":  {"active": 1, "category": "capa1_capa2", "volume_threshold": 0.4},
-  "DOGEUSDT": {"active": 1, "category": "memecoin", "volume_threshold": 0.6},
-  "SHIBUSDT": {"active": 1, "category": "memecoin", "volume_threshold": 0.6},
-  "PEPEUSDT": {"active": 0, "category": "memecoin", "volume_threshold": 0.6},
-  "WIFUSDT":  {"active": 1, "category": "memecoin", "volume_threshold": 0.6},
-  "BONKUSDT": {"active": 0, "category": "memecoin", "volume_threshold": 0.6},
-  "FLOKIUSDT": {"active": 0, "category": "memecoin", "volume_threshold": 0.6},
-  "MEMEUSDT": {"active": 1, "category": "memecoin", "volume_threshold": 0.6},
-  "BOMEUSDT": {"active": 0, "category": "memecoin", "volume_threshold": 0.6},
-  "ORDIUSDT": {"active": 0, "category": "memecoin", "volume_threshold": 0.6},
-  "1000SATSUSDT": {"active": 0, "category": "memecoin", "volume_threshold": 0.6},
-  "ZECUSDT":  {"active": 1, "category": "clasica_privacidad", "volume_threshold": 0.3},
-  "LTCUSDT":  {"active": 1, "category": "clasica_privacidad", "volume_threshold": 0.3},
-  "BCHUSDT":  {"active": 1, "category": "clasica_privacidad", "volume_threshold": 0.3},
-  "ETCUSDT":  {"active": 1, "category": "clasica_privacidad", "volume_threshold": 0.3},
-  "EOSUSDT":  {"active": 0, "category": "clasica_privacidad", "volume_threshold": 0.3},
-  "XLMUSDT":  {"active": 1, "category": "clasica_privacidad", "volume_threshold": 0.3},
-  "VETUSDT":  {"active": 0, "category": "clasica_privacidad", "volume_threshold": 0.3},
-  "THETAUSDT": {"active": 0, "category": "clasica_privacidad", "volume_threshold": 0.3},
-  "ALGOUSDT": {"active": 0, "category": "clasica_privacidad", "volume_threshold": 0.3},
-  "DASHUSDT": {"active": 0, "category": "clasica_privacidad", "volume_threshold": 0.3},
-  "RNDRUSDT": {"active": 1, "category": "ai_defi_web3", "volume_threshold": 0.4},
-  "WLDUSDT":  {"active": 0, "category": "ai_defi_web3", "volume_threshold": 0.4},
-  "FETUSDT":  {"active": 1, "category": "ai_defi_web3", "volume_threshold": 0.4},
-  "GRTUSDT":  {"active": 0, "category": "ai_defi_web3", "volume_threshold": 0.4},
-  "FILUSDT":  {"active": 1, "category": "ai_defi_web3", "volume_threshold": 0.4},
-  "AAVEUSDT": {"active": 0, "category": "ai_defi_web3", "volume_threshold": 0.4},
-  "BARDUSDT": {"active": 0, "category": "ai_defi_web3", "volume_threshold": 0.4},
-  "CRVUSDT":  {"active": 0, "category": "ai_defi_web3", "volume_threshold": 0.4},
-  "UNIUSDT":  {"active": 1, "category": "ai_defi_web3", "volume_threshold": 0.4},
-  "SNXUSDT":  {"active": 0, "category": "ai_defi_web3", "volume_threshold": 0.4}
+  "BTCUSDT": {
+    "active": 0,
+    "category": "peso_pesado",
+    "volume_threshold": 0.8,
+    "adx_reject": 45.0,
+    "mfm_umbral": 0.25,
+    "grid_timeout": 30
+  },
+  "ETHUSDT": {
+    "active": 0,
+    "category": "peso_pesado",
+    "volume_threshold": 0.8,
+    "adx_reject": 45.0,
+    "mfm_umbral": 0.25,
+    "grid_timeout": 30
+  },
+  "BNBUSDT": {
+    "active": 1,
+    "category": "peso_pesado",
+    "volume_threshold": 0.8,
+    "adx_reject": 45.0,
+    "mfm_umbral": 0.25,
+    "grid_timeout": 30
+  },
+  "SOLUSDT": {
+    "active": 0,
+    "category": "peso_pesado",
+    "volume_threshold": 0.8,
+    "adx_reject": 45.0,
+    "mfm_umbral": 0.25,
+    "grid_timeout": 30
+  },
+  "XRPUSDT": {
+    "active": 1,
+    "category": "peso_pesado",
+    "volume_threshold": 0.8,
+    "adx_reject": 45.0,
+    "mfm_umbral": 0.25,
+    "grid_timeout": 30
+  },
+  "ADAUSDT": {
+    "active": 1,
+    "category": "peso_pesado",
+    "volume_threshold": 0.8,
+    "adx_reject": 45.0,
+    "mfm_umbral": 0.25,
+    "grid_timeout": 30
+  },
+  "LINKUSDT": {
+    "active": 0,
+    "category": "peso_pesado",
+    "volume_threshold": 0.8,
+    "adx_reject": 45.0,
+    "mfm_umbral": 0.25,
+    "grid_timeout": 30
+  },
+  "AVAXUSDT": {
+    "active": 0,
+    "category": "peso_pesado",
+    "volume_threshold": 0.8,
+    "adx_reject": 45.0,
+    "mfm_umbral": 0.25,
+    "grid_timeout": 30
+  },
+  "DOTUSDT": {
+    "active": 1,
+    "category": "peso_pesado",
+    "volume_threshold": 0.8,
+    "adx_reject": 45.0,
+    "mfm_umbral": 0.25,
+    "grid_timeout": 30
+  },
+  "TRXUSDT": {
+    "active": 1,
+    "category": "peso_pesado",
+    "volume_threshold": 0.8,
+    "adx_reject": 45.0,
+    "mfm_umbral": 0.25,
+    "grid_timeout": 30
+  },
+  "ARBUSDT": {
+    "active": 1,
+    "category": "capa1_capa2",
+    "volume_threshold": 0.4,
+    "adx_reject": 55.0,
+    "mfm_umbral": 0.15,
+    "grid_timeout": 15
+  },
+  "OPUSDT": {
+    "active": 1,
+    "category": "capa1_capa2",
+    "volume_threshold": 0.4,
+    "adx_reject": 55.0,
+    "mfm_umbral": 0.15,
+    "grid_timeout": 15
+  },
+  "LDOUSDT": {
+    "active": 1,
+    "category": "capa1_capa2",
+    "volume_threshold": 0.4,
+    "adx_reject": 55.0,
+    "mfm_umbral": 0.15,
+    "grid_timeout": 15
+  },
+  "POLUSDT": {
+    "active": 1,
+    "category": "capa1_capa2",
+    "volume_threshold": 0.4,
+    "adx_reject": 55.0,
+    "mfm_umbral": 0.15,
+    "grid_timeout": 15
+  },
+  "NEARUSDT": {
+    "active": 1,
+    "category": "capa1_capa2",
+    "volume_threshold": 0.4,
+    "adx_reject": 55.0,
+    "mfm_umbral": 0.15,
+    "grid_timeout": 15
+  },
+  "FTMUSDT": {
+    "active": 0,
+    "category": "capa1_capa2",
+    "volume_threshold": 0.4,
+    "adx_reject": 55.0,
+    "mfm_umbral": 0.15,
+    "grid_timeout": 15
+  },
+  "INJUSDT": {
+    "active": 1,
+    "category": "capa1_capa2",
+    "volume_threshold": 0.4,
+    "adx_reject": 55.0,
+    "mfm_umbral": 0.15,
+    "grid_timeout": 15
+  },
+  "APTUSDT": {
+    "active": 1,
+    "category": "capa1_capa2",
+    "volume_threshold": 0.4,
+    "adx_reject": 55.0,
+    "mfm_umbral": 0.15,
+    "grid_timeout": 15
+  },
+  "SUIUSDT": {
+    "active": 1,
+    "category": "capa1_capa2",
+    "volume_threshold": 0.4,
+    "adx_reject": 55.0,
+    "mfm_umbral": 0.15,
+    "grid_timeout": 15
+  },
+  "SEIUSDT": {
+    "active": 1,
+    "category": "capa1_capa2",
+    "volume_threshold": 0.4,
+    "adx_reject": 55.0,
+    "mfm_umbral": 0.15,
+    "grid_timeout": 15
+  },
+  "DOGEUSDT": {
+    "active": 1,
+    "category": "memecoin",
+    "volume_threshold": 0.6,
+    "adx_reject": 65.0,
+    "mfm_umbral": 0.1,
+    "grid_timeout": 10
+  },
+  "SHIBUSDT": {
+    "active": 0,
+    "category": "memecoin",
+    "volume_threshold": 0.6,
+    "adx_reject": 65.0,
+    "mfm_umbral": 0.1,
+    "grid_timeout": 10
+  },
+  "PEPEUSDT": {
+    "active": 0,
+    "category": "memecoin",
+    "volume_threshold": 0.6,
+    "adx_reject": 65.0,
+    "mfm_umbral": 0.1,
+    "grid_timeout": 10
+  },
+  "WIFUSDT": {
+    "active": 1,
+    "category": "memecoin",
+    "volume_threshold": 0.6,
+    "adx_reject": 65.0,
+    "mfm_umbral": 0.1,
+    "grid_timeout": 10
+  },
+  "BONKUSDT": {
+    "active": 0,
+    "category": "memecoin",
+    "volume_threshold": 0.6,
+    "adx_reject": 65.0,
+    "mfm_umbral": 0.1,
+    "grid_timeout": 10
+  },
+  "FLOKIUSDT": {
+    "active": 0,
+    "category": "memecoin",
+    "volume_threshold": 0.6,
+    "adx_reject": 65.0,
+    "mfm_umbral": 0.1,
+    "grid_timeout": 10
+  },
+  "MEMEUSDT": {
+    "active": 1,
+    "category": "memecoin",
+    "volume_threshold": 0.6,
+    "adx_reject": 65.0,
+    "mfm_umbral": 0.1,
+    "grid_timeout": 10
+  },
+  "BOMEUSDT": {
+    "active": 0,
+    "category": "memecoin",
+    "volume_threshold": 0.6,
+    "adx_reject": 65.0,
+    "mfm_umbral": 0.1,
+    "grid_timeout": 10
+  },
+  "ORDIUSDT": {
+    "active": 0,
+    "category": "memecoin",
+    "volume_threshold": 0.6,
+    "adx_reject": 65.0,
+    "mfm_umbral": 0.1,
+    "grid_timeout": 10
+  },
+  "1000SATSUSDT": {
+    "active": 0,
+    "category": "memecoin",
+    "volume_threshold": 0.6,
+    "adx_reject": 65.0,
+    "mfm_umbral": 0.1,
+    "grid_timeout": 10
+  },
+  "ZECUSDT": {
+    "active": 1,
+    "category": "clasica_privacidad",
+    "volume_threshold": 0.3,
+    "adx_reject": 50.0,
+    "mfm_umbral": 0.2,
+    "grid_timeout": 20
+  },
+  "LTCUSDT": {
+    "active": 1,
+    "category": "clasica_privacidad",
+    "volume_threshold": 0.3,
+    "adx_reject": 50.0,
+    "mfm_umbral": 0.2,
+    "grid_timeout": 20
+  },
+  "BCHUSDT": {
+    "active": 1,
+    "category": "clasica_privacidad",
+    "volume_threshold": 0.3,
+    "adx_reject": 50.0,
+    "mfm_umbral": 0.2,
+    "grid_timeout": 20
+  },
+  "ETCUSDT": {
+    "active": 1,
+    "category": "clasica_privacidad",
+    "volume_threshold": 0.3,
+    "adx_reject": 50.0,
+    "mfm_umbral": 0.2,
+    "grid_timeout": 20
+  },
+  "EOSUSDT": {
+    "active": 0,
+    "category": "clasica_privacidad",
+    "volume_threshold": 0.3,
+    "adx_reject": 50.0,
+    "mfm_umbral": 0.2,
+    "grid_timeout": 20
+  },
+  "XLMUSDT": {
+    "active": 1,
+    "category": "clasica_privacidad",
+    "volume_threshold": 0.3,
+    "adx_reject": 50.0,
+    "mfm_umbral": 0.2,
+    "grid_timeout": 20
+  },
+  "VETUSDT": {
+    "active": 0,
+    "category": "clasica_privacidad",
+    "volume_threshold": 0.3,
+    "adx_reject": 50.0,
+    "mfm_umbral": 0.2,
+    "grid_timeout": 20
+  },
+  "THETAUSDT": {
+    "active": 0,
+    "category": "clasica_privacidad",
+    "volume_threshold": 0.3,
+    "adx_reject": 50.0,
+    "mfm_umbral": 0.2,
+    "grid_timeout": 20
+  },
+  "ALGOUSDT": {
+    "active": 0,
+    "category": "clasica_privacidad",
+    "volume_threshold": 0.3,
+    "adx_reject": 50.0,
+    "mfm_umbral": 0.2,
+    "grid_timeout": 20
+  },
+  "DASHUSDT": {
+    "active": 0,
+    "category": "clasica_privacidad",
+    "volume_threshold": 0.3,
+    "adx_reject": 50.0,
+    "mfm_umbral": 0.2,
+    "grid_timeout": 20
+  },
+  "RNDRUSDT": {
+    "active": 0,
+    "category": "ai_defi_web3",
+    "volume_threshold": 0.4,
+    "adx_reject": 55.0,
+    "mfm_umbral": 0.15,
+    "grid_timeout": 15
+  },
+  "WLDUSDT": {
+    "active": 0,
+    "category": "ai_defi_web3",
+    "volume_threshold": 0.4,
+    "adx_reject": 55.0,
+    "mfm_umbral": 0.15,
+    "grid_timeout": 15
+  },
+  "FETUSDT": {
+    "active": 1,
+    "category": "ai_defi_web3",
+    "volume_threshold": 0.4,
+    "adx_reject": 55.0,
+    "mfm_umbral": 0.15,
+    "grid_timeout": 15
+  },
+  "GRTUSDT": {
+    "active": 0,
+    "category": "ai_defi_web3",
+    "volume_threshold": 0.4,
+    "adx_reject": 55.0,
+    "mfm_umbral": 0.15,
+    "grid_timeout": 15
+  },
+  "FILUSDT": {
+    "active": 1,
+    "category": "ai_defi_web3",
+    "volume_threshold": 0.4,
+    "adx_reject": 55.0,
+    "mfm_umbral": 0.15,
+    "grid_timeout": 15
+  },
+  "AAVEUSDT": {
+    "active": 0,
+    "category": "ai_defi_web3",
+    "volume_threshold": 0.4,
+    "adx_reject": 55.0,
+    "mfm_umbral": 0.15,
+    "grid_timeout": 15
+  },
+  "BARDUSDT": {
+    "active": 0,
+    "category": "ai_defi_web3",
+    "volume_threshold": 0.4,
+    "adx_reject": 55.0,
+    "mfm_umbral": 0.15,
+    "grid_timeout": 15
+  },
+  "CRVUSDT": {
+    "active": 0,
+    "category": "ai_defi_web3",
+    "volume_threshold": 0.4,
+    "adx_reject": 55.0,
+    "mfm_umbral": 0.15,
+    "grid_timeout": 15
+  },
+  "UNIUSDT": {
+    "active": 1,
+    "category": "ai_defi_web3",
+    "volume_threshold": 0.4,
+    "adx_reject": 55.0,
+    "mfm_umbral": 0.15,
+    "grid_timeout": 15
+  },
+  "SNXUSDT": {
+    "active": 0,
+    "category": "ai_defi_web3",
+    "volume_threshold": 0.4,
+    "adx_reject": 55.0,
+    "mfm_umbral": 0.15,
+    "grid_timeout": 15
+  }
 }

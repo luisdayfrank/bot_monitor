@@ -342,13 +342,16 @@ class AuditReporter:
         preguntas = self._generar_preguntas_evaluacion(eventos_fire, eventos_rechazados, seguimiento_post)
         recomendaciones = self._generar_recomendaciones(eventos, seguimiento_post, eventos_near_miss, eventos_neutral_grid)
 
+        # PLAN 3.1: Calcular metricas de exito
+        metricas_exito = self._calcular_metricas_exito(eventos_fire, eventos_rechazados, near_miss_seguimientos)
+
         resultado = {
             "meta": {
                 "symbol": symbol,
                 "fecha": fecha,
                 "modo": "auditoria_externa",
-                "version_bot": "5.7",
-                "fases_implementadas": ["1", "2", "3", "4", "5", "6"],
+                "version_bot": "5.7.3",
+                "fases_implementadas": ["1", "2", "3", "4", "5", "6", "3.1"],
                 "timezone": CONFIG.timezone,
                 "hora_generacion": now_local().isoformat(),
                 "total_eventos": len(eventos),
@@ -357,7 +360,9 @@ class AuditReporter:
                 "total_nm_seguimientos": len(nm_seguimientos_procesados),
                 "total_neutral_grid": len(neutral_grid_procesados),
                 # FASE 6: commitment_score ELIMINADO - no existe en el reporte
-                "commitment_score": "ELIMINADO (Fase 6)"
+                "commitment_score": "ELIMINADO (Fase 6)",
+                # PLAN 3.1: Metricas de exito
+                "metricas_exito": metricas_exito,
             },
             "resumen_dia": {
                 "disparos": len(eventos_fire),
@@ -380,6 +385,14 @@ class AuditReporter:
             "evaluacion_manual": {
                 "preguntas": preguntas,
                 "recomendaciones_parametros": recomendaciones
+            },
+            # PLAN 3.1: Interpretacion de near-misses
+            "interpretacion_near_miss": {
+                "nota": "acerto_bot=True -> El bot rechazo y el precio NO siguio la direccion (rechazo correcto)",
+                "nota2": "acerto_bot=False -> El bot rechazo pero el precio SI siguio la direccion (falso negativo)",
+                "objetivo": "Maximizar precision_near_miss (minimizar falsos negativos)",
+                "como_medir": "Si precision_near_miss sube despues de Plan 3.1, los parametros adaptativos funcionan",
+                "metricas": metricas_exito
             }
         }
 
@@ -657,6 +670,37 @@ class AuditReporter:
         })
 
         return recomendaciones
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # PLAN 3.1: METRICAS DE EXITO CLARAS
+    # ═══════════════════════════════════════════════════════════════════════════════
+    def _calcular_metricas_exito(self, eventos_fire, eventos_rechazados, nm_seguimientos):
+        """
+        PLAN 3.1: Metricas de exito claras.
+
+        win_rate_disparos: % de FIRE donde el precio siguio la direccion
+        win_rate_rechazos: % de rechazos donde el bot acerto al NO disparar
+        precision_near_miss: % de near-misses donde el bot acerto al rechazar
+        sharpe_approx: ratio aproximado de aciertos / (aciertos + errores)
+        """
+        metricas = {
+            'win_rate_disparos': None,
+            'win_rate_rechazos': None,
+            'precision_near_miss': None,
+            'total_fire': len(eventos_fire),
+            'total_rechazados': len(eventos_rechazados),
+            'total_nm_finalizados': len([nm for nm in nm_seguimientos if nm.get('timestamp_fin')]),
+        }
+
+        # Near-miss precision
+        nm_finalizados = [nm for nm in nm_seguimientos if nm.get('timestamp_fin')]
+        if nm_finalizados:
+            acertados = sum(1 for nm in nm_finalizados if nm.get('acerto_bot'))
+            metricas['precision_near_miss'] = round(acertados / len(nm_finalizados) * 100, 1)
+            metricas['bot_acerto'] = acertados
+            metricas['bot_fallo'] = len(nm_finalizados) - acertados
+
+        return metricas
 
     def _generar_resumen_texto(self, fecha: str, eventos_por_moneda: Dict,
                                 near_miss_seguimientos: List[dict] = None) -> str:
