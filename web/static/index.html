@@ -399,6 +399,41 @@
                     </ul>
                 </div>
 
+                <!-- V5.9.2: Panel de Grid Neutral -->
+                <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50 mt-6 mb-6">
+                    <h3 class="text-sm font-bold text-gray-300 mb-3 flex items-center gap-2">
+                        <span>🌐</span> Grid Neutral (V5.9.2)
+                        <span id="grid-badge" class="hidden px-2 py-0.5 rounded-full text-xs font-bold bg-purple-600 text-white">ACTIVO</span>
+                    </h3>
+                    <div id="grid-info" class="text-xs text-gray-500">Selecciona una moneda para ver estado del grid neutral</div>
+                    <div id="grid-stats" class="hidden grid grid-cols-2 gap-3 mt-3">
+                        <div class="bg-gray-900/50 p-3 rounded-lg">
+                            <div class="text-xs text-gray-500">Posiciones Abiertas</div>
+                            <div class="text-lg font-mono text-purple-400" id="grid-pos-open">--</div>
+                        </div>
+                        <div class="bg-gray-900/50 p-3 rounded-lg">
+                            <div class="text-xs text-gray-500">PnL Neto</div>
+                            <div class="text-lg font-mono" id="grid-pnl">--</div>
+                        </div>
+                        <div class="bg-gray-900/50 p-3 rounded-lg">
+                            <div class="text-xs text-gray-500">Trades</div>
+                            <div class="text-lg font-mono text-blue-400" id="grid-trades">--</div>
+                        </div>
+                        <div class="bg-gray-900/50 p-3 rounded-lg">
+                            <div class="text-xs text-gray-500">Kill Switches</div>
+                            <div class="text-lg font-mono text-orange-400" id="grid-ks">--</div>
+                        </div>
+                        <div class="bg-gray-900/50 p-3 rounded-lg">
+                            <div class="text-xs text-gray-500">Atrapadas</div>
+                            <div class="text-lg font-mono text-red-400" id="grid-trapped">--</div>
+                        </div>
+                        <div class="bg-gray-900/50 p-3 rounded-lg">
+                            <div class="text-xs text-gray-500">Último Tick</div>
+                            <div class="text-lg font-mono text-gray-400" id="grid-last-tick">--</div>
+                        </div>
+                    </div>
+                </div>
+
                 <button onclick="fetchStats()" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm transition flex items-center gap-2">
                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
                     Actualizar Datos
@@ -568,6 +603,57 @@
                 const elFinalizados = document.getElementById('stat-finalizados');
                 if (elFinalizados) elFinalizados.innerText = 'ERR';
                 document.getElementById('stat-winrate').innerText = 'ERR';
+            }
+
+            // V5.9.2: Cargar estado del grid neutral para la moneda activa
+            if (activeSymbol) {
+                await fetchGridNeutral(activeSymbol);
+            }
+        }
+
+        // V5.9.2: Cargar estado del grid neutral desde /api/grid-neutral/{symbol}
+        async function fetchGridNeutral(symbol) {
+            try {
+                const res = await fetch(`/api/grid-neutral/${symbol}`);
+                const data = await res.json();
+                const gridInfo = document.getElementById('grid-info');
+                const gridStats = document.getElementById('grid-stats');
+                const gridBadge = document.getElementById('grid-badge');
+
+                if (data.grid_activo) {
+                    gridInfo.innerText = `Grid ID: ${data.grid_id} | Niveles: ${data.niveles}`;
+                    gridStats.classList.remove('hidden');
+                    gridBadge.classList.remove('hidden');
+
+                    document.getElementById('grid-pos-open').innerText = data.posiciones_abiertas || 0;
+
+                    const pnlEl = document.getElementById('grid-pnl');
+                    pnlEl.innerText = (data.pnl_neto > 0 ? '+' : '') + data.pnl_neto.toFixed(4) + ' USDT';
+                    pnlEl.className = 'text-lg font-mono ' + (data.pnl_neto >= 0 ? 'text-green-400' : 'text-red-400');
+
+                    document.getElementById('grid-trades').innerText = (data.trades_completados || 0) + ' (' + (data.trades_kill_switch || 0) + ' KS)';
+                    document.getElementById('grid-ks').innerText = data.trades_kill_switch || 0;
+
+                    const trappedEl = document.getElementById('grid-trapped');
+                    trappedEl.innerText = data.posiciones_atrapadas || 0;
+                    trappedEl.className = 'text-lg font-mono ' + ((data.posiciones_atrapadas || 0) > 0 ? 'text-red-400' : 'text-gray-400');
+
+                    document.getElementById('grid-last-tick').innerText = (data.ultimo_tick_minutos || 0) + 'm ago';
+
+                    // V5.9.2 MEJORA #1: Alertar si hay posiciones vencidas
+                    if ((data.posiciones_vencidas || 0) > 0) {
+                        gridInfo.innerHTML += ` <span class="text-red-400 font-bold">⚠️ ${data.posiciones_vencidas} vencidas</span>`;
+                    }
+                } else {
+                    gridInfo.innerText = data.mensaje || 'Sin grid neutral activo';
+                    gridStats.classList.add('hidden');
+                    gridBadge.classList.add('hidden');
+                }
+            } catch (e) {
+                console.error("[GRID] Error cargando grid neutral:", e);
+                document.getElementById('grid-info').innerText = 'Error cargando grid neutral';
+                document.getElementById('grid-stats').classList.add('hidden');
+                document.getElementById('grid-badge').classList.add('hidden');
             }
         }
 
@@ -1122,6 +1208,9 @@
                 updatePauseButton();
             }
             loadChartData(symbol, activeTimeframe);
+
+            // V5.9.2: Cargar estado del grid neutral al seleccionar moneda
+            fetchGridNeutral(symbol);
         }
 
         // ============================================
