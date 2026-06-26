@@ -534,6 +534,54 @@ async def get_paused(request: Request):
     }
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# V5.9.2: ENDPOINT GRID NEUTRAL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/grid-neutral/{symbol}")
+async def get_grid_neutral(symbol: str, request: Request):
+    """Retorna el estado de la simulación grid neutral para un símbolo."""
+    grid_simulator = getattr(request.app.state, 'grid_simulator', None)
+
+    if not grid_simulator:
+        return {
+            "symbol": symbol,
+            "grid_activo": False,
+            "mensaje": "Grid simulator no disponible",
+            "timestamp": int(time.time() * 1000)
+        }
+
+    estado = grid_simulator.get_estado_simulacion(symbol)
+
+    if not estado:
+        return {
+            "symbol": symbol,
+            "grid_activo": False,
+            "mensaje": "Sin grid neutral activo",
+            "timestamp": int(time.time() * 1000)
+        }
+
+    return {
+        "symbol": symbol,
+        "grid_activo": True,
+        "grid_id": estado.get('grid_id'),
+        "sim_id": estado.get('sim_id'),
+        "niveles": estado.get('niveles'),
+        "posiciones_abiertas": estado.get('posiciones_abiertas'),
+        "posiciones_atrapadas": estado.get('posiciones_atrapadas'),  # Mejora #2
+        "posiciones_vencidas": estado.get('posiciones_vencidas'),    # Mejora #1
+        "trades_completados": estado.get('trades_completados'),
+        "trades_kill_switch": estado.get('trades_kill_switch'),
+        "pnl_neto": estado.get('pnl_neto'),
+        "pnl_bruto": estado.get('pnl_bruto'),
+        "fees_totales": estado.get('fees_totales'),
+        "slippage_total": estado.get('slippage_total'),
+        "max_posiciones_simultaneas": estado.get('max_posiciones_simultaneas'),
+        "ultimo_tick_minutos": estado.get('ultimo_tick_segundos_ago', 0) // 60,  # Heartbeat
+        "timestamp": int(time.time() * 1000)
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # ENDPOINTS PARA COIN REGISTRY (Toggle desde dashboard)
 # ═══════════════════════════════════════════════════════════════════════════════
 
