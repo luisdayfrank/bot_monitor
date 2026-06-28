@@ -561,6 +561,10 @@
                 btnChart.classList.remove('text-blue-400', 'border-blue-500', 'bg-gray-800/50');
                 btnChart.classList.add('text-gray-400', 'border-transparent');
                 fetchStats();
+                // F5.6: Refrescar grid neutral al cambiar a pestaña STATS
+                if (activeSymbol) {
+                    fetchGridNeutral(activeSymbol);
+                }
             }
         }
 
@@ -651,7 +655,9 @@
                 }
             } catch (e) {
                 console.error("[GRID] Error cargando grid neutral:", e);
-                document.getElementById('grid-info').innerText = 'Error cargando grid neutral';
+                const gridInfo = document.getElementById('grid-info');
+                gridInfo.innerText = 'Error al cargar estado del grid';
+                gridInfo.classList.add('text-red-400');
                 document.getElementById('grid-stats').classList.add('hidden');
                 document.getElementById('grid-badge').classList.add('hidden');
             }
@@ -862,6 +868,7 @@
         }
 
         function appendAlertHTML(alertData) {
+            const isNeutralGrid = (alertData.tipo === 'NEUTRAL_GRID');
             const container = document.getElementById('alerts-log');
             if (container.innerHTML.includes('Sin alertas recientes')) container.innerHTML = '';
 
