@@ -4,11 +4,6 @@ import os
 import json
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ═══════════════════════════════════════════════════════════════════════════════
-# PLAN 3.1: FEATURE FLAGS DE ARQUITECTURA ADAPTATIVA
-# ═══════════════════════════════════════════════════════════════════════════════
-use_per_coin_params: bool = True   # False = usa globals, ignora registry por moneda
-
 # REGISTRO DE MONEDAS — JSON separado del config
 # ═══════════════════════════════════════════════════════════════════════════════
 def load_coin_registry():
@@ -42,6 +37,16 @@ def load_coin_registry():
 _ACTIVE_SYMBOLS, _COIN_REGISTRY = load_coin_registry()
 
 class Config(BaseModel):
+    # ───────────────────────────────────────────────────────────────────────────────
+    # F1.1: Feature flag para I/O de precios en vivo (evita asfixia de SQLite)
+    # ───────────────────────────────────────────────────────────────────────────────
+    guardar_precios_vivo: bool = False   # True = persiste precios en DB (costoso I/O)
+
+    # ───────────────────────────────────────────────────────────────────────────────
+    # F1.2: Feature flag de arquitectura adaptativa (MOVIDO DENTRO de la clase)
+    # ───────────────────────────────────────────────────────────────────────────────
+    use_per_coin_params: bool = True   # False = usa globals, ignora registry por moneda
+
     # ───────────────────────────────────────────────────────────────────────────────
     # CONFIGURACIÓN DE ZONA HORARIA
     # Formatos válidos: "America/Caracas", "America/Bogota", "America/Mexico_City",

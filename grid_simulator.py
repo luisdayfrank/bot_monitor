@@ -406,7 +406,12 @@ class GridSimulator:
             await self._persistir_estado(sim)
 
     async def _detectar_cruces(self, sim: SimState, high: Decimal, low: Decimal, close: Decimal, timestamp: int):
-        """Detecta si el precio cruzó algún nivel del grid."""
+        """
+        Detecta si el precio cruzó algún nivel del grid.
+        NOTA: El parámetro `close` se recibe por compatibilidad de interfaz pero se ignora
+        intencionalmente porque la simulación usa ejecución LIMIT:
+        precio_ejecucion = nivel * (1 ± slippage).
+        """
         posiciones_abiertas = sim.posiciones_abiertas_list()
 
         # Orden de niveles: de abajo hacia arriba
@@ -797,6 +802,12 @@ class GridSimulator:
             if segundos_sin_tick > 300:  # 5 minutos
                 print(f"  [HEARTBEAT SIM] {symbol} Grid {sim.grid_id} SIN TICKS "
                       f"por {segundos_sin_tick:.0f}s → ABORTADO")
+                if self.audit_logger:
+                    await self.audit_logger.log_evento_grid_simulacion(
+                        symbol=symbol, tipo='NEUTRAL_GRID_ABORT', grid_id=sim.grid_id,
+                        evento_simulacion={'razon': 'sin_ticks_5min', 'segundos_sin_tick': segundos_sin_tick},
+                        pnl_acumulado=float(sim.pnl_neto)
+                    )
                 await self.finalizar_grid(symbol, razon='sin_ticks_5min')
                 continue
 

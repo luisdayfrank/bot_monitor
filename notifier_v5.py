@@ -24,10 +24,7 @@ class Notifier:
     # FIX CRITICO: Limpiar mensajes pendientes de Telegram al iniciar
     # ═══════════════════════════════════════════════════════════════════════════════
     async def limpiar_updates_pendientes(self):
-        """
-        Al iniciar el bot, limpia todos los mensajes pendientes de Telegram
-        para evitar que comandos antiguos se reprocesen.
-        """
+        """\n        Al iniciar el bot, limpia todos los mensajes pendientes de Telegram\n        para evitar que comandos antiguos se reprocesen.\n        """
         if not self.bot:
             return
 
@@ -42,18 +39,36 @@ class Notifier:
         except Exception as e:
             print(f"  [ERROR] Error limpiando updates: {e}")
 
-    async def enviar_telegram(self, mensaje: str):
-        if self.bot and CONFIG.telegram_chat_id:
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # F1.5: Envío con reintentos exponenciales (1s → 2s → 4s → 8s)
+    # ═══════════════════════════════════════════════════════════════════════════════
+    async def _enviar_con_reintentos(self, mensaje: str, max_retries: int = 4) -> bool:
+        """Envía mensaje a Telegram con backoff exponencial."""
+        if not self.bot or not CONFIG.telegram_chat_id:
+            return False
+
+        for intento in range(max_retries):
             try:
                 await self.bot.send_message(
                     chat_id=CONFIG.telegram_chat_id,
                     text=mensaje,
                     parse_mode=ParseMode.HTML
                 )
-                print(f"  📤 Telegram: {mensaje[:45]}...")
+                return True
             except Exception as e:
-                logging.error(f"Error enviando Telegram: {e}")
-                print(f"  [ERROR] Telegram: {e}")
+                delay = 2 ** intento  # 1s, 2s, 4s, 8s
+                if intento < max_retries - 1:
+                    logging.warning(f"Telegram error (intento {intento+1}/{max_retries}): {e}. Reintentando en {delay}s...")
+                    await asyncio.sleep(delay)
+                else:
+                    logging.error(f"Error enviando Telegram después de {max_retries} intentos: {e}")
+                    print(f"  [ERROR] Telegram falló tras {max_retries} reintentos: {e}")
+        return False
+
+    async def enviar_telegram(self, mensaje: str):
+        enviado = await self._enviar_con_reintentos(mensaje)
+        if enviado:
+            print(f"  📤 Telegram: {mensaje[:45]}...")
 
     async def enviar_archivo_telegram(self, filepath: str, caption: str = ""):
         if not self.bot or not CONFIG.telegram_chat_id:
@@ -81,6 +96,22 @@ class Notifier:
             logging.error(f"Error notificacion local: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════════════
+    # F1.5: Verificación de conexión al arrancar (getMe)
+    # ═══════════════════════════════════════════════════════════════════════════════
+    async def verificar_conexion_telegram(self):
+        """Verifica token y chat_id al arrancar. No bloquea el bot si falla."""
+        if not self.bot:
+            print("  ⚠️ Telegram no configurado (sin token)")
+            return False
+        try:
+            me = await self.bot.get_me()
+            print(f"  ✅ Telegram conectado: @{me.username}")
+            return True
+        except Exception as e:
+            print(f"  ❌ ERROR CRÍTICO: Telegram no conectado. Verifica token. Error: {e}")
+            return False
+
+    # ═══════════════════════════════════════════════════════════════════════════════
     # FASE 5: PROCESAR ALERTA
     # ═══════════════════════════════════════════════════════════════════════════════
     async def procesar_alerta(self, evento: dict):
@@ -93,11 +124,11 @@ class Notifier:
 
         if tipo == 'FIRE':
             titulo = f"SNIPER {symbol} | {dir_}"
-            p = evento['params']
+            p = evento.get('params') or {}
             auto_comp = "📐 <i>Auto-comprimido</i>\n" if p.get('auto_compressed') else ""
             pos_ext = "⚠️ <i>Posición extrema en rango</i>\n" if p.get('posicion_extrema') else ""
             dir_icon = "🟢" if dir_ == "LONG" else "🔴"
-            
+
             # V6.0: Parámetros formateados para copiar-pegar en Binance
             params_binance = (
                 f"<code>"
@@ -112,7 +143,7 @@ class Notifier:
                 f"Margen seguro: +{p['margen_sobre_breakeven']:.3f}%"
                 f"</code>"
             )
-            
+
             msg = (
                 f"<b>🔥 DISPARO {dir_icon} {dir_} - {symbol}</b>\n"
                 f"Estado: <b>{estado}</b>\n"
@@ -133,10 +164,10 @@ class Notifier:
             p = evento.get('params', {})
             adx = i15.get('adx')
             rsi = i15.get('rsi')
-            
+
             adx_str = f"{adx:.1f}" if isinstance(adx, (int, float)) else "N/A"
             rsi_str = f"{rsi:.1f}" if isinstance(rsi, (int, float)) else "N/A"
-            
+
             # V6.0: Parámetros formateados para copiar-pegar en Binance
             params_binance = ""
             if p:
@@ -160,7 +191,7 @@ class Notifier:
                     params_binance += "\n<i>⚠️ Posición extrema en rango</i>"
             else:
                 params_binance = "\n\n<i>⚠️ Parámetros del grid no disponibles</i>"
-            
+
             msg = (
                 f"<b>💠 GRID NEUTRAL ACTIVADO - {symbol}</b>\n"
                 f"Estado: <b>{estado}</b>\n"
@@ -217,6 +248,9 @@ class Notifier:
         await self.enviar_telegram(msg)
 
     async def notificar_online(self, symbols: list, uptime_start: float = None):
+        # F1.5: Verificar conexión antes de enviar mensaje de bienvenida
+        await self.verificar_conexion_telegram()
+
         uptime_str = ""
         if uptime_start:
             elapsed = datetime.now(pytz.UTC).timestamp() - uptime_start
@@ -245,7 +279,7 @@ class Notifier:
             st = estados[symbol]
             precio = precios.get(symbol, 0)
             i15 = indicadores_15m.get(symbol, {})
-            
+
             estado_icon = {
                 'FIRE': '🔥',
                 'ARMED': '🟡',
@@ -253,26 +287,26 @@ class Notifier:
                 'MONITOREO': '⚪',
                 'NEUTRAL_GRID': '💠'
             }.get(st.estado, '⚫')
-            
+
             dir_icon = '🟢 LONG' if st.direccion_filtro == 'LONG' else ('🔴 SHORT' if st.direccion_filtro == 'SHORT' else '⚖️ NEUTRAL')
-            
+
             # FIX: Evitar TypeError formateando un valor que podría ser None
             rsi_val = i15.get('rsi')
             adx_val = i15.get('adx')
             rsi_str = f"{rsi_val:.1f}" if isinstance(rsi_val, (int, float)) else "--"
             adx_str = f"{adx_val:.1f}" if isinstance(adx_val, (int, float)) else "--"
-            
+
             pausa_info = ""
             if getattr(st, 'moneda_pausada_manual', False):
                 pausa_info = " ⏸️[M]"
             elif getattr(st, 'moneda_pausada', False):
                 pausa_info = " ⏸️[A]"
-                
+
             grid_info = ""
             if st.estado == 'NEUTRAL_GRID' and hasattr(st, 'neutral_grid_timestamp') and st.neutral_grid_timestamp > 0:
                 mins_en_grid = (int(datetime.now(pytz.UTC).timestamp()) - st.neutral_grid_timestamp) // 60
                 grid_info = f" ⏳{mins_en_grid}m"
-                
+
             lineas.append(
                 f"{estado_icon} <b>{symbol}</b>{pausa_info}{grid_info} | {st.estado} | {dir_icon}\n"
                 f"   💲 {precio:.4f} | RSI: {rsi_str} | ADX: {adx_str}"
@@ -283,12 +317,12 @@ class Notifier:
     async def notificar_status(self, estados: dict, precios: dict, indicadores_15m: dict):
         ahora = datetime.now(pytz.UTC).strftime("%H:%M:%S UTC")
         lineas = [f"<b>📋 ESTADO ACTUAL</b>\n🕐 {ahora}\n"]
-        
+
         for symbol in sorted(estados.keys()):
             st = estados[symbol]
             precio = precios.get(symbol, 0)
             i15 = indicadores_15m.get(symbol, {})
-            
+
             estado_icon = {
                 'FIRE': '🔥',
                 'ARMED': '🟡',
@@ -296,31 +330,31 @@ class Notifier:
                 'MONITOREO': '⚪',
                 'NEUTRAL_GRID': '💠'
             }.get(st.estado, '⚫')
-            
+
             dir_str = st.direccion_filtro or 'NEUTRAL'
             dir_icon = "🟢" if dir_str == "LONG" else "🔴" if dir_str == "SHORT" else "⚖️"
-            
+
             # FIX: Evitar TypeError
             rsi_val = i15.get('rsi')
             adx_val = i15.get('adx')
             rsi_str = f"{rsi_val:.1f}" if isinstance(rsi_val, (int, float)) else "--"
             adx_str = f"{adx_val:.1f}" if isinstance(adx_val, (int, float)) else "--"
-            
+
             cb_info = ""
             if hasattr(st, 'circuit_breaker_activo') and st.circuit_breaker_activo:
                 remaining = (st.circuit_breaker_hasta - int(datetime.now(pytz.UTC).timestamp()*1000)) // 1000
                 cb_info = f" 🔒[CB:{remaining}s]"
-                
+
             pausa_info = ""
             if getattr(st, 'moneda_pausada_manual', False):
                 pausa_info = " ⏸️[M]"
             elif getattr(st, 'moneda_pausada', False):
                 pausa_info = " ⏸️[A]"
-                
+
             grid_info = ""
             if st.estado == 'NEUTRAL_GRID':
                 grid_info = " 💠[GRID]"
-                
+
             lineas.append(
                 f"{estado_icon} <b>{symbol}</b>{cb_info}{pausa_info}{grid_info} | {st.estado} | {dir_icon} {dir_str}\n"
                 f"   💲 {precio:.4f} | RSI(15m): {rsi_str} | ADX: {adx_str}"
@@ -428,7 +462,7 @@ class Notifier:
         pausadas_manual = 0
         pausadas_auto = 0
         neutral_grid_count = 0
-        
+
         for s in signal_states.values():
             estados_count[s.estado] = estados_count.get(s.estado, 0) + 1
             if getattr(s, 'moneda_pausada_manual', False):

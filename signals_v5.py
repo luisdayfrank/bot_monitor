@@ -29,7 +29,7 @@ class SignalState:
         self.capital_actual = CONFIG.grid_default_capital
 
         # FASE 4.5: Tracking de auditoria
-        self._prev_filtro_aprobado = None
+        self._prev_filtro_aprobado = False
         self._prev_estado = 'MONITOREO'
 
         # Correcciones post-analisis cruzado
@@ -206,15 +206,15 @@ class SignalGenerator:
         adx = i15.get('adx', 0)
         if adx is None or np.isnan(adx):
             return False, "ADX no disponible"
-        if adx >= 20:
-            rechazos.append(f"ADX {adx:.1f} >= 20 (tendencia detectada)")
+        if adx >= CONFIG.grid_neutral_adx_max:
+            rechazos.append(f"ADX {adx:.1f} >= {CONFIG.grid_neutral_adx_max} (tendencia detectada)")
 
         # 2. RSI neutral
         rsi = i15.get('rsi', 50)
-        if rsi < 40:
-            rechazos.append(f"RSI {rsi:.1f} < 40 (sobreventa)")
-        elif rsi > 60:
-            rechazos.append(f"RSI {rsi:.1f} > 60 (sobrecompra)")
+        if rsi < CONFIG.grid_neutral_rsi_min:
+            rechazos.append(f"RSI {rsi:.1f} < {CONFIG.grid_neutral_rsi_min} (sobreventa)")
+        elif rsi > CONFIG.grid_neutral_rsi_max:
+            rechazos.append(f"RSI {rsi:.1f} > {CONFIG.grid_neutral_rsi_max} (sobrecompra)")
 
         # 3. ATR percentil moderado
         atr = i15.get('atr', 0)
@@ -228,7 +228,7 @@ class SignalGenerator:
 
         # 4. Precio cerca de EMA50
         price = i15.get('close', 0)
-        ema50 = i15.get('ema50_15m', price)
+        ema50 = i15.get('ema50_15m') or price
         if price > 0 and ema50 > 0:
             distancia_pct = abs(price - ema50) / ema50 * 100
             if distancia_pct > 1.0:
@@ -248,7 +248,7 @@ class SignalGenerator:
     # ═══════════════════════════════════════════════════════════════════════════════
     # FASE 5: GRID NEUTRAL — EVALUACION DE ABORTO (5 condiciones)
     # ═══════════════════════════════════════════════════════════════════════════════
-    def evaluar_aborto_neutral_grid(self, symbol: str, i15: dict, state: SignalState) -> Tuple[bool, str]:
+    def evaluar_aborto_neutral_grid(self, symbol: str, i15: dict, state: SignalState, timeout_moneda: int) -> Tuple[bool, str]:
         """
         Evalua las 5 condiciones de aborto del estado NEUTRAL_GRID.
         Se ejecuta en cada vela 15m mientras esta en NEUTRAL_GRID.
@@ -266,11 +266,8 @@ class SignalGenerator:
         # 1. Timeout adaptativo por moneda
         if state.neutral_grid_timestamp > 0:
             tiempo_min = (ahora - state.neutral_grid_timestamp) / 60
-            # PLAN 3.1: Timeout adaptativo desde el adapter
-            coin_cfg = get_coin_config(symbol)
-            timeout_moneda = coin_cfg['grid_timeout']
             if tiempo_min > timeout_moneda:
-                return True, f"Timeout: {tiempo_min:.0f}min > {timeout_moneda}min (categoria: {coin_cfg['category']})"
+                return True, f"Timeout: {tiempo_min:.0f}min > {timeout_moneda}min"
 
         # 2. ADX explosivo
         adx = i15.get('adx', 0)
@@ -286,7 +283,7 @@ class SignalGenerator:
 
         # 4. Ruptura EMAs (> 2% de distancia)
         price = i15.get('close', 0)
-        ema50 = i15.get('ema50_15m', price)
+        ema50 = i15.get('ema50_15m') or price
         if price > 0 and ema50 > 0:
             distancia_pct = abs(price - ema50) / ema50 * 100
             if distancia_pct > CONFIG.grid_neutral_aborto_precio_pct:
@@ -411,14 +408,20 @@ class SignalGenerator:
                 # ═══════════════════════════════════════════════════════════════════
                 state = self.states[symbol]
                 if state.estado == 'NEUTRAL_GRID':
-                    abortar, razon = self.evaluar_aborto_neutral_grid(symbol, data, state)
+                    coin_cfg = get_coin_config(symbol)
+                    abortar, razon = self.evaluar_aborto_neutral_grid(symbol, data, state, coin_cfg['grid_timeout'])
                     if abortar:
                         state.estado = 'MONITOREO'
                         state.neutral_grid_timestamp = 0
                         state.filtro_macro_aprobado = False
                         state.direccion_filtro = None
                         print(f"  [NEUTRAL_GRID] {symbol} -> MONITOREO (aborto: {razon})")
+                        # F3.6: Auditoría de aborto de grid neutral
                         if self.audit_logger:
+                            await self.audit_logger.log_evento_grid_simulacion(
+                                symbol=symbol, tipo='NEUTRAL_GRID_ABORT', grid_id=0,
+                                evento_simulacion={'razon': razon}, pnl_acumulado=0.0
+                            )
                             await self.audit_logger.log_cambio_estado(
                                 symbol=symbol,
                                 de='NEUTRAL_GRID',
@@ -615,12 +618,18 @@ class SignalGenerator:
 
         if state.moneda_pausada_manual:
             state.filtro_macro_aprobado = False
+            # F2.1: Logs antes de return temprano
+            await self._log_continuo(symbol, i15 or {})
+            await self._evaluar_near_misses(symbol, 0, 0, [], None, False)
             return
 
         if not i15 or not i4h:
             state.filtro_macro_aprobado = False
             # FIX #5: NO evaluar despausa durante cold start (evita pausa prematura)
             # await self._evaluar_despausa_automatica(symbol, state, score_macro=0)
+            # F2.1: Logs antes de return temprano
+            await self._log_continuo(symbol, i15 or {})
+            await self._evaluar_near_misses(symbol, 0, 0, [], None, False)
             return
 
         required_15m = ['rsi', 'adx', 'atr', 'ema200_15m', 'macd_hist',
@@ -629,11 +638,17 @@ class SignalGenerator:
             state.filtro_macro_aprobado = False
             # FIX #5: NO evaluar despausa durante cold start
             # await self._evaluar_despausa_automatica(symbol, state, score_macro=0)
+            # F2.1: Logs antes de return temprano
+            await self._log_continuo(symbol, i15 or {})
+            await self._evaluar_near_misses(symbol, 0, 0, [], None, False)
             return
         if i4h.get('ema200_4h') is None:
             state.filtro_macro_aprobado = False
             # FIX #5: NO evaluar despausa durante cold start
             # await self._evaluar_despausa_automatica(symbol, state, score_macro=0)
+            # F2.1: Logs antes de return temprano
+            await self._log_continuo(symbol, i15 or {})
+            await self._evaluar_near_misses(symbol, 0, 0, [], None, False)
             return
 
         price = i15['close']
@@ -839,6 +854,7 @@ class SignalGenerator:
         if state.moneda_pausada and not state.moneda_pausada_manual:
             state.filtro_macro_aprobado = False
             await self._log_continuo(symbol, i15)
+            await self._evaluar_near_misses(symbol, score_macro, score_minimo, rechazos, direction, filtro_aprobado)
             return
 
         # FASE 4: Umbral dinamico por volatilidad historica
@@ -877,8 +893,14 @@ class SignalGenerator:
                 coin_config = CONFIG.coin_registry.get(symbol, {})
                 entrar_grid, razon_grid = self.evaluar_grid_neutro(symbol, i15, coin_config)
                 if entrar_grid and state.estado != 'NEUTRAL_GRID':
+                    # F2.2: Limpiar flags anteriores antes de entrar a NEUTRAL_GRID
+                    state.filtro_macro_aprobado = False
+                    state.direccion_filtro = None
+                    state.score_bajo_desde = None
+                    state._prev_filtro_aprobado = False
                     state.estado = 'NEUTRAL_GRID'
                     state.neutral_grid_timestamp = int(datetime.now(pytz.UTC).timestamp())
+                    # F2.4: [MOVIDO] Guardar grid params para aborto de emergencia 1m — ver después de calcular grid_params
                     print(f"  [NEUTRAL_GRID] {symbol} -> NEUTRAL_GRID | {razon_grid}")
 
                     # V5.9.2: Calcular parámetros del grid e iniciar simulación
@@ -889,6 +911,8 @@ class SignalGenerator:
                         price=price, direction='NEUTRAL', atr=atr_gp, i15=i15_gp, i4h=i4h_gp,
                         symbol=symbol, state=state
                     )
+                    # F2.4: Guardar grid params para aborto de emergencia 1m
+                    state.grid_params_neutral = grid_params
                     if grid_params and self.grid_simulator:
                         await self.grid_simulator.queue.put({
                             'tipo': 'INICIAR_GRID',
@@ -896,9 +920,23 @@ class SignalGenerator:
                             'grid_params': grid_params,
                             'precio_actual': price,
                         })
+                        # F3.1: Enviar primer tick inmediato con datos reales de vela 1m
+                        i1m_actual = self.indicadores_1m.get(symbol, {})
+                        if i1m_actual:
+                            await self.grid_simulator.queue.put({
+                                'tipo': 'TICK',
+                                'symbol': symbol,
+                                'high': i1m_actual.get('high', price),
+                                'low': i1m_actual.get('low', price),
+                                'close': i1m_actual.get('close', price),
+                                'timestamp': i1m_actual.get('timestamp', int(datetime.now(pytz.UTC).timestamp()))
+                            })
                     elif not grid_params:
                         print(f"  [NEUTRAL_GRID] {symbol} No se pudieron calcular params del grid: {gp_rechazos}")
 
+                    # F4.1: Asegurar params nunca sea None para notificaciones
+                    if grid_params is None:
+                        grid_params = {}
                     if self.audit_logger:
                         await self.audit_logger.log_cambio_estado(
                             symbol=symbol,
@@ -918,6 +956,14 @@ class SignalGenerator:
         if state.estado == 'NEUTRAL_GRID' and direction != 'NEUTRAL':
             state.estado = 'MONITOREO'
             state.neutral_grid_timestamp = 0
+            state.grid_params_neutral = None
+            # F3.6: Auditoría de aborto por dirección detectada
+            if self.audit_logger:
+                await self.audit_logger.log_evento_grid_simulacion(
+                    symbol=symbol, tipo='NEUTRAL_GRID_ABORT', grid_id=0,
+                    evento_simulacion={'razon': 'direccion_detectada', 'nueva_direccion': direction},
+                    pnl_acumulado=0.0
+                )
             # V5.9.2: Notificar al simulador para finalizar grid
             if self.grid_simulator:
                 await self.grid_simulator.queue.put({
@@ -937,7 +983,9 @@ class SignalGenerator:
         state.ultimo_filtro_timestamp = i15.get('timestamp', 0)
 
         # Inactividad tracking
-        if score_macro < 50:
+        if state.estado == 'NEUTRAL_GRID':
+            state.score_bajo_desde = None  # No auto-pausar durante grid neutral
+        elif score_macro < 50:
             if state.score_bajo_desde is None:
                 state.score_bajo_desde = int(datetime.now(pytz.UTC).timestamp())
             else:
@@ -1015,10 +1063,15 @@ class SignalGenerator:
                 if score_macro > 40:
                     print(f"  [FILTRO] {symbol} Filtro Macro NO apto | Score: {score_macro} | {rechazos[:1]}")
 
-        # Trackear precio para near-misses
-        if self.audit_logger and i15.get('timestamp'):
-            ts = datetime.fromtimestamp(i15['timestamp'] / 1000, tz=pytz.UTC) if i15['timestamp'] > 1e12 else datetime.now(pytz.UTC)
-            await self.audit_logger.trackear_precio_near_miss(symbol, i15.get('close', 0), ts)
+        # Trackear precio para near-misses (F3.5: usa timestamp de vela 1m)
+        if self.audit_logger:
+            i1m_nm = self.indicadores_1m.get(symbol, {})
+            ts_nm = i1m_nm.get('timestamp')
+            if ts_nm:
+                ts = datetime.fromtimestamp(ts_nm / 1000, tz=pytz.UTC) if ts_nm > 1e12 else datetime.now(pytz.UTC)
+            else:
+                ts = datetime.now(pytz.UTC)
+            await self.audit_logger.trackear_precio_near_miss(symbol, i1m_nm.get('close', i15.get('close', 0)), ts)
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # METODOS AUXILIARES
@@ -1118,9 +1171,43 @@ class SignalGenerator:
                 print(f"  [PAUSA] {symbol} -> MONITOREO (pausa {tipo_pausa} activa)")
             return
 
-        # FASE 5: Si esta en NEUTRAL_GRID, no seguir la maquina de estados tradicional
-        # El aborto se evalua en el loop principal (run) con evaluar_aborto_neutral_grid
+        # FASE 5: Si esta en NEUTRAL_GRID, evaluar aborto de emergencia por precio 1m
+        # El aborto macro (ADX/RSI/EMA) se evalua en el loop principal (run) con evaluar_aborto_neutral_grid
+        # F2.4: Aborto de emergencia por ruptura de límites del grid + 0.5% margen
         if state.estado == 'NEUTRAL_GRID':
+            grid_params = getattr(state, 'grid_params_neutral', None)
+            if grid_params:
+                price_1m = self.indicadores_1m.get(symbol, {}).get('close', 0)
+                lower = grid_params.get('lower_limit', 0)
+                upper = grid_params.get('upper_limit', 0)
+                if price_1m > 0 and lower > 0 and upper > 0:
+                    margen = 0.005
+                    if price_1m < lower * (1 - margen) or price_1m > upper * (1 + margen):
+                        state.estado = 'MONITOREO'
+                        state.neutral_grid_timestamp = 0
+                        state.grid_params_neutral = None
+                        print(f"  [NEUTRAL_GRID] {symbol} -> MONITOREO (aborto emergencia: precio {price_1m:.4f} fuera de grid [{lower:.4f}, {upper:.4f}])")
+                        if self.audit_logger:
+                            await self.audit_logger.log_cambio_estado(
+                                symbol=symbol, de='NEUTRAL_GRID', a='MONITOREO',
+                                direccion='NEUTRAL', score_macro=state.score_macro_actual,
+                                contexto_macro={'razon': 'Aborto emergencia 1m: precio fuera de grid + 0.5%'}
+                            )
+                            state._prev_estado = 'MONITOREO'
+                        if self.audit_logger:
+                            await self.audit_logger.log_evento_grid_simulacion(
+                                symbol=symbol, tipo='NEUTRAL_GRID_ABORT', grid_id=0,
+                                evento_simulacion={'razon': 'aborto_emergencia_1m', 'precio': price_1m, 'lower': lower, 'upper': upper},
+                                pnl_acumulado=0.0
+                            )
+                        if self.grid_simulator:
+                            await self.grid_simulator.queue.put({
+                                'tipo': 'FINALIZAR_GRID',
+                                'symbol': symbol,
+                                'razon': 'aborto_emergencia_1m'
+                            })
+                        return
+            # Si no hay aborto de emergencia, mantener NEUTRAL_GRID sin seguir máquina tradicional
             return
 
         estado_anterior_log = state.estado
@@ -1500,6 +1587,7 @@ class SignalGenerator:
             'capital_sugerido': capital,
             'apalancamiento_sugerido': leverage,
             'notional_por_orden': round(poder_total / grid_count, 2) if grid_count > 0 else 0,
+            'qty_por_orden': round(poder_total / grid_count / price, 4) if grid_count > 0 and price > 0 else 0,
             'margen_sobre_breakeven': round(step_pct - breakeven, 3),
             'rentable': rentable,
             'posicion_en_rango': round(float(posicion), 2),

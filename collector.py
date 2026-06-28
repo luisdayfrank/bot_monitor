@@ -9,7 +9,7 @@ import pandas as pd
 from binance.client import Client
 
 from config import CONFIG
-from database_v5 import insertar_vela, actualizar_precio_vivo
+from database_v5 import insertar_vela, actualizar_precio_vivo, actualizar_precios_vivo_batch
 
 
 def extraer_precio_combinado(data: dict) -> tuple[Optional[float], Optional[str]]:
@@ -73,8 +73,58 @@ class DataCollector:
             s: {'1m': (0, 0.0), '15m': (0, 0.0), '4h': (0, 0.0)} for s in CONFIG.symbols
         }
 
-        # FASE 1: Semáforo para precios
-        self._precio_semaphore = asyncio.Semaphore(10)
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # F1.1 + F1.6: Buffer batch para precios vivo (elimina asfixia de I/O y memory leak)
+        # Reemplaza el semáforo + create_task por acumulación en RAM con flush periódico.
+        # ═══════════════════════════════════════════════════════════════════════════════
+        self._precio_buffer: Dict[str, float] = {}  # symbol -> precio más reciente
+        self._precio_buffer_lock = asyncio.Lock()
+        self._precio_flush_event = asyncio.Event()
+        self._precio_flush_task: Optional[asyncio.Task] = None
+        self._precio_buffer_max_size = 100
+        self._precio_flush_interval = 5.0  # segundos
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # F1.1: Helpers del buffer batch de precios
+    # ═══════════════════════════════════════════════════════════════════════════════
+    async def _buffer_precio(self, symbol: str, precio: float):
+        """Acumula precio en buffer RAM. El flush periódico persiste en SQLite."""
+        if not CONFIG.guardar_precios_vivo:
+            return
+        async with self._precio_buffer_lock:
+            self._precio_buffer[symbol] = precio
+            if len(self._precio_buffer) >= self._precio_buffer_max_size:
+                self._precio_flush_event.set()
+
+    async def _flush_precios_loop(self):
+        """Loop background que flushea precios cada N segundos o cuando el buffer está lleno."""
+        while not self._shutdown.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._precio_flush_event.wait(),
+                    timeout=self._precio_flush_interval
+                )
+            except asyncio.TimeoutError:
+                pass
+
+            self._precio_flush_event.clear()
+            await self._flush_precios_buffer()
+
+        # Flush final al salir
+        await self._flush_precios_buffer()
+
+    async def _flush_precios_buffer(self):
+        """Persiste el buffer de precios en SQLite de forma batch (reduce I/O 95%)."""
+        async with self._precio_buffer_lock:
+            if not self._precio_buffer:
+                return
+            buffer_copy = dict(self._precio_buffer)
+            self._precio_buffer.clear()
+
+        try:
+            await actualizar_precios_vivo_batch(buffer_copy)
+        except Exception as e:
+            print(f"  ⚠️ Error en flush batch de precios: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # FASE 2: Helpers para conversión lazy deque → DataFrame
@@ -98,14 +148,6 @@ class DataCollector:
             self.buffers_1m[symbol] = self._rebuild_df(symbol, '1m')
             self.buffers_15m[symbol] = self._rebuild_df(symbol, '15m')
             self.buffers_4h[symbol] = self._rebuild_df(symbol, '4h')
-
-    async def _safe_actualizar_precio(self, symbol: str, precio: float):
-        """Actualiza precio en SQLite con semáforo y manejo de excepciones."""
-        async with self._precio_semaphore:
-            try:
-                await actualizar_precio_vivo(symbol, precio)
-            except Exception:
-                pass
 
     async def cold_start(self):
         print("🧊 COLD START: Descargando histórico REST...")
@@ -199,10 +241,8 @@ class DataCollector:
                 ticker = self.client.futures_symbol_ticker(symbol=symbol)
                 precio_spot = float(ticker['price'])
                 self.precios_vivo[symbol] = precio_spot
-                try:
-                    await self._safe_actualizar_precio(symbol, precio_spot)
-                except Exception as e:
-                    print(f"  ⚠️ {symbol} DB precio error: {e}")
+                # F1.1: Usar buffer en lugar de write directo a DB
+                await self._buffer_precio(symbol, precio_spot)
                 print(f"  💰 {symbol} Precio REST: ${precio_spot:.4f}")
             except Exception as e:
                 print(f"  ⚠️ {symbol} Precio REST error: {e}")
@@ -226,6 +266,9 @@ class DataCollector:
     async def run(self):
         url = self.build_ws_url()
         intento = 0
+
+        # F1.1: Iniciar loop de flush de precios en background
+        self._precio_flush_task = asyncio.create_task(self._flush_precios_loop())
 
         while not self._shutdown.is_set():
             print(f"📡 Conectando a: {url[:90]}...")
@@ -271,7 +314,8 @@ class DataCollector:
                             precio, symbol_parsed = extraer_precio_combinado(data)
                             if precio and symbol_parsed:
                                 self.precios_vivo[symbol_parsed] = precio
-                                asyncio.create_task(self._safe_actualizar_precio(symbol_parsed, precio))
+                                # F1.1 + F1.6: Buffer en RAM (no create_task ni write directo)
+                                await self._buffer_precio(symbol_parsed, precio)
                                 markprice_recibidos += 1
                                 if not self._primer_precio_recibido:
                                     print(f"  🎯 PRIMER PRECIO WS: {symbol_parsed} @ ${precio:.4f}")
@@ -365,3 +409,6 @@ class DataCollector:
 
     def stop(self):
         self._shutdown.set()
+        # F1.1: Cancelar flush loop de forma segura
+        if self._precio_flush_task and not self._precio_flush_task.done():
+            self._precio_flush_task.cancel()

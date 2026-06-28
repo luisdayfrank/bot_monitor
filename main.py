@@ -33,25 +33,15 @@ async def lifespan(fastapi_app):
     signals = SignalGenerator(queue_indicadores, queue_eventos)
     notifier = Notifier()
 
-    # V5.9.2: Crear simulador de grid neutral
-    grid_simulator = GridSimulator(
-        precios_vivo=precios_vivo,
-        indicadores_1m=signals.indicadores_1m,
-        signal_states=signals.states,
-    )
-    signals.grid_simulator = grid_simulator  # Conectar con signals para CB→aborto grid
-    grid_simulator.audit_logger = None
-    grid_simulator.notifier = notifier
-
     # V4.2: Guardar referencia para comandos Telegram
     notifier.signal_generator = signals
 
+    # F2.8: Crear todas las instancias PRIMERO (antes de inyectar dependencias)
     audit_logger = None
     audit_reporter = None
     if CONFIG.modo_auditoria:
         audit_logger = AuditLogger()
         audit_reporter = AuditReporter(notifier)
-        signals.audit_logger = audit_logger
         print(f"📋 Modo auditoría ACTIVADO ({CONFIG.timezone})")
         print(f"   Reporte diario: {CONFIG.auditoria_hora_reporte} {CONFIG.timezone}")
         # FASE 5.2: Notificar que MFM está activo
@@ -59,6 +49,19 @@ async def lifespan(fastapi_app):
         print(f"   Umbral alineación: ±{CONFIG.mfm_umbral_alineacion}")
     else:
         print("📋 Modo auditoría DESACTIVADO")
+
+    # V5.9.2: Crear simulador de grid neutral
+    grid_simulator = GridSimulator(
+        precios_vivo=precios_vivo,
+        indicadores_1m=signals.indicadores_1m,
+        signal_states=signals.states,
+    )
+
+    # F2.8: BLOQUE SECUENCIAL de inyección de dependencias (TODAS juntas, antes de lanzar tareas)
+    signals.audit_logger = audit_logger
+    signals.grid_simulator = grid_simulator
+    grid_simulator.audit_logger = audit_logger
+    grid_simulator.notifier = notifier
 
     print("⏳ Cold start en progreso...")
     await collector.cold_start()
@@ -81,10 +84,6 @@ async def lifespan(fastapi_app):
     app.state.signal_generator = signals
     # V5.9.2: Exponer grid_simulator para endpoint /api/grid-neutral/{symbol}
     app.state.grid_simulator = grid_simulator
-
-    # V5.9.2: Conectar audit_logger al simulador si está activo
-    if CONFIG.modo_auditoria and audit_logger:
-        grid_simulator.audit_logger = audit_logger
 
     # V5.9.2 MEJORA #6: Limpiar grids huérfanos al arranque
     print("  🧹 V5.9.2: Limpiando grids huérfanos...")
@@ -119,10 +118,18 @@ async def lifespan(fastapi_app):
                         i1m = signals.indicadores_1m.get(symbol, {})
                         precio = precios_vivo[symbol]
                         # Usar high/low del indicador 1m o estimar desde precio
-                        high = i1m.get('high', precio * 1.001)
-                        low = i1m.get('low', precio * 0.999)
+                        # F3.2: Usar datos reales de vela 1m, nunca estimados
+                        high = i1m.get('high', precio)
+                        low = i1m.get('low', precio)
                         close = i1m.get('close', precio)
-                        ts = int(datetime.now(pytz.UTC).timestamp())
+                        # F3.2: Usar timestamp real de la vela 1m
+                        ts_raw = i1m.get('timestamp')
+                        if ts_raw and ts_raw > 1e12:
+                            ts = int(ts_raw / 1000)
+                        elif ts_raw:
+                            ts = int(ts_raw)
+                        else:
+                            ts = int(datetime.now(pytz.UTC).timestamp())
                         await grid_simulator.queue.put({
                             'tipo': 'TICK',
                             'symbol': symbol,
@@ -148,6 +155,8 @@ async def lifespan(fastapi_app):
 
     t_grid_heartbeat = asyncio.create_task(grid_heartbeat())
 
+    for t in [t_grid_sim, t_grid_ticker, t_grid_heartbeat]:
+        t.add_done_callback(task_done_callback)
     background_tasks.update([t1, t2, t3, t4, t_grid_sim, t_grid_ticker, t_grid_heartbeat])
 
     def task_done_callback(t):
@@ -330,104 +339,3 @@ if __name__ == "__main__":
         print(f"📋 MODO AUDITORÍA: Reportes a las {CONFIG.auditoria_hora_reporte} {CONFIG.timezone}")
         print(f"📊 MODO MFM: Volumen inteligente con Money Flow Multiplier")
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
-
-    if CONFIG.heartbeat_debug:
-        async def heartbeat_validacion():
-            """Log periódico del estado interno de todas las monedas. Solo lectura."""
-            from datetime import datetime
-            while True:
-                await asyncio.sleep(CONFIG.heartbeat_intervalo_min * 60)
-                lineas = []
-                ahora = datetime.now(pytz.UTC).strftime('%H:%M:%S')
-
-                # Contadores para resumen
-                total_monedas = len(CONFIG.symbols)
-                monedas_pausadas_manual = 0
-                monedas_pausadas_auto = 0
-                monedas_armed = 0
-                monedas_fire = 0
-                monedas_neutral_grid = 0
-
-                for symbol in CONFIG.symbols:
-                    st = signals.states[symbol]
-                    i15 = signals.indicadores_15m.get(symbol, {})
-
-                    # PLAN 3.1: Parametros adaptativos
-                    from coin_config_adapter import get_coin_config, get_category_emoji
-                    coin_cfg = get_coin_config(symbol)
-                    cat = coin_cfg['category']
-                    cat_emoji = get_category_emoji(cat)
-                    adx_t = coin_cfg['adx_reject']
-
-                    adx = i15.get('adx', 'N/A')
-                    rsi = i15.get('rsi', 'N/A')
-                    score = st.score_macro_actual
-                    dir_valida = st.direccion_ultima_valida or 'None'
-
-                    # PLAN 3.1: Score visual con umbral real
-                    umbral_actual = adx_t if (isinstance(adx, (int, float)) and adx > adx_t) else (
-                        70 if (isinstance(adx, (int, float)) and 25 <= adx <= 35) else 75
-                    )
-                    if score >= umbral_actual:
-                        score_str = f"{score}✅(>{umbral_actual})"
-                    elif score >= umbral_actual * 0.85:
-                        score_str = f"{score}🟡(~{umbral_actual})"
-                    elif score > 0:
-                        score_str = f"{score}🔴"
-                    else:
-                        score_str = f"{score}⚪"
-
-                    # PLAN 3.1: Filtro aprobado/rechazado
-                    filtro_str = "✅FILTRO" if st.filtro_macro_aprobado else "❌SIN_FILTRO"
-
-                    pausa_info = ''
-                    if st.moneda_pausada_manual:
-                        pausa_info = ' [PAUSADA-MANUAL]'
-                        monedas_pausadas_manual += 1
-                    elif st.moneda_pausada:
-                        pausa_info = ' [PAUSADA-AUTO]'
-                        monedas_pausadas_auto += 1
-                    elif st.score_bajo_desde:
-                        mins_bajo = (int(datetime.now(pytz.UTC).timestamp()) - st.score_bajo_desde) // 60
-                        pausa_info = f' [bajo:{mins_bajo}min→pausa en {max(0, int(CONFIG.pausa_inactividad_horas*60)-mins_bajo)}min]'
-
-                    armed_age = ''
-                    if st.estado == 'ARMED' and st.armed_timestamp > 0:
-                        mins = (int(datetime.now(pytz.UTC).timestamp() * 1000) - st.armed_timestamp) // 60000
-                        armed_age = f' armed:{mins}min'
-                        monedas_armed += 1
-
-                    if st.estado == 'FIRE':
-                        monedas_fire += 1
-                    if st.estado == 'NEUTRAL_GRID':
-                        monedas_neutral_grid += 1
-
-                    lineas.append(
-                        f"{symbol} {cat_emoji}[{cat}] ADXlim:{adx_t} | "
-                        f"score={score_str} | adx={adx} | {filtro_str} | {st.estado}{armed_age}{pausa_info}"
-                    )
-
-                # V4.2: Resumen al inicio del heartbeat
-                resumen = (
-                    f"💓 [{ahora}] HEARTBEAT | "
-                    f"Total:{total_monedas} | "
-                    f"🔥FIRE:{monedas_fire} | "
-                    f"🎯ARMED:{monedas_armed} | "
-                    f"💠N-GRID:{monedas_neutral_grid} | "
-                    f"⏸️Manual:{monedas_pausadas_manual} | "
-                    f"⏸️Auto:{monedas_pausadas_auto}"
-                )
-                print(resumen)
-                print(f"  💓 [{ahora}] DETALLE | {' | '.join(lineas)}")
-
-                # V4.2: Leyenda cada 4 ciclos (1 hora)
-                ciclo_actual = int(datetime.now(pytz.UTC).timestamp()) // (CONFIG.heartbeat_intervalo_min * 60)
-                if ciclo_actual % 4 == 0:
-                    print("  📖 LEYENDA: [PAUSADA-MANUAL]=solo /resume la reactiva | "
-                          "[PAUSADA-AUTO]=se reactiva sola cuando score>=50 | "
-                          "[bajo:Xmin→pausa en Ymin]=cuenta regresiva a pausa auto | "
-                          "armed:Xmin=tiempo en ARMED | score✅>=70 🟡>=50 🔴>0 ⚪=0 | "
-                          "ADXlim=umbral adaptativo por categoria | "
-                          "✅FILTRO=filtro macro aprobado | ❌SIN_FILTRO=filtro rechazado")
-
-

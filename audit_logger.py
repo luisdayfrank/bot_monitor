@@ -414,11 +414,21 @@ class AuditLogger:
             "version": "5.9.2"
         })
 
-        # Mapear tipos internos a tipos de auditoría válidos
+        # F4.1: Unificar nomenclatura de eventos grid neutral
         tipo_auditoria = tipo
-        if tipo not in ('GRID_INICIADO', 'GRID_BUY_SIM', 'GRID_SELL_SIM',
-                        'POSICION_TIMEOUT', 'KILL_SWITCH_CLOSE', 'POSICION_ATRAPADA'):
-            tipo_auditoria = 'GRID_NEUTRAL_EVENTO'
+        tipo_map = {
+            'GRID_INICIADO': 'NEUTRAL_GRID_INICIADO',
+            'GRID_BUY_SIM': 'NEUTRAL_GRID_BUY',
+            'GRID_SELL_SIM': 'NEUTRAL_GRID_SELL',
+            'POSICION_TIMEOUT': 'NEUTRAL_GRID_TIMEOUT',
+            'KILL_SWITCH_CLOSE': 'NEUTRAL_GRID_KILL',
+            'POSICION_ATRAPADA': 'NEUTRAL_GRID_ATRAPADA',
+            'NEUTRAL_GRID_ABORT': 'NEUTRAL_GRID_ABORT',
+        }
+        if tipo in tipo_map:
+            tipo_auditoria = tipo_map[tipo]
+        elif not tipo.startswith('NEUTRAL_GRID_'):
+            tipo_auditoria = 'NEUTRAL_GRID_EVENTO'
 
         evento = {
             "symbol": symbol,

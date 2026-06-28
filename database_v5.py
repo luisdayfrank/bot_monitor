@@ -329,7 +329,41 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_grid_sim_estado ON grid_simulaciones(estado)")
 
         await db.commit()
-    print("🗄️ Base de datos inicializada (WAL mode) + Auditoría + Disparos + Near-miss + V5.9.2 Grid Neutral")
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # F1.4: MIGRACIÓN SILENCIOSA DE COLUMNAS FALTANTES (compatibilidad DB antigua)
+    # ═══════════════════════════════════════════════════════════════════════════════
+    async def _migrar_columnas_faltantes():
+        """Añade columnas faltantes en tablas existentes (idempotente)."""
+        columnas_necesarias = {
+            'grid_estados': [
+                ('evento_auditoria_id', 'INTEGER'),
+            ],
+            'near_miss_seguimientos': [
+                ('filtros_rechazo', 'TEXT'),
+                ('muestras_json', 'TEXT'),
+                ('precio_max', 'REAL'),
+                ('precio_min', 'REAL'),
+            ],
+        }
+
+        for tabla, columnas in columnas_necesarias.items():
+            try:
+                cursor = await db.execute(f"PRAGMA table_info({tabla})")
+                rows = await cursor.fetchall()
+                columnas_existentes = {r[1] for r in rows}  # r[1] = name
+
+                for col, tipo in columnas:
+                    if col not in columnas_existentes:
+                        await db.execute(f"ALTER TABLE {tabla} ADD COLUMN {col} {tipo}")
+                        print(f"  [MIGRACION] Columna '{col}' ({tipo}) añadida a '{tabla}'")
+                await db.commit()
+            except Exception as e:
+                print(f"  ⚠️ [MIGRACION] Error verificando {tabla}: {e}")
+
+    await _migrar_columnas_faltantes()
+
+    print("🗄️ Base de datos inicializada (WAL mode) + Auditoría + Disparos + Near-miss + V5.9.2 Grid Neutral + F1.4 Migración")
 
 async def insertar_vela(symbol: str, tf: str, vela: dict):
     tabla = f"velas_{tf}"
@@ -364,6 +398,25 @@ async def actualizar_precio_vivo(symbol: str, precio: float):
         INSERT OR REPLACE INTO precios_vivo (symbol, precio, actualizado)
         VALUES (?, ?, ?)
     """, (symbol, precio, datetime.utcnow().isoformat()))
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# F1.1: ACTUALIZACIÓN BATCH DE PRECIOS VIVO (reduce I/O drásticamente)
+# ═══════════════════════════════════════════════════════════════════════════════
+async def actualizar_precios_vivo_batch(precios: dict):
+    """Actualiza múltiples precios en una sola transacción (batch)."""
+    if not precios:
+        return
+    db = await _get_db()
+    ts = datetime.utcnow().isoformat()
+    async with _db_lock:
+        try:
+            await db.executemany(
+                "INSERT OR REPLACE INTO precios_vivo (symbol, precio, actualizado) VALUES (?, ?, ?)",
+                [(symbol, precio, ts) for symbol, precio in precios.items()]
+            )
+            await db.commit()
+        except Exception as e:
+            print(f"  ⚠️ Error en batch precios vivo: {e}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FASE 4.5: FUNCIONES DE AUDITORÍA
@@ -664,10 +717,10 @@ async def cargar_near_miss_seguimientos_dia(fecha_local: str):
         fecha_inicio = datetime.strptime(fecha_local, "%Y-%m-%d")
         fecha_inicio = tz.localize(fecha_inicio)
         fecha_fin = fecha_inicio + timedelta(days=1)
-        
+
         ts_inicio = fecha_inicio.astimezone(pytz.UTC).timestamp()
         ts_fin = fecha_fin.astimezone(pytz.UTC).timestamp()
-        
+
         cursor = await db.execute("""
             SELECT * FROM near_miss_seguimientos
             WHERE timestamp_inicio >= ? AND timestamp_inicio < ?
@@ -909,7 +962,8 @@ async def forzar_aborto_grid_huerfano(grid_id, sim_id=None):
 
 
 async def guardar_grid_estado_atomico(symbol, timestamp_inicio, precio_inicio, grid_params_json,
-                                       posiciones_abiertas_json, evento_auditoria_id=None):
+                                       posiciones_abiertas_json, evento_auditoria_id=None,
+                                       direccion="NEUTRAL"):
     """Transacción atómica: grid_estado + grid_simulacion en una sola transacción."""
     db = await _get_db()
     ts = int(datetime.now(pytz.UTC).timestamp())
@@ -920,8 +974,8 @@ async def guardar_grid_estado_atomico(symbol, timestamp_inicio, precio_inicio, g
                 await db.execute("""
                     INSERT INTO grid_estados
                     (symbol, timestamp_inicio, estado, direccion, precio_entrada, grid_params_json, evento_auditoria_id)
-                    VALUES (?, ?, 'ACTIVO', 'NEUTRAL', ?, ?, ?)
-                """, (symbol, timestamp_inicio, precio_inicio, grid_params_json, evento_auditoria_id))
+                    VALUES (?, ?, 'ACTIVO', ?, ?, ?, ?)
+                """, (symbol, timestamp_inicio, direccion, precio_inicio, grid_params_json, evento_auditoria_id))
 
                 cursor = await db.execute("SELECT last_insert_rowid()")
                 row = await cursor.fetchone()

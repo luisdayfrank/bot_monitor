@@ -165,7 +165,7 @@ class AuditReporter:
         eventos_near_miss = [e for e in eventos if e['tipo'] == 'NEAR_MISS']
         eventos_metricas = [e for e in eventos if e['tipo'] == 'METRICAS_DIA']
         # FASE 5: Eventos de grid neutral
-        eventos_neutral_grid = [e for e in eventos if e['tipo'] in ('NEUTRAL_GRID', 'NEUTRAL_GRID_ABORT')]
+        eventos_neutral_grid = [e for e in eventos if e['tipo'].startswith('NEUTRAL_GRID_')]
         eventos_nm_seguimiento = [e for e in eventos if e['tipo'] in ('NEAR_MISS_SEGUIMIENTO_INICIO', 'NEAR_MISS_SEGUIMIENTO_FIN')]
 
         # Procesar eventos principales (sin CONTINUO)
