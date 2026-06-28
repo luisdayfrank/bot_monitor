@@ -4,6 +4,14 @@ import logging
 import numpy as np
 import os
 import datetime
+import time
+import pytz
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from database_v5 import guardar_alerta, _get_db, now_local, get_tz
+from notifier_v5 import Notifier
+from config import CONFIG
 
 REGISTRY_PATH = "coins_registry.json"
 
@@ -66,16 +74,6 @@ def _sanitize_numpy(obj):
     if isinstance(obj, (list, tuple)):
         return [_sanitize_numpy(v) for v in obj]
     return obj
-
-import os
-import time
-import pytz  # V5.7 FIX: Necesario para cálculo de timestamps UTC en estadísticas
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
-from database_v5 import guardar_alerta, _get_db, now_local, get_tz
-from notifier_v5 import Notifier
-from config import CONFIG
 
 app = FastAPI(title="Crypto Monitor V5.7 — Multi-Timeframe Sniper Dashboard")
 
@@ -195,6 +193,7 @@ async def get_estado(symbol: str, request: Request):
             "circuit_breaker_hasta": getattr(s, 'circuit_breaker_hasta', 0),
             "moneda_pausada": getattr(s, 'moneda_pausada', False),
             "moneda_pausada_manual": getattr(s, 'moneda_pausada_manual', False),
+            "neutral_grid_timestamp": getattr(s, 'neutral_grid_timestamp', 0),
             "moneda_pausada_razon": getattr(s, 'moneda_pausada_razon', None),
             "timestamp": int(time.time() * 1000)
         })
@@ -309,6 +308,8 @@ async def get_snapshot(request: Request):
 
     result = {}
     for symbol in registry.keys():
+        if not registry.get(symbol, {}).get('active', False):
+            continue
         st = estados.get(symbol)
         i1m = indicadores_1m.get(symbol, {})
         i15m = indicadores_15m.get(symbol, {})
@@ -394,12 +395,8 @@ async def get_stats_summary(request: Request):
         )
         fires_hoy = (await cursor.fetchone())[0]
 
-        # V5.7 FIX: Convertir fecha local a timestamp UTC para near-misses
-        # Esto estandariza las métricas del dashboard al día en curso
-        tz = get_tz()
-        fecha_inicio = datetime.datetime.strptime(hoy_local, "%Y-%m-%d")
-        fecha_inicio = tz.localize(fecha_inicio)
-        ts_inicio_dia = fecha_inicio.astimezone(pytz.UTC).timestamp()
+        # F4.2: Usar UTC directamente para evitar desfase zona horaria
+        ts_inicio_dia = datetime.datetime.now(pytz.UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
         # 2. Conteo de Near Misses INICIADOS HOY (no toda la historia)
         cursor = await db.execute(
@@ -420,7 +417,7 @@ async def get_stats_summary(request: Request):
         aciertos = 0
         if finalizados_hoy > 0:
             cursor = await db.execute(
-                "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND acerto_bot = 1",
+                "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND timestamp_fin IS NOT NULL AND acerto_bot = 1",
                 (ts_inicio_dia,)
             )
             aciertos = (await cursor.fetchone())[0]
@@ -550,7 +547,16 @@ async def get_grid_neutral(symbol: str, request: Request):
             "timestamp": int(time.time() * 1000)
         }
 
-    estado = grid_simulator.get_estado_simulacion(symbol)
+    try:
+        estado = grid_simulator.get_estado_simulacion(symbol)
+    except Exception as e:
+        return {
+            "symbol": symbol,
+            "grid_activo": False,
+            "mensaje": "Error interno del simulador",
+            "error": str(e),
+            "timestamp": int(time.time() * 1000)
+        }
 
     if not estado:
         return {
@@ -567,8 +573,8 @@ async def get_grid_neutral(symbol: str, request: Request):
         "sim_id": estado.get('sim_id'),
         "niveles": estado.get('niveles'),
         "posiciones_abiertas": estado.get('posiciones_abiertas'),
-        "posiciones_atrapadas": estado.get('posiciones_atrapadas'),  # Mejora #2
-        "posiciones_vencidas": estado.get('posiciones_vencidas'),    # Mejora #1
+        "posiciones_atrapadas": estado.get('posiciones_atrapadas'),
+        "posiciones_vencidas": estado.get('posiciones_vencidas'),
         "trades_completados": estado.get('trades_completados'),
         "trades_kill_switch": estado.get('trades_kill_switch'),
         "pnl_neto": estado.get('pnl_neto'),
@@ -576,7 +582,7 @@ async def get_grid_neutral(symbol: str, request: Request):
         "fees_totales": estado.get('fees_totales'),
         "slippage_total": estado.get('slippage_total'),
         "max_posiciones_simultaneas": estado.get('max_posiciones_simultaneas'),
-        "ultimo_tick_minutos": estado.get('ultimo_tick_segundos_ago', 0) // 60,  # Heartbeat
+        "ultimo_tick_minutos": estado.get('ultimo_tick_segundos_ago', 0) // 60,
         "timestamp": int(time.time() * 1000)
     }
 
@@ -616,11 +622,13 @@ async def toggle_coin(request: Request):
         registry[symbol]["active"] = 1 if active else 0
         _save_registry(registry)
 
-        await notifier.enviar_telegram(
-            f"🔄 <b>Registro actualizado</b>\n"
-            f"{symbol}: {'✅ ACTIVADA' if active else '❌ DESACTIVADA'}\n"
-            f"⚠️ Ejecuta <code>/restart</code> para aplicar cambios."
+        status_text = "ACTIVADA" if active else "DESACTIVADA"
+        msg_text = (
+            "🔄 <b>Registro actualizado</b>\n"
+            + f"{symbol}: {'✅' if active else '❌'} {status_text}\n"
+            + "⚠️ Ejecuta <code>/restart</code> para aplicar cambios."
         )
+        await notifier.enviar_telegram(msg_text)
 
         await manager.broadcast_json({
             "msg_type": "coin_config_update",
@@ -663,11 +671,13 @@ async def toggle_all_coins(request: Request):
         _save_registry(registry)
 
         cat_msg = f" en categoría '{category}'" if category else ""
-        await notifier.enviar_telegram(
-            f"🔄 <b>Todas {'ACTIVADAS' if active else 'DESACTIVADAS'}{cat_msg}</b>\n"
-            f"Monedas afectadas: {len(changed)}\n"
-            f"⚠️ Ejecuta <code>/restart</code> para aplicar cambios."
+        status_text = "ACTIVADAS" if active else "DESACTIVADAS"
+        msg_text = (
+            f"🔄 <b>Todas {status_text}{cat_msg}</b>\n"
+            + f"Monedas afectadas: {len(changed)}\n"
+            + "⚠️ Ejecuta <code>/restart</code> para aplicar cambios."
         )
+        await notifier.enviar_telegram(msg_text)
 
         update_payload = {symbol: {"active": active} for symbol in changed}
         await manager.broadcast_json({
