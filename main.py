@@ -18,6 +18,7 @@ from grid_simulator import GridSimulator  # V5.9.2: Motor de simulación grid ne
 
 background_tasks = set()
 
+
 @asynccontextmanager
 async def lifespan(fastapi_app):
     await init_db()
@@ -155,10 +156,9 @@ async def lifespan(fastapi_app):
 
     t_grid_heartbeat = asyncio.create_task(grid_heartbeat())
 
-    for t in [t_grid_sim, t_grid_ticker, t_grid_heartbeat]:
-        t.add_done_callback(task_done_callback)
-    background_tasks.update([t1, t2, t3, t4, t_grid_sim, t_grid_ticker, t_grid_heartbeat])
-
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # F1.3 FIX: Definir callback ANTES de usarlo en las tareas del grid
+    # ═══════════════════════════════════════════════════════════════════════════════
     def task_done_callback(t):
         try:
             t.result()
@@ -167,6 +167,13 @@ async def lifespan(fastapi_app):
         except Exception as e:
             print(f"❌ ERROR CRÍTICO EN TAREA: {e}")
 
+    # Aplicar callback a tareas del grid (F1.3 del Plan 6.1)
+    for t in [t_grid_sim, t_grid_ticker, t_grid_heartbeat]:
+        t.add_done_callback(task_done_callback)
+
+    background_tasks.update([t1, t2, t3, t4, t_grid_sim, t_grid_ticker, t_grid_heartbeat])
+
+    # Aplicar callback a tareas principales
     for t in [t1, t2, t3, t4]:
         t.add_done_callback(task_done_callback)
 
@@ -188,12 +195,10 @@ async def lifespan(fastapi_app):
                     try:
                         ts = datetime.now(pytz.UTC)
                         await audit_logger.trackear_precio_post_disparo(symbol, precio, ts)
-                        # ✅ AÑADIR ESTA LÍNEA:
                         await audit_logger.trackear_precio_near_miss(symbol, precio, ts)
                     except Exception as e:
                         print(f"  ⚠️ Error trackeando {symbol}: {e}")
                     await asyncio.sleep(0)
-
 
         t7 = asyncio.create_task(trackear_precios_post())
         background_tasks.add(t7)
@@ -330,6 +335,7 @@ async def lifespan(fastapi_app):
         await audit_logger.stop()
 
     collector.stop()
+
 
 app.router.lifespan_context = lifespan
 
