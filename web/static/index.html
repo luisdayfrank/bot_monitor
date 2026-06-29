@@ -600,13 +600,22 @@
                     /* V5.7 FIX: Mostrar seguimientos finalizados si el elemento existe */
                     const elFinalizados = document.getElementById('stat-finalizados');
                     if (elFinalizados) elFinalizados.innerText = data.finalizados_hoy || 0;
-                    document.getElementById('stat-winrate').innerText = data.win_rate_rechazos + '%';
+                    const winRateEl = document.getElementById('stat-winrate');
+                    if (data.finalizados_hoy > 0) {
+                        winRateEl.innerText = data.win_rate_rechazos + '%';
+                        winRateEl.className = 'text-3xl font-mono text-green-400';
+                    } else {
+                        winRateEl.innerText = 'N/A';
+                        winRateEl.className = 'text-3xl font-mono text-gray-500';
+                    }
                 } else {
                     document.getElementById('stat-fires').innerText = 'ERR';
                     document.getElementById('stat-nearmiss').innerText = 'ERR';
                     const elFinalizados = document.getElementById('stat-finalizados');
                     if (elFinalizados) elFinalizados.innerText = 'ERR';
-                    document.getElementById('stat-winrate').innerText = 'ERR';
+                    const winRateEl = document.getElementById('stat-winrate');
+                    winRateEl.innerText = 'ERR';
+                    winRateEl.className = 'text-3xl font-mono text-red-400';
                 }
             } catch (e) {
                 console.error("[STATS] Error cargando estadísticas:", e);
@@ -1110,7 +1119,11 @@
                     updateCoinListItem(sym);
                 }
 
-                if (!activeSymbol && Object.keys(marketData).length > 0) {
+                // Restaurar selección guardada si existe y sigue activa
+                const savedSymbol = sessionStorage.getItem('activeSymbol');
+                if (savedSymbol && marketData[savedSymbol] && coinConfig[savedSymbol] && coinConfig[savedSymbol].active) {
+                    selectCoin(savedSymbol);
+                } else if (!activeSymbol && Object.keys(marketData).length > 0) {
                     const firstActive = Object.keys(marketData).find(s => 
                         coinConfig[s] && coinConfig[s].active
                     );
@@ -1207,6 +1220,7 @@
             }
 
             activeSymbol = symbol;
+            sessionStorage.setItem('activeSymbol', symbol);
             document.getElementById('active-coin-title').innerText = symbol;
             document.getElementById('mobile-coin-title').innerText = symbol;
 
@@ -1691,6 +1705,11 @@
         document.addEventListener('DOMContentLoaded', () => {
             renderAlertsFromStorage();
             window.dispatchEvent(new Event('resize'));
+            // Restaurar símbolo guardado antes de cargar datos
+            const savedSymbol = sessionStorage.getItem('activeSymbol');
+            if (savedSymbol) {
+                activeSymbol = savedSymbol;
+            }
             loadSnapshot().then(() => {
                 connectWebSocket();
             });
