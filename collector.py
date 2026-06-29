@@ -409,6 +409,9 @@ class DataCollector:
             if time.time() - ultimo_msg > 900:
                 print("🧊 Hueco largo de datos. Re-hidratando...")
                 await self.cold_start()
+                # Re-sincronizar buffers raw → DataFrames para el engine
+                self._sync_buffers_to_engine()
+                print("🧊 Buffers re-sincronizados tras re-hidratación")
 
     def stop(self):
         self._shutdown.set()

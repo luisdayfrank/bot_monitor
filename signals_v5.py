@@ -51,7 +51,7 @@ class SignalState:
         # FASE 5: GRID NEUTRAL — Estado persistente
         # ═══════════════════════════════════════════════════════════════════════════════
         self.neutral_grid_timestamp = 0  # Timestamp de entrada a NEUTRAL_GRID
-
+        self.grid_params_neutral = None  # Parámetros del grid neutral activo
         # FASE 5.5: Metricas diarias acumuladas
         self.metricas_dia: dict = {
             'score_max': 0,
@@ -242,7 +242,7 @@ class SignalGenerator:
         # 5. MACD cerca de cero
         macd_hist = i15.get('macd_hist', 0)
         if macd_hist is not None and price > 0 and atr > 0:
-            macd_en_atr = abs(macd_hist) / (atr * price / 100) if atr > 0 else float('inf')
+            macd_en_atr = abs(macd_hist) / atr if atr > 0 else float('inf')
             if macd_en_atr > 0.5:
                 rechazos.append(f"MACD {macd_hist:.4f} lejos de 0 ({macd_en_atr:.1f}x ATR)")
 
@@ -934,7 +934,7 @@ class SignalGenerator:
                         })
                         # F3.1: Enviar primer tick inmediato con datos reales de vela 1m
                         i1m_actual = self.indicadores_1m.get(symbol, {})
-                        if i1m_actual:
+                        if i1m_actual and self.grid_simulator:
                             await self.grid_simulator.queue.put({
                                 'tipo': 'TICK',
                                 'symbol': symbol,
@@ -1221,7 +1221,8 @@ class SignalGenerator:
                 price_1m = self.indicadores_1m.get(symbol, {}).get('close', 0)
                 lower = grid_params.get('lower_limit', 0)
                 upper = grid_params.get('upper_limit', 0)
-                if price_1m > 0 and lower > 0 and upper > 0:
+                # Validación defensiva: lower debe ser < upper
+                if price_1m > 0 and lower > 0 and upper > 0 and upper > lower:
                     margen = 0.005
                     if price_1m < lower * (1 - margen) or price_1m > upper * (1 + margen):
                         state.estado = 'MONITOREO'
@@ -1235,19 +1236,27 @@ class SignalGenerator:
                                 contexto_macro={'razon': 'Aborto emergencia 1m: precio fuera de grid + 0.5%'}
                             )
                             state._prev_estado = 'MONITOREO'
-                        if self.audit_logger:
                             await self.audit_logger.log_evento_grid_simulacion(
                                 symbol=symbol, tipo='NEUTRAL_GRID_ABORT', grid_id=0,
                                 evento_simulacion={'razon': 'aborto_emergencia_1m', 'precio': price_1m, 'lower': lower, 'upper': upper},
                                 pnl_acumulado=0.0
                             )
+                        # Notificar al simulador solo si existe
                         if self.grid_simulator:
                             await self.grid_simulator.queue.put({
                                 'tipo': 'FINALIZAR_GRID',
                                 'symbol': symbol,
                                 'razon': 'aborto_emergencia_1m'
                             })
+                        else:
+                            print(f"  ⚠️ [NEUTRAL_GRID] {symbol} grid_simulator no disponible, aborto solo en estado")
                         return
+                elif lower > 0 and upper > 0 and upper <= lower:
+                    print(f"  ⚠️ [NEUTRAL_GRID] {symbol} Grid params inválidos: upper({upper}) <= lower({lower}), abortando")
+                    state.estado = 'MONITOREO'
+                    state.neutral_grid_timestamp = 0
+                    state.grid_params_neutral = None
+                    return
             # Si no hay aborto de emergencia, mantener NEUTRAL_GRID sin seguir máquina tradicional
             return
 
@@ -1665,19 +1674,35 @@ class SignalGenerator:
         print(f"  [CB] {symbol} CIRCUIT BREAKER ACTIVADO | Pausa: {CONFIG.circuit_breaker_pausa_seg}s | "
               f"Capital reducido: ${state.capital_actual:.2f}")
 
+        # Forzar estado de la máquina a COOLDOWN (bloquea nuevos disparos)
+        estado_previo = state.estado
+        state.estado = 'COOLDOWN'
+        state.velas_confirmacion = 0
+        state.filtro_macro_aprobado = False
+        state.direccion_filtro = None
+        state.armed_timestamp = 0
+        print(f"  [CB] {symbol} Estado forzado a COOLDOWN (era: {estado_previo})")
+
+        if self.audit_logger:
+            await self.audit_logger.log_cambio_estado(
+                symbol=symbol,
+                de=estado_previo,
+                a='COOLDOWN',
+                direccion=state.direccion_ultima_valida,
+                score_macro=0,
+                contexto_macro={'razon': 'Circuit Breaker activado'}
+            )
+            state._prev_estado = 'COOLDOWN'
+
         # V5.9.2 MEJORA #9: Si CB afecta grid neutral, abortar grid activo
-        if CONFIG.circuit_breaker_afecta_grid_neutral and state.estado == 'NEUTRAL_GRID':
-            state.estado = 'MONITOREO'
+        if CONFIG.circuit_breaker_afecta_grid_neutral and estado_previo == 'NEUTRAL_GRID':
             state.neutral_grid_timestamp = 0
+            state.grid_params_neutral = None
             print(f"  [CB] {symbol} Grid neutral ABORTADO por Circuit Breaker")
             if self.audit_logger:
-                await self.audit_logger.log_cambio_estado(
-                    symbol=symbol,
-                    de='NEUTRAL_GRID',
-                    a='MONITOREO',
-                    direccion='NEUTRAL',
-                    score_macro=0,
-                    contexto_macro={'razon': 'Circuit Breaker activado - aborto grid neutral'}
+                await self.audit_logger.log_evento_grid_simulacion(
+                    symbol=symbol, tipo='NEUTRAL_GRID_ABORT', grid_id=0,
+                    evento_simulacion={'razon': 'circuit_breaker'}, pnl_acumulado=0.0
                 )
             # Notificar al simulador para finalizar grid
             if self.grid_simulator:

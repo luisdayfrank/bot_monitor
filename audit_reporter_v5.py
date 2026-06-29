@@ -692,13 +692,17 @@ class AuditReporter:
             'total_nm_finalizados': len([nm for nm in nm_seguimientos if nm.get('timestamp_fin')]),
         }
 
-        # Near-miss precision
+        # Near-miss precision = win_rate_rechazos (misma métrica: ¿el bot acertó al rechazar?)
         nm_finalizados = [nm for nm in nm_seguimientos if nm.get('timestamp_fin')]
         if nm_finalizados:
             acertados = sum(1 for nm in nm_finalizados if nm.get('acerto_bot'))
-            metricas['precision_near_miss'] = round(acertados / len(nm_finalizados) * 100, 1)
+            precision = round(acertados / len(nm_finalizados) * 100, 1)
+            metricas['precision_near_miss'] = precision
+            metricas['win_rate_rechazos'] = precision  # ← AÑADIR: misma métrica con nombre diferente
             metricas['bot_acerto'] = acertados
             metricas['bot_fallo'] = len(nm_finalizados) - acertados
+        else:
+            metricas['win_rate_rechazos'] = 0.0  # ← AÑADIR: evitar None
 
         return metricas
 

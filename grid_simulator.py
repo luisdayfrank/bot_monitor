@@ -107,6 +107,17 @@ class SimState:
         # Track de órdenes "fantasma" (parciales pendientes)
         # nivel_precio -> qty_restante
         self.ordenes_fantasma: Dict[str, Decimal] = {}
+        # V7: Separar niveles por dirección (grid neutral real)
+        # Niveles por debajo del precio_inicio = BUY (LONG)
+        # Niveles por encima del precio_inicio = SELL (SHORT)
+        self.niveles_buy: List[Decimal] = []   # Niveles donde colocamos órdenes BUY LIMIT
+        self.niveles_sell: List[Decimal] = []  # Niveles donde colocamos órdenes SELL LIMIT
+        self.precio_referencia = precio_inicio  # Precio al iniciar el grid
+
+        # V7: Órdenes pendientes (take-profit) que se colocan automáticamente
+        # Cuando un BUY se ejecuta en nivel N, se coloca SELL en N+1
+        # Cuando un SELL se ejecuta en nivel N, se coloca BUY en N-1
+        self.ordenes_pendientes: Dict[str, str] = {}  # nivel_str -> 'BUY' | 'SELL'
 
     def contar_posiciones_abiertas(self):
         return sum(1 for p in self.posiciones if p.estado == 'ABIERTA')
@@ -241,6 +252,13 @@ class GridSimulator:
             step = (upper - lower) / Decimal(str(grid_count))
             niveles = [lower + step * i for i in range(grid_count + 1)]
 
+            # V7: Separar niveles por dirección relativa al precio actual
+            # Niveles por debajo = BUY (compras barato)
+            # Niveles por encima = SELL (vendes caro)
+            # El nivel más cercano al precio se ignora (no hay orden en el centro)
+            niveles_buy = [n for n in niveles if n < Decimal(str(precio_actual)) * Decimal('0.9995')]
+            niveles_sell = [n for n in niveles if n > Decimal(str(precio_actual)) * Decimal('1.0005')]
+
             # Calcular qty_por_orden basada en capital / num_grids / precio
             capital = Decimal(str(grid_params.get('capital', CONFIG.grid_default_capital)))
             leverage = Decimal(str(grid_params.get('apalancamiento_sugerido', CONFIG.grid_default_leverage)))
@@ -289,6 +307,18 @@ class GridSimulator:
                 timestamp_inicio=ts,
             )
             self.simulaciones[symbol] = sim
+            # V7: Asignar niveles separados al estado
+            sim.niveles_buy = niveles_buy
+            sim.niveles_sell = niveles_sell
+            sim.precio_referencia = Decimal(str(precio_actual))
+
+            # V7: Inicializar órdenes LIMIT pendientes
+            for n in sim.niveles_buy:
+                sim.ordenes_pendientes[str(float(n))] = 'BUY'
+            for n in sim.niveles_sell:
+                sim.ordenes_pendientes[str(float(n))] = 'SELL'
+
+            print(f"  [GRID_SIM] {symbol} Niveles BUY: {len(niveles_buy)} | Niveles SELL: {len(niveles_sell)}")
 
             print(f"  [GRID_SIM] {symbol} Grid iniciado | ID:{grid_id} | Niveles:{len(niveles)} | "
                   f"Qty/orden:{float(qty_por_orden):.4f} | Precio:${precio_actual:.4f}")
@@ -443,59 +473,80 @@ class GridSimulator:
 
     async def _detectar_cruces(self, sim: SimState, high: Decimal, low: Decimal, close: Decimal, timestamp: int):
         """
-        Detecta si el precio cruzó algún nivel del grid.
-        NOTA: El parámetro `close` se recibe por compatibilidad de interfaz pero se ignora
-        intencionalmente porque la simulación usa ejecución LIMIT:
-        precio_ejecucion = nivel * (1 ± slippage).
+        Detecta si el precio cruzó niveles del grid en la dirección correcta.
+        
+        Grid neutral real:
+        - Niveles BUY (por debajo de precio_inicio): ejecutan cuando precio BAJA y toca el nivel
+        - Niveles SELL (por encima de precio_inicio): ejecutan cuando precio SUBE y toca el nivel
+        - Cuando BUY se ejecuta en N, se coloca SELL LIMIT en N+1 (take-profit)
+        - Cuando SELL se ejecuta en N, se coloca BUY LIMIT en N-1 (take-profit)
         """
         posiciones_abiertas = sim.posiciones_abiertas_list()
 
-        # Si el grid está inactivo, no abrir nuevas posiciones
-        if not sim.activa:
-            # Solo emparejar posiciones existentes
-            await self._emparejar_posiciones(sim, close, timestamp)
-            return
+        # V7: Precio anterior para determinar dirección del cruce
+        precio_anterior = Decimal(str(sim.precio_referencia))
+        if len(sim.posiciones) > 0:
+            # Usar el último precio conocido como referencia
+            ultimo_precio = self.precios_vivo.get(sim.symbol)
+            if ultimo_precio:
+                precio_anterior = Decimal(str(ultimo_precio))
 
-        # Orden de niveles: de abajo hacia arriba
-        niveles_ordenados = sorted(sim.niveles)
-
-        # --- DETECTAR COMPRAS (BUY): precio baja y toca un nivel ---
-        for nivel in niveles_ordenados:
-            if low <= nivel <= high:
+        # --- DETECTAR COMPRAS (BUY): precio baja y toca un nivel BUY ---
+        for nivel in sim.niveles_buy:
+            # BUY se ejecuta si: precio anterior >= nivel AND close <= nivel
+            # (el precio cruzó el nivel hacia abajo)
+            if precio_anterior >= nivel and close <= nivel:
                 # Verificar si ya hay posición abierta en este nivel
                 ya_abierta = any(
-                    p.nivel_precio == nivel and p.estado == 'ABIERTA' and p.tipo == 'LONG'
+                    abs(p.nivel_precio - float(nivel)) < 0.0001 and p.estado == 'ABIERTA' and p.tipo == 'LONG'
                     for p in posiciones_abiertas
                 )
                 if not ya_abierta:
-                    # Verificar orden fantasma (parcial)
-                    qty = sim.qty_por_orden
+                    # Verificar si hay una orden pendiente en este nivel
                     nivel_str = str(float(nivel))
-                    if nivel_str in sim.ordenes_fantasma:
-                        qty = sim.ordenes_fantasma[nivel_str]
-                        del sim.ordenes_fantasma[nivel_str]
+                    if nivel_str in sim.ordenes_pendientes and sim.ordenes_pendientes[nivel_str] == 'BUY':
+                        await self._ejecutar_buy(sim, nivel, close, timestamp)
+                        # Colocar take-profit: SELL en el siguiente nivel superior
+                        siguiente_nivel = self._siguiente_nivel_superior(sim, nivel)
+                        if siguiente_nivel:
+                            sim.ordenes_pendientes[str(float(siguiente_nivel))] = 'SELL'
+                            print(f"  [GRID_SIM] {sim.symbol} Take-profit SELL colocado @ ${float(siguiente_nivel):.4f}")
 
-                    await self._ejecutar_buy(sim, nivel, close, timestamp, qty)
-
-        # --- DETECTAR VENTAS (SELL): precio sube y toca un nivel ---
-        for nivel in reversed(niveles_ordenados):
-            if low <= nivel <= high:
+        # --- DETECTAR VENTAS (SELL): precio sube y toca un nivel SELL ---
+        for nivel in sim.niveles_sell:
+            # SELL se ejecuta si: precio anterior <= nivel AND close >= nivel
+            # (el precio cruzó el nivel hacia arriba)
+            if precio_anterior <= nivel and close >= nivel:
                 ya_abierta = any(
-                    p.nivel_precio == nivel and p.estado == 'ABIERTA' and p.tipo == 'SHORT'
+                    abs(p.nivel_precio - float(nivel)) < 0.0001 and p.estado == 'ABIERTA' and p.tipo == 'SHORT'
                     for p in posiciones_abiertas
                 )
                 if not ya_abierta:
-                    qty = sim.qty_por_orden
                     nivel_str = str(float(nivel))
-                    if nivel_str in sim.ordenes_fantasma:
-                        qty = sim.ordenes_fantasma[nivel_str]
-                        del sim.ordenes_fantasma[nivel_str]
+                    if nivel_str in sim.ordenes_pendientes and sim.ordenes_pendientes[nivel_str] == 'SELL':
+                        await self._ejecutar_sell(sim, nivel, close, timestamp)
+                        # Colocar take-profit: BUY en el siguiente nivel inferior
+                        siguiente_nivel = self._siguiente_nivel_inferior(sim, nivel)
+                        if siguiente_nivel:
+                            sim.ordenes_pendientes[str(float(siguiente_nivel))] = 'BUY'
+                            print(f"  [GRID_SIM] {sim.symbol} Take-profit BUY colocado @ ${float(siguiente_nivel):.4f}")
 
-                    await self._ejecutar_sell(sim, nivel, close, timestamp, qty)
+        # V7: Actualizar precio de referencia para el próximo tick
+        sim.precio_referencia = close
 
-        # --- EMPAREJAR POSICIONES OPUESTAS (FIFO) ---
-        await self._emparejar_posiciones(sim, close, timestamp)
+        # --- EMPAREJAR POSICIONES (take-profit ejecutado) ---
+        await self._emparejar_posiciones(sim, timestamp)
 
+    def _siguiente_nivel_superior(self, sim: SimState, nivel: Decimal) -> Optional[Decimal]:
+        """Devuelve el siguiente nivel superior al dado (para take-profit SELL)."""
+        niveles_superiores = [n for n in sim.niveles if n > nivel]
+        return min(niveles_superiores) if niveles_superiores else None
+
+    def _siguiente_nivel_inferior(self, sim: SimState, nivel: Decimal) -> Optional[Decimal]:
+        """Devuelve el siguiente nivel inferior al dado (para take-profit BUY)."""
+        niveles_inferiores = [n for n in sim.niveles if n < nivel]
+        return max(niveles_inferiores) if niveles_inferiores else None
+        
     async def _ejecutar_buy(self, sim: SimState, nivel: Decimal, precio_actual: Decimal, timestamp: int, qty: Decimal = None):
         """Simula una orden BUY LIMIT ejecutada."""
         qty = qty or sim.qty_por_orden
@@ -525,9 +576,8 @@ class GridSimulator:
         sim.max_posiciones_simultaneas = max(sim.max_posiciones_simultaneas, n_abiertas)
 
         # Log condensado
-        if sim.trades_completados % 10 == 0:
-            print(f"  [GRID_SIM] {sim.symbol} BUY ${float(nivel):.4f} | "
-                  f"Posiciones:{n_abiertas} | PnL:{float(sim.pnl_neto):+.4f}")
+        print(f"  [GRID_SIM] {sim.symbol} BUY ejecutado @ ${float(nivel):.4f} | "
+              f"Posiciones abiertas:{n_abiertas} | PnL acumulado:{float(sim.pnl_neto):+.4f}")
 
         # Auditoría dual
         if self.audit_logger:
@@ -573,9 +623,8 @@ class GridSimulator:
         n_abiertas = sim.contar_posiciones_abiertas()
         sim.max_posiciones_simultaneas = max(sim.max_posiciones_simultaneas, n_abiertas)
 
-        if sim.trades_completados % 10 == 0:
-            print(f"  [GRID_SIM] {sim.symbol} SELL ${float(nivel):.4f} | "
-                  f"Posiciones:{n_abiertas} | PnL:{float(sim.pnl_neto):+.4f}")
+        print(f"  [GRID_SIM] {sim.symbol} SELL ejecutado @ ${float(nivel):.4f} | "
+              f"Posiciones abiertas:{n_abiertas} | PnL acumulado:{float(sim.pnl_neto):+.4f}")
 
         if self.audit_logger:
             await self.audit_logger.log_evento_grid_simulacion(
@@ -592,39 +641,53 @@ class GridSimulator:
                 pnl_acumulado=float(sim.pnl_neto)
             )
 
-    async def _emparejar_posiciones(self, sim: SimState, precio_actual: Decimal, timestamp: int):
+    async def _emparejar_posiciones(self, sim: SimState, timestamp: int):
         """
-        Empareja posiciones LONG y SHORT opuestas (FIFO).
-        Cuando hay ambos tipos abiertos, cierra el par más antiguo.
+        Empareja posiciones LONG y SHORT cuando el take-profit se ejecuta.
+        
+        En un grid neutral real:
+        - Un LONG abierto en nivel N se cierra cuando el precio sube y ejecuta el SELL en N+1
+        - Un SHORT abierto en nivel N se cierra cuando el precio baja y ejecuta el BUY en N-1
+        - El PnL del par = (nivel_sell - nivel_buy) * qty - fees_del_par
         """
         abiertas = sim.posiciones_abiertas_list()
-        longs = [p for p in abiertas if p.tipo == 'LONG']
-        shorts = [p for p in abiertas if p.tipo == 'SHORT']
-
-        # Emparejar hasta que no haya pares
-        pairs = min(len(longs), len(shorts))
-        for i in range(pairs):
-            long_pos = longs[i]
-            short_pos = shorts[i]
-
-            # Cerrar ambas posiciones
-            precio_cierre = float(precio_actual)
-
-            # PnL LONG = (precio_cierre - precio_entrada) * qty
-            pnl_long = (precio_cierre - long_pos.precio_ejecucion) * long_pos.filled_qty
-            # PnL SHORT = (precio_entrada - precio_cierre) * qty
-            pnl_short = (short_pos.precio_ejecucion - precio_cierre) * short_pos.filled_qty
-
-            pnl_total = pnl_long + pnl_short
-
-            long_pos.estado = 'CERRADA'
-            long_pos.pnl_cierre = pnl_long
-            short_pos.estado = 'CERRADA'
-            short_pos.pnl_cierre = pnl_short
-
-            sim.pnl_bruto += Decimal(str(pnl_total))
-            sim.pnl_neto = sim.pnl_bruto - sim.fees_totales
-            sim.trades_completados += 1
+        
+        # V7: Emparejar LONG con SHORT que está en nivel superior (ganancia garantizada)
+        for long_pos in list(abiertas):
+            if long_pos.tipo != 'LONG':
+                continue
+                
+            # Buscar un SHORT abierto en un nivel SUPERIOR al LONG
+            # (el take-profit del LONG es un SELL en nivel superior)
+            for short_pos in list(abiertas):
+                if short_pos.tipo != 'SHORT':
+                    continue
+                if short_pos.estado != 'ABIERTA':
+                    continue
+                    
+                # El SHORT debe estar en nivel > nivel del LONG
+                if short_pos.nivel_precio > long_pos.nivel_precio:
+                    # Cerrar el par
+                    diferencia_niveles = short_pos.nivel_precio - long_pos.nivel_precio
+                    pnl_bruto = diferencia_niveles * long_pos.filled_qty
+                    
+                    # Restar fees del par (2 órdenes)
+                    fee_par = (long_pos.fee_pagada + short_pos.fee_pagada)
+                    pnl_neto = pnl_bruto - fee_par
+                    
+                    long_pos.estado = 'CERRADA'
+                    long_pos.pnl_cierre = pnl_neto / 2  # Distribuir proporcionalmente
+                    short_pos.estado = 'CERRADA'
+                    short_pos.pnl_cierre = pnl_neto / 2
+                    
+                    sim.pnl_bruto += Decimal(str(pnl_bruto))
+                    sim.pnl_neto = sim.pnl_bruto - sim.fees_totales
+                    sim.trades_completados += 1
+                    
+                    print(f"  [GRID_SIM] {sim.symbol} PAR CERRADO | "
+                          f"LONG ${long_pos.nivel_precio:.4f} → SELL ${short_pos.nivel_precio:.4f} | "
+                          f"Diff: {diferencia_niveles:.4f} | PnL: {pnl_neto:+.4f}")
+                    break  # Solo emparejar una vez por LONG
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # KILL SWITCH INTELIGENTE (MEJORA #2)
@@ -647,38 +710,35 @@ class GridSimulator:
         print(f"  [KILL_SWITCH] {symbol} {posicion.tipo} ${posicion.precio_ejecucion:.4f} "
               f"Razón:{razon_cierre}")
 
-        while intentos < max_intentos:
-            # Fase 1: Intentar con slippage escalado (0.1% → 0.5%)
-            slippage_intento = sim.slippage_base * Decimal(str(intentos + 1))
-            slippage_intento = min(slippage_intento, slippage_max)
+        # Fase 1: Intentar LIMIT con slippage normal (0.5%)
+        slippage_intento = slippage_max  # 0.5% directamente
 
-            if posicion.tipo == 'LONG':
-                precio_limite = Decimal(str(posicion.precio_ejecucion)) * (Decimal('1') + slippage_intento)
-            else:
-                precio_limite = Decimal(str(posicion.precio_ejecucion)) * (Decimal('1') - slippage_intento)
+        if posicion.tipo == 'LONG':
+            precio_limite = Decimal(str(posicion.precio_ejecucion)) * (Decimal('1') + slippage_intento)
+        else:
+            precio_limite = Decimal(str(posicion.precio_ejecucion)) * (Decimal('1') - slippage_intento)
 
-            # Simular: ¿se llenó? (asumimos que sí si el precio actual está cerca)
-            precio_diff = abs(float(precio_actual) - float(precio_limite)) / float(precio_limite)
-            if precio_diff <= float(slippage_absoluto):
-                # Éxito con LIMIT
-                fee = float(precio_limite) * posicion.filled_qty * float(sim.fee_rate)
-                pnl = self._calcular_pnl(posicion, float(precio_limite))
+        # Simular: ¿se llenó? (asumimos que sí si el precio actual está dentro del rango)
+        precio_diff = abs(float(precio_actual) - float(precio_limite)) / float(precio_limite)
+        if precio_diff <= float(slippage_absoluto):
+            # Éxito con LIMIT
+            fee = float(precio_limite) * posicion.filled_qty * float(sim.fee_rate)
+            pnl = self._calcular_pnl(posicion, float(precio_limite))
 
-                posicion.estado = 'CERRADA'
-                posicion.pnl_cierre = pnl
-                sim.pnl_bruto += Decimal(str(pnl))
-                sim.fees_totales += Decimal(str(fee))
-                sim.pnl_neto = sim.pnl_bruto - sim.fees_totales
-                sim.slippage_total += slippage_intento
-                sim.trades_kill_switch += 1
+            posicion.estado = 'CERRADA'
+            posicion.pnl_cierre = pnl
+            sim.pnl_bruto += Decimal(str(pnl))
+            sim.fees_totales += Decimal(str(fee))
+            sim.pnl_neto = sim.pnl_bruto - sim.fees_totales
+            sim.slippage_total += slippage_intento
+            sim.trades_kill_switch += 1
 
-                print(f"  [KILL_SWITCH] {symbol} CERRADO intento {intentos+1}/{max_intentos} "
-                      f"@ ${float(precio_limite):.4f} slippage:{float(slippage_intento):.4f} "
-                      f"PnL:{pnl:+.4f}")
-                return True
+            print(f"  [KILL_SWITCH] {symbol} CERRADO con LIMIT @ ${float(precio_limite):.4f} "
+                  f"slippage:{float(slippage_intento):.4f} PnL:{pnl:+.4f}")
+            return True
 
-            intentos += 1
-            await asyncio.sleep(0.01)  # Simular delay sin bloquear
+        # Si LIMIT no se llena, pasar directamente a MARKET order
+        print(f"  [KILL_SWITCH] {symbol} LIMIT no llenado, pasando a MARKET order")
 
         # V5.9.2 MEJORA #2: Último recurso — market order con 2% slippage
         slippage_ultimo = abs(float(precio_actual) - posicion.precio_ejecucion) / posicion.precio_ejecucion

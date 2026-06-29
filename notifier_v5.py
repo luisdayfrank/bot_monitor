@@ -80,8 +80,6 @@ class Notifier:
             print(f"  📤 Telegram: {mensaje[:45]}...")
         else:
             print(f"  ❌ [TELEGRAM] Falló envío de mensaje ({len(mensaje)} chars)")
-        if enviado:
-            print(f"  📤 Telegram: {mensaje[:45]}...")
 
     async def enviar_archivo_telegram(self, filepath: str, caption: str = ""):
         if not self.bot or not CONFIG.telegram_chat_id:

@@ -126,7 +126,7 @@ class Config(BaseModel):
     # ═══════════════════════════════════════════════════════════════════════════════
 
     # Grid params base
-    grid_min_grids: int = 15
+    grid_min_grids: int = 5
     grid_max_grids_hard: int = 50      # Cap absoluto para evitar saturación API
     grid_fee_rate: float = 0.0005
     grid_slippage: float = 0.0005
