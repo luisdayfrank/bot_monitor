@@ -120,7 +120,8 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
-notifier = Notifier()
+# FASE 5 FIX: El notifier se inyecta desde main.py vía app.state
+# notifier = Notifier()  ← ELIMINADO (era instancia huérfana sin signal_generator)
 
 
 @app.websocket("/ws")
@@ -628,7 +629,12 @@ async def toggle_coin(request: Request):
             + f"{symbol}: {'✅' if active else '❌'} {status_text}\n"
             + "⚠️ Ejecuta <code>/restart</code> para aplicar cambios."
         )
-        await notifier.enviar_telegram(msg_text)
+        # FASE 5 FIX: Usar notifier desde app.state (instancia real de main.py)
+        _notifier_rest = getattr(request.app.state, 'notifier', None)
+        if _notifier_rest:
+            await _notifier_rest.enviar_telegram(msg_text)
+        else:
+            print("  [API] Notifier no disponible en app.state")
 
         await manager.broadcast_json({
             "msg_type": "coin_config_update",
@@ -677,7 +683,12 @@ async def toggle_all_coins(request: Request):
             + f"Monedas afectadas: {len(changed)}\n"
             + "⚠️ Ejecuta <code>/restart</code> para aplicar cambios."
         )
-        await notifier.enviar_telegram(msg_text)
+        # FASE 5 FIX: Usar notifier desde app.state (instancia real de main.py)
+        _notifier_rest = getattr(request.app.state, 'notifier', None)
+        if _notifier_rest:
+            await _notifier_rest.enviar_telegram(msg_text)
+        else:
+            print("  [API] Notifier no disponible en app.state")
 
         update_payload = {symbol: {"active": active} for symbol in changed}
         await manager.broadcast_json({
@@ -699,23 +710,41 @@ async def toggle_all_coins(request: Request):
 
 async def orquestador_eventos(queue_eventos: asyncio.Queue, precios_vivo: dict,
                                indicadores_1m: dict, indicadores_15m: dict,
-                               indicadores_4h: dict, signal_states: dict):
+                               indicadores_4h: dict, signal_states: dict,
+                               notifier=None):
+    # FASE 5 FIX: Usar el notifier pasado desde main.py (ya no hay global)
+    _notifier = notifier
     async def escuchar_alertas():
         while True:
             evento = await queue_eventos.get()
+            # FASE 6 FIX: Confirmar en consola que el evento llegó al orquestador
+            print(f"  [ORQUESTADOR] Evento recibido: {evento.get('tipo', 'UNKNOWN')} {evento.get('symbol', 'UNKNOWN')}")
             try:
                 await guardar_alerta(
-                    symbol=evento['symbol'], tipo=evento['tipo'], direccion=evento['direction'],
-                    score=evento['score'], mensaje=str(evento.get('rechazos', [])),
-                    params_json=safe_json_dumps(evento.get('params', {})), precio=evento['price']
+                    symbol=evento.get('symbol'), tipo=evento.get('tipo'), 
+                    direccion=evento.get('direction'),
+                    score=evento.get('score'), mensaje=str(evento.get('rechazos', [])),
+                    params_json=safe_json_dumps(evento.get('params') or {}), 
+                    precio=evento.get('price')
                 )
+                print(f"  [ORQUESTADOR] Alerta guardada en DB: {evento.get('tipo')} {evento.get('symbol')}")
             except Exception as e:
-                logger.warning(f"Error guardando alerta: {e}")
+                logger.exception(f"Error guardando alerta en DB: {e}")
+                print(f"  ❌ [ORQUESTADOR] ERROR guardando alerta DB: {e}")
 
             try:
-                await notifier.procesar_alerta(evento)
+                await _notifier.procesar_alerta(evento)
             except Exception as e:
-                logger.warning(f"Error notificando alerta: {e}")
+                # FASE 3 FIX: Traceback completo + notificación de fallback
+                logger.exception(f"ERROR notificando alerta {evento.get('tipo')} para {evento.get('symbol')}: {e}")
+                print(f"  ❌ [ORQUESTADOR] ERROR alerta {evento.get('tipo')} {evento.get('symbol')}: {e}")
+                try:
+                    await _notifier.enviar_telegram(
+                        f"⚠️ <b>Error procesando alerta {evento.get('tipo')}</b> para {evento.get('symbol')}\n"
+                        f"<code>{str(e)[:200]}</code>"
+                    )
+                except Exception:
+                    pass
 
             await manager.broadcast_json({
                 "msg_type": "alerta",
