@@ -17,6 +17,9 @@ class SignalState:
         self.ultimo_score = 0
         self.ultimos_params = None
         self.ultimo_disparo_timestamp_15m = 0
+        self.ultimo_disparo_precio = 0.0
+        self.ultimo_disparo_direccion = None
+        self.ultimo_disparo_evaluado = False
         self.filtro_macro_aprobado = False
         self.direccion_filtro = None
         self.ultimo_filtro_timestamp = 0
@@ -188,7 +191,7 @@ class SignalGenerator:
     # FASE 5: GRID NEUTRAL — EVALUACION DE ENTRADA
     # ═══════════════════════════════════════════════════════════════════════════════
     # ═══════════════════════════════════════════════════════════════════════════════
-    def evaluar_grid_neutro(self, symbol: str, i15: dict, coin_config: dict) -> Tuple[bool, str]:
+    def evaluar_grid_neutro(self, symbol: str, i15: dict) -> Tuple[bool, str]:
         """
         Evalua las 5 condiciones de entrada al estado NEUTRAL_GRID.
         Retorna: (entrar, razon)
@@ -216,15 +219,17 @@ class SignalGenerator:
         elif rsi > CONFIG.grid_neutral_rsi_max:
             rechazos.append(f"RSI {rsi:.1f} > {CONFIG.grid_neutral_rsi_max} (sobrecompra)")
 
-        # 3. ATR percentil moderado
+        # 3. ATR percentil moderado (usa config, no hardcode)
         atr = i15.get('atr', 0)
         atr_hist = self._atr15m_historico.get(symbol, [])
+        atr_pct_min = CONFIG.grid_neutral_atr_percentil_min
+        atr_pct_max = CONFIG.grid_neutral_atr_percentil_max
         if len(atr_hist) >= 20 and atr > 0:
-            atr_p = np.percentile(atr_hist, [30, 70])
+            atr_p = np.percentile(atr_hist, [atr_pct_min, atr_pct_max])
             if atr < atr_p[0]:
-                rechazos.append(f"ATR {atr:.6f} < p30 {atr_p[0]:.6f} (volatilidad muy baja)")
+                rechazos.append(f"ATR {atr:.6f} < p{atr_pct_min:.0f} {atr_p[0]:.6f} (volatilidad muy baja)")
             elif atr > atr_p[1]:
-                rechazos.append(f"ATR {atr:.6f} > p70 {atr_p[1]:.6f} (volatilidad muy alta)")
+                rechazos.append(f"ATR {atr:.6f} > p{atr_pct_max:.0f} {atr_p[1]:.6f} (volatilidad muy alta)")
 
         # 4. Precio cerca de EMA50
         price = i15.get('close', 0)
@@ -269,10 +274,12 @@ class SignalGenerator:
             if tiempo_min > timeout_moneda:
                 return True, f"Timeout: {tiempo_min:.0f}min > {timeout_moneda}min"
 
-        # 2. ADX explosivo
+        # 2. ADX explosivo (usa delta configurable sobre el umbral de entrada)
         adx = i15.get('adx', 0)
-        if adx > CONFIG.grid_neutral_adx_max:
-            return True, f"ADX {adx:.1f} > {CONFIG.grid_neutral_adx_max} (tendencia emergente)"
+        adx_umbral_entrada = CONFIG.grid_neutral_adx_max
+        adx_umbral_aborto = adx_umbral_entrada + CONFIG.grid_neutral_aborto_adx_delta
+        if adx > adx_umbral_aborto:
+            return True, f"ADX {adx:.1f} > {adx_umbral_aborto:.1f} (umbral entrada {adx_umbral_entrada} + delta {CONFIG.grid_neutral_aborto_adx_delta})"
 
         # 3. RSI extremo
         rsi = i15.get('rsi', 50)
@@ -717,6 +724,11 @@ class SignalGenerator:
             umbral_entrada = self.UMBRAL_BLOQUEADO_ADX_BAJO
             umbral_mantenimiento = self.UMBRAL_BLOQUEADO_ADX_BAJO
             umbral_bloqueado = True
+        elif adx_piso <= adx < self.ADX_RECHAZO_MIN:
+            # Gap 17-20: ADX muy bajo para operar, no bloqueado pero penalizado
+            score_macro += 5
+            umbral_entrada = 80
+            umbral_mantenimiento = self.SCORE_MANTENIMIENTO_ARMED
         elif self.ADX_RECHAZO_MIN <= adx < 25:
             score_macro += 10
             umbral_entrada = 75
@@ -851,12 +863,6 @@ class SignalGenerator:
 
         await self._evaluar_despausa_automatica(symbol, state, score_macro)
 
-        if state.moneda_pausada and not state.moneda_pausada_manual:
-            state.filtro_macro_aprobado = False
-            await self._log_continuo(symbol, i15)
-            await self._evaluar_near_misses(symbol, score_macro, score_minimo, rechazos, direction, filtro_aprobado)
-            return
-
         # FASE 4: Umbral dinamico por volatilidad historica
         if state.estado == 'ARMED':
             umbral_dinamico = self._calcular_umbral_dinamico(symbol)
@@ -867,12 +873,18 @@ class SignalGenerator:
         else:
             # Para entrada, aplicar umbral base dinamico
             atr_percentil = self._get_atr_percentil(symbol)
-            coin_config = CONFIG.coin_registry.get(symbol, {})
-            umbral_base_dinamico = self.calcular_umbral_base(symbol, atr_percentil, coin_config)
+            umbral_base_dinamico = self.calcular_umbral_base(symbol, atr_percentil, coin_cfg)
             score_minimo = umbral_base_dinamico
 
         base_aprobado = len(rechazos) == 0 and direction != 'NEUTRAL'
         filtro_aprobado = base_aprobado and score_macro >= score_minimo
+
+        # Si sigue auto-pausada tras calcular el umbral, loguear y salir sin tocar estado
+        if state.moneda_pausada and not state.moneda_pausada_manual:
+            state.filtro_macro_aprobado = False
+            await self._log_continuo(symbol, i15)
+            await self._evaluar_near_misses(symbol, score_macro, score_minimo, rechazos, direction, filtro_aprobado)
+            return
 
         # ═══════════════════════════════════════════════════════════════════════════════
         # FASE 5: TRANSICION A NEUTRAL_GRID
@@ -891,7 +903,7 @@ class SignalGenerator:
                 print(f"  [NEUTRAL_GRID] {symbol} Grid neutral BLOQUEADO por Circuit Breaker activo")
             else:
                 coin_config = CONFIG.coin_registry.get(symbol, {})
-                entrar_grid, razon_grid = self.evaluar_grid_neutro(symbol, i15, coin_config)
+                entrar_grid, razon_grid = self.evaluar_grid_neutro(symbol, i15)
                 if entrar_grid and state.estado != 'NEUTRAL_GRID':
                     # F2.2: Limpiar flags anteriores antes de entrar a NEUTRAL_GRID
                     state.filtro_macro_aprobado = False
@@ -967,7 +979,7 @@ class SignalGenerator:
             # V5.9.2: Notificar al simulador para finalizar grid
             if self.grid_simulator:
                 await self.grid_simulator.queue.put({
-                    'tipo': 'FINALIZAR_GRID',
+                    'tipo': 'CERRAR_GRID_SUAVE',
                     'symbol': symbol,
                     'razon': 'direccion_detectada'
                 })
@@ -1170,6 +1182,35 @@ class SignalGenerator:
                     state._prev_estado = 'MONITOREO'
                 print(f"  [PAUSA] {symbol} -> MONITOREO (pausa {tipo_pausa} activa)")
             return
+
+        # CIRCUIT BREAKER: Evaluar rentabilidad del último disparo (Bug Crítico #3)
+        if state.ultimo_disparo_precio > 0 and not state.ultimo_disparo_evaluado:
+            price_actual = self.indicadores_1m.get(symbol, {}).get('close', 0)
+            if price_actual > 0:
+                if state.ultimo_disparo_direccion == 'SHORT':
+                    if price_actual > state.ultimo_disparo_precio * 1.003:
+                        state.disparos_consecutivos += 1
+                        state.ultimo_disparo_fue_rentable = False
+                        print(f"  [CB] {symbol} Disparo SHORT en pérdida | #{state.disparos_consecutivos}")
+                    else:
+                        state.disparos_consecutivos = 0
+                        state.ultimo_disparo_fue_rentable = True
+                        print(f"  [CB] {symbol} Disparo SHORT rentable | Reset contador")
+                elif state.ultimo_disparo_direccion == 'LONG':
+                    if price_actual < state.ultimo_disparo_precio * 0.997:
+                        state.disparos_consecutivos += 1
+                        state.ultimo_disparo_fue_rentable = False
+                        print(f"  [CB] {symbol} Disparo LONG en pérdida | #{state.disparos_consecutivos}")
+                    else:
+                        state.disparos_consecutivos = 0
+                        state.ultimo_disparo_fue_rentable = True
+                        print(f"  [CB] {symbol} Disparo LONG rentable | Reset contador")
+                
+                state.ultimo_disparo_evaluado = True
+                
+                if state.disparos_consecutivos >= CONFIG.circuit_breaker_disparos:
+                    await self._activar_circuit_breaker(symbol)
+                    return
 
         # FASE 5: Si esta en NEUTRAL_GRID, evaluar aborto de emergencia por precio 1m
         # El aborto macro (ADX/RSI/EMA) se evalua en el loop principal (run) con evaluar_aborto_neutral_grid
@@ -1435,6 +1476,10 @@ class SignalGenerator:
         state.ultima_direccion = direction
         state.ultimo_score = score
         state.ultimos_params = params
+        # Guardar datos para evaluación de Circuit Breaker (Bug Crítico #3)
+        state.ultimo_disparo_precio = price
+        state.ultimo_disparo_direccion = direction
+        state.ultimo_disparo_evaluado = False
 
         score_min_usado = self._calcular_umbral_dinamico(symbol)
         umbral_info = f" | Umbral: {score_min_usado}" if score_min_usado != self.SCORE_DISPARO_MIN else ""
@@ -1493,6 +1538,9 @@ class SignalGenerator:
                 score_disparo=score
             )
 
+        # FASE 6 FIX: Doble candado para FIRE (nunca emitir params=None)
+        if params is None:
+            params = {}
         await self.emitir_alerta(symbol, 'FIRE', direction, score, [], params, price)
 
         await asyncio.sleep(0.1)
@@ -1547,8 +1595,9 @@ class SignalGenerator:
         step_usdt = rango_total / grid_count if grid_count > 0 else 0
         step_pct = (step_usdt / price) * 100 if price > 0 else 0
 
-        comisiones_ciclo = 2 * CONFIG.grid_fee_rate
-        breakeven = (comisiones_ciclo + CONFIG.grid_slippage) * 100
+        comisiones_ciclo = 2 * CONFIG.grid_fee_rate          # 0.10% (2 órdenes × 0.05%)
+        slippage_total = 2 * CONFIG.grid_slippage              # 0.10% (2 órdenes × 0.05%)
+        breakeven = (comisiones_ciclo + slippage_total) * 100  # 0.20% costo real por par
         margen_seguridad = breakeven * CONFIG.grid_breakeven_mult
 
         auto_compressed = False
@@ -1678,7 +1727,8 @@ class SignalGenerator:
                 score += 15
             elif i1m['rsi_7'] > 75:
                 score += 10
-            vol_ratio = i1m['volume'] / i1m.get('volume_sma20', i1m['volume'])
+            vol_sma = i1m.get('volume_sma20') or i1m['volume'] or 1
+            vol_ratio = i1m['volume'] / vol_sma
             if vol_ratio > 1.5:
                 score += 5
             atr1m = i1m.get('atr_1m', 0)

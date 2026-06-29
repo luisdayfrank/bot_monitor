@@ -78,6 +78,9 @@ def get_coin_config(symbol: str) -> dict:
         'volume_threshold': _validar(
             raw.get('volume_threshold'), float, _RANGOS['volume_threshold'], 0.6
         ),
+        'base_threshold': _validar(
+            raw.get('base_threshold'), int, (30, 95), 70
+        ),
     }
 
     _CACHE[symbol] = config

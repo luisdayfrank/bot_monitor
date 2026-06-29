@@ -224,7 +224,7 @@ class Config(BaseModel):
     # Activar estrategia de grid en mercados neutrales
     grid_neutral_enabled: bool = True  # Toggle global, sin confirmación manual
     # Tiempo máximo en estado NEUTRAL_GRID antes de aborto automático
-    grid_neutral_timeout_min: int = 15
+    grid_neutral_timeout_min: int = 90
     # Aborto si ADX sube +5 sobre umbral de entrada
     grid_neutral_aborto_adx_delta: float = 5.0
     # Aborto si precio se mueve >2% de EMA50/200

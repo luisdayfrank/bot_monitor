@@ -711,7 +711,7 @@ class AuditReporter:
         total_continuos = sum(len([e for e in evs if e['tipo'] == 'CONTINUO']) for evs in eventos_por_moneda.values())
         total_near_miss = sum(len([e for e in evs if e['tipo'] == 'NEAR_MISS']) for evs in eventos_por_moneda.values())
         # FASE 5: Contar eventos de grid neutral
-        total_neutral_grid = sum(len([e for e in evs if e['tipo'] in ('NEUTRAL_GRID', 'NEUTRAL_GRID_ABORT')]) for evs in eventos_por_moneda.values())
+        total_neutral_grid = sum(len([e for e in evs if e['tipo'].startswith('NEUTRAL_GRID_')]) for evs in eventos_por_moneda.values())
         # V5.7: Near-miss seguimientos finalizados
         total_nm_seguimientos_finalizados = len([nm for nm in near_miss_seguimientos if nm.get('timestamp_fin') is not None])
         total_nm_acertados = len([nm for nm in near_miss_seguimientos if nm.get('acerto_bot') == 1])

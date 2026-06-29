@@ -85,6 +85,8 @@ async def lifespan(fastapi_app):
     app.state.signal_generator = signals
     # V5.9.2: Exponer grid_simulator para endpoint /api/grid-neutral/{symbol}
     app.state.grid_simulator = grid_simulator
+    # FASE 5 FIX: Exponer notifier real para endpoints REST
+    app.state.notifier = notifier
 
     # V5.9.2 MEJORA #6: Limpiar grids huérfanos al arranque
     print("  🧹 V5.9.2: Limpiando grids huérfanos...")
@@ -101,7 +103,8 @@ async def lifespan(fastapi_app):
         indicadores_1m=signals.indicadores_1m,
         indicadores_15m=signals.indicadores_15m,
         indicadores_4h=signals.indicadores_4h,
-        signal_states=signals.states
+        signal_states=signals.states,
+        notifier=notifier  # FASE 1 FIX: Pasar la instancia real con signal_generator configurado
     ))
 
     # V5.9.2: Tarea del simulador de grid neutral
@@ -118,11 +121,13 @@ async def lifespan(fastapi_app):
                     if st and st.estado == 'NEUTRAL_GRID' and symbol in precios_vivo:
                         i1m = signals.indicadores_1m.get(symbol, {})
                         precio = precios_vivo[symbol]
-                        # Usar high/low del indicador 1m o estimar desde precio
-                        # F3.2: Usar datos reales de vela 1m, nunca estimados
-                        high = i1m.get('high', precio)
-                        low = i1m.get('low', precio)
-                        close = i1m.get('close', precio)
+                        # FASE 6 FIX: Nunca estimar high/low desde precio spot
+                        high = i1m.get('high')
+                        low = i1m.get('low')
+                        close = i1m.get('close')
+                        if high is None or low is None or close is None:
+                            print(f"  [GRID_TICKER] {symbol} Sin vela 1m real, saltando tick")
+                            continue
                         # F3.2: Usar timestamp real de la vela 1m
                         ts_raw = i1m.get('timestamp')
                         if ts_raw and ts_raw > 1e12:

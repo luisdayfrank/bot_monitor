@@ -66,7 +66,20 @@ class Notifier:
         return False
 
     async def enviar_telegram(self, mensaje: str):
+        # FASE 3 FIX: Rastreo de flujo para diagnóstico
+        print(f"  [TELEGRAM] Enviando mensaje ({len(mensaje)} chars): {mensaje[:60]}...")
+        
+        # FASE 4 FIX: Truncar mensajes que excedan el límite de Telegram (4096 chars)
+        # Dejamos margen de 96 chars para el tag de truncamiento
+        if len(mensaje) > 4000:
+            print(f"  [TELEGRAM] Mensaje truncado de {len(mensaje)} a 4000 chars")
+            mensaje = mensaje[:4000] + "\n\n<i>[Mensaje truncado por límite de Telegram]</i>"
+        
         enviado = await self._enviar_con_reintentos(mensaje)
+        if enviado:
+            print(f"  📤 Telegram: {mensaje[:45]}...")
+        else:
+            print(f"  ❌ [TELEGRAM] Falló envío de mensaje ({len(mensaje)} chars)")
         if enviado:
             print(f"  📤 Telegram: {mensaje[:45]}...")
 
@@ -115,8 +128,18 @@ class Notifier:
     # FASE 5: PROCESAR ALERTA
     # ═══════════════════════════════════════════════════════════════════════════════
     async def procesar_alerta(self, evento: dict):
-        symbol = evento['symbol']
-        tipo = evento['tipo']
+        # FASE 3 FIX: Rastreo de flujo para diagnóstico
+        symbol = evento.get('symbol', 'UNKNOWN')
+        tipo = evento.get('tipo', 'UNKNOWN')
+        print(f"  [NOTIFIER] Procesando alerta: {tipo} | {symbol} | precio={evento.get('price')}")
+        
+        # Validación defensiva de entrada
+        if not isinstance(evento, dict):
+            print(f"  ❌ [NOTIFIER] evento no es dict: {type(evento)}")
+            return
+        if not symbol or not tipo:
+            print(f"  ❌ [NOTIFIER] evento incompleto: symbol={symbol} tipo={tipo}")
+            return
         dir_ = evento['direction']
         score = evento['score']
         price = evento['price']
@@ -160,8 +183,8 @@ class Notifier:
 
         elif tipo == 'NEUTRAL_GRID':
             titulo = f"GRID NEUTRAL {symbol}"
-            i15 = evento.get('indicadores_15m', {})
-            p = evento.get('params', {})
+            i15 = evento.get('indicadores_15m') or {}
+            p = evento.get('params') or {}  # FASE 2 FIX: Proteger contra params=None
             adx = i15.get('adx')
             rsi = i15.get('rsi')
 

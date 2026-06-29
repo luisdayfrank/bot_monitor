@@ -155,8 +155,9 @@ class DataCollector:
         for symbol in CONFIG.symbols:
             # ─── 1M ───
             try:
-                klines = self.client.get_historical_klines(
-                    symbol, Client.KLINE_INTERVAL_1MINUTE, 
+                klines = await asyncio.to_thread(
+                    self.client.get_historical_klines,
+                    symbol, Client.KLINE_INTERVAL_1MINUTE,
                     f"{CONFIG.max_velas_1m} minutes ago UTC"
                 )
                 velas = []
@@ -184,8 +185,9 @@ class DataCollector:
 
             # ─── 15M ───
             try:
-                klines = self.client.get_historical_klines(
-                    symbol, Client.KLINE_INTERVAL_15MINUTE, 
+                klines = await asyncio.to_thread(
+                    self.client.get_historical_klines,
+                    symbol, Client.KLINE_INTERVAL_15MINUTE,
                     f"{CONFIG.max_velas_15m * 15} minutes ago UTC"
                 )
                 velas = []
@@ -212,7 +214,8 @@ class DataCollector:
 
             # ─── 4H ───
             try:
-                klines = self.client.get_historical_klines(
+                klines = await asyncio.to_thread(
+                    self.client.get_historical_klines,
                     symbol, Client.KLINE_INTERVAL_4HOUR,
                     f"{CONFIG.max_velas_4h * 4} hours ago UTC"
                 )
