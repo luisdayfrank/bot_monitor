@@ -601,12 +601,12 @@
                     const elFinalizados = document.getElementById('stat-finalizados');
                     if (elFinalizados) elFinalizados.innerText = data.finalizados_hoy || 0;
                     const winRateEl = document.getElementById('stat-winrate');
-                    if (data.finalizados_hoy > 0) {
+                    if (data.win_rate_estado === "CALCULABLE" && data.win_rate_rechazos !== null) {
                         winRateEl.innerText = data.win_rate_rechazos + '%';
                         winRateEl.className = 'text-3xl font-mono text-green-400';
                     } else {
-                        winRateEl.innerText = 'N/A';
-                        winRateEl.className = 'text-3xl font-mono text-gray-500';
+                        winRateEl.innerText = 'PENDIENTE';
+                        winRateEl.className = 'text-3xl font-mono text-yellow-400';
                     }
                 } else {
                     document.getElementById('stat-fires').innerText = 'ERR';
