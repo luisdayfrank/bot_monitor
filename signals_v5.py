@@ -547,6 +547,20 @@ class SignalGenerator:
                 'rechazos': rechazos,
                 'direccion': direction
             }
+        elif score_macro >= umbral_efectivo * 0.75 and score_macro < umbral_efectivo * self.NEAR_MISS_UMBRAL_PCT:
+            # FIX 0.2: Nuevo tier "EN_ZONA_DE_INTERES" para scores entre 75% y 70% del umbral
+            # Captura oportunidades que estuvieron cerca pero no lo suficiente para "CERCA_DEL_UMBRAL"
+            near_miss = True
+            tipo_near_miss = "EN_ZONA_DE_INTERES"
+            detalle = {
+                'score': score_macro,
+                'umbral': umbral_efectivo,
+                'porcentaje_umbral': round(score_macro / umbral_efectivo * 100, 1),
+                'razon': f'Score al {round(score_macro / umbral_efectivo * 100, 0)}% del umbral — seguimiento preventivo',
+                'rechazos': rechazos,
+                'direccion': direction
+            }
+            state.metricas_dia['veces_cerca_umbral'] += 1
         elif score_macro >= umbral_efectivo * self.NEAR_MISS_UMBRAL_PCT:
             near_miss = True
             if score_macro >= umbral_efectivo * self.NEAR_MISS_MUY_CERCA_PCT:
@@ -742,18 +756,22 @@ class SignalGenerator:
             umbral_entrada = 65
             umbral_mantenimiento = self.SCORE_MANTENIMIENTO_ARMED
 
-        # FASE 3: RSI contextualizado
+        # FASE 3: RSI contextualizado — FIX 0.1
+        # La funcion evaluar_rsi_oxigeno() es la UNICA autoridad.
+        # Se elimina la doble validacion con CONFIG.rsi_macro_* que contradecia
+        # la logica direccional (ej: RSI 32 en SHORT era "PERMITIR" pero luego
+        # CONFIG.rsi_macro_min=45 lo rechazaba).
         rsi_ok = False
         if direction == 'SHORT':
             decision, razon = self.evaluar_rsi_oxigeno(rsi, direction, adx, trend_strength)
-            if decision == "PERMITIR" and CONFIG.rsi_macro_min <= rsi <= CONFIG.rsi_macro_max:
+            if decision == "PERMITIR":
                 score_macro += 20
                 rsi_ok = True
             else:
                 rechazos.append(razon)
         elif direction == 'LONG':
             decision, razon = self.evaluar_rsi_oxigeno(rsi, direction, adx, trend_strength)
-            if decision == "PERMITIR" and CONFIG.rsi_macro_long_min <= rsi <= CONFIG.rsi_macro_long_max:
+            if decision == "PERMITIR":
                 score_macro += 20
                 rsi_ok = True
             else:
