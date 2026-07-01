@@ -429,13 +429,27 @@ async def get_stats_summary(request: Request):
         # Métricas adicionales para transparencia
         seguimientos_activos = total_near_miss - finalizados_hoy
 
+        # FIX 0.3: Win Rate solo calculable cuando hay seguimientos finalizados.
+        # Si no hay finalizados, mostrar "PENDIENTE" en lugar de 0.0 para evitar
+        # interpretacion erronea ("el bot acierta 0%" cuando en realidad es
+        # "aun no hay datos suficientes").
+        if finalizados_hoy > 0:
+            win_rate_val = round(win_rate, 2)
+            win_rate_estado = "CALCULABLE"
+        else:
+            win_rate_val = None
+            win_rate_estado = "PENDIENTE"
+
         return {
             "fires_hoy": fires_hoy,
             "total_near_miss": total_near_miss,
             "finalizados_hoy": finalizados_hoy,
             "seguimientos_activos": seguimientos_activos,
             "aciertos_bot": aciertos,
-            "win_rate_rechazos": round(win_rate, 2),
+            "win_rate_rechazos": win_rate_val,
+            "win_rate_estado": win_rate_estado,
+            "mensaje": f"{seguimientos_activos} seguimiento(s) en curso (2h). "
+                       f"Win Rate calculable cuando finalicen.",
             "estado": "success"
         }
     except Exception as e:
