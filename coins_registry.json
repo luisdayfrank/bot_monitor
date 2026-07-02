@@ -74,7 +74,7 @@
   "TRXUSDT": {
     "active": 1,
     "category": "peso_pesado",
-    "volume_threshold": 0.8,
+    "volume_threshold": 0.4,
     "adx_reject": 45.0,
     "mfm_umbral": 0.25,
     "grid_timeout": 30
@@ -162,7 +162,7 @@
   "DOGEUSDT": {
     "active": 1,
     "category": "memecoin",
-    "volume_threshold": 0.6,
+    "volume_threshold": 0.35,
     "adx_reject": 65.0,
     "mfm_umbral": 0.1,
     "grid_timeout": 10
@@ -170,7 +170,7 @@
   "SHIBUSDT": {
     "active": 0,
     "category": "memecoin",
-    "volume_threshold": 0.6,
+    "volume_threshold": 0.3,
     "adx_reject": 65.0,
     "mfm_umbral": 0.1,
     "grid_timeout": 10
@@ -178,7 +178,7 @@
   "PEPEUSDT": {
     "active": 0,
     "category": "memecoin",
-    "volume_threshold": 0.6,
+    "volume_threshold": 0.3,
     "adx_reject": 65.0,
     "mfm_umbral": 0.1,
     "grid_timeout": 10
@@ -186,7 +186,7 @@
   "WIFUSDT": {
     "active": 1,
     "category": "memecoin",
-    "volume_threshold": 0.6,
+    "volume_threshold": 0.3,
     "adx_reject": 65.0,
     "mfm_umbral": 0.1,
     "grid_timeout": 10
@@ -194,7 +194,7 @@
   "BONKUSDT": {
     "active": 0,
     "category": "memecoin",
-    "volume_threshold": 0.6,
+    "volume_threshold": 0.3,
     "adx_reject": 65.0,
     "mfm_umbral": 0.1,
     "grid_timeout": 10
@@ -202,7 +202,7 @@
   "FLOKIUSDT": {
     "active": 0,
     "category": "memecoin",
-    "volume_threshold": 0.6,
+    "volume_threshold": 0.3,
     "adx_reject": 65.0,
     "mfm_umbral": 0.1,
     "grid_timeout": 10
@@ -210,7 +210,7 @@
   "MEMEUSDT": {
     "active": 1,
     "category": "memecoin",
-    "volume_threshold": 0.6,
+    "volume_threshold": 0.3,
     "adx_reject": 65.0,
     "mfm_umbral": 0.1,
     "grid_timeout": 10
@@ -218,7 +218,7 @@
   "BOMEUSDT": {
     "active": 0,
     "category": "memecoin",
-    "volume_threshold": 0.6,
+    "volume_threshold": 0.3,
     "adx_reject": 65.0,
     "mfm_umbral": 0.1,
     "grid_timeout": 10
@@ -226,7 +226,7 @@
   "ORDIUSDT": {
     "active": 0,
     "category": "memecoin",
-    "volume_threshold": 0.6,
+    "volume_threshold": 0.35,
     "adx_reject": 65.0,
     "mfm_umbral": 0.1,
     "grid_timeout": 10
@@ -234,7 +234,7 @@
   "1000SATSUSDT": {
     "active": 0,
     "category": "memecoin",
-    "volume_threshold": 0.6,
+    "volume_threshold": 0.3,
     "adx_reject": 65.0,
     "mfm_umbral": 0.1,
     "grid_timeout": 10
@@ -242,7 +242,7 @@
   "ZECUSDT": {
     "active": 1,
     "category": "clasica_privacidad",
-    "volume_threshold": 0.3,
+    "volume_threshold": 0.4,
     "adx_reject": 50.0,
     "mfm_umbral": 0.2,
     "grid_timeout": 20
@@ -250,7 +250,7 @@
   "LTCUSDT": {
     "active": 1,
     "category": "clasica_privacidad",
-    "volume_threshold": 0.3,
+    "volume_threshold": 0.4,
     "adx_reject": 50.0,
     "mfm_umbral": 0.2,
     "grid_timeout": 20
@@ -258,7 +258,7 @@
   "BCHUSDT": {
     "active": 1,
     "category": "clasica_privacidad",
-    "volume_threshold": 0.3,
+    "volume_threshold": 0.4,
     "adx_reject": 50.0,
     "mfm_umbral": 0.2,
     "grid_timeout": 20
@@ -266,7 +266,7 @@
   "ETCUSDT": {
     "active": 1,
     "category": "clasica_privacidad",
-    "volume_threshold": 0.3,
+    "volume_threshold": 0.4,
     "adx_reject": 50.0,
     "mfm_umbral": 0.2,
     "grid_timeout": 20
@@ -274,7 +274,7 @@
   "EOSUSDT": {
     "active": 0,
     "category": "clasica_privacidad",
-    "volume_threshold": 0.3,
+    "volume_threshold": 0.4,
     "adx_reject": 50.0,
     "mfm_umbral": 0.2,
     "grid_timeout": 20
@@ -282,7 +282,7 @@
   "XLMUSDT": {
     "active": 1,
     "category": "clasica_privacidad",
-    "volume_threshold": 0.3,
+    "volume_threshold": 0.4,
     "adx_reject": 50.0,
     "mfm_umbral": 0.2,
     "grid_timeout": 20
@@ -290,7 +290,7 @@
   "VETUSDT": {
     "active": 0,
     "category": "clasica_privacidad",
-    "volume_threshold": 0.3,
+    "volume_threshold": 0.4,
     "adx_reject": 50.0,
     "mfm_umbral": 0.2,
     "grid_timeout": 20
@@ -298,7 +298,7 @@
   "THETAUSDT": {
     "active": 0,
     "category": "clasica_privacidad",
-    "volume_threshold": 0.3,
+    "volume_threshold": 0.4,
     "adx_reject": 50.0,
     "mfm_umbral": 0.2,
     "grid_timeout": 20
@@ -306,7 +306,7 @@
   "ALGOUSDT": {
     "active": 0,
     "category": "clasica_privacidad",
-    "volume_threshold": 0.3,
+    "volume_threshold": 0.4,
     "adx_reject": 50.0,
     "mfm_umbral": 0.2,
     "grid_timeout": 20
@@ -314,7 +314,7 @@
   "DASHUSDT": {
     "active": 0,
     "category": "clasica_privacidad",
-    "volume_threshold": 0.3,
+    "volume_threshold": 0.4,
     "adx_reject": 50.0,
     "mfm_umbral": 0.2,
     "grid_timeout": 20

@@ -643,48 +643,45 @@ class GridSimulator:
 
     async def _emparejar_posiciones(self, sim: SimState, timestamp: int):
         """
-        Empareja posiciones LONG y SHORT cuando el take-profit se ejecuta.
-        
-        En un grid neutral real:
-        - Un LONG abierto en nivel N se cierra cuando el precio sube y ejecuta el SELL en N+1
-        - Un SHORT abierto en nivel N se cierra cuando el precio baja y ejecuta el BUY en N-1
-        - El PnL del par = (nivel_sell - nivel_buy) * qty - fees_del_par
+        FASE 2.1: Emparejamiento FIFO de posiciones LONG y SHORT.
+        El LONG más antiguo se empareja primero con el SHORT más antiguo
+        que esté en nivel superior, evitando ocultar pérdidas.
         """
-        abiertas = sim.posiciones_abiertas_list()
-        
-        # V7: Emparejar LONG con SHORT que está en nivel superior (ganancia garantizada)
-        for long_pos in list(abiertas):
-            if long_pos.tipo != 'LONG':
+        # Separar y ordenar por timestamp (FIFO)
+        longs_abiertas = [p for p in sim.posiciones if p.estado == 'ABIERTA' and p.tipo == 'LONG']
+        shorts_abiertas = [p for p in sim.posiciones if p.estado == 'ABIERTA' and p.tipo == 'SHORT']
+        longs_abiertas.sort(key=lambda p: p.timestamp_apertura)
+        shorts_abiertas.sort(key=lambda p: p.timestamp_apertura)
+
+        for long_pos in longs_abiertas:
+            if long_pos.estado != 'ABIERTA':
                 continue
-                
-            # Buscar un SHORT abierto en un nivel SUPERIOR al LONG
-            # (el take-profit del LONG es un SELL en nivel superior)
-            for short_pos in list(abiertas):
-                if short_pos.tipo != 'SHORT':
-                    continue
+
+            for short_pos in shorts_abiertas:
                 if short_pos.estado != 'ABIERTA':
                     continue
-                    
-                # El SHORT debe estar en nivel > nivel del LONG
-                if short_pos.nivel_precio > long_pos.nivel_precio:
+
+                # El SHORT debe estar en nivel superior al LONG (take-profit válido)
+                # y haberse abierto después o al mismo tiempo que el LONG
+                if (short_pos.nivel_precio > long_pos.nivel_precio and
+                    short_pos.timestamp_apertura >= long_pos.timestamp_apertura):
+
                     # Cerrar el par
                     diferencia_niveles = short_pos.nivel_precio - long_pos.nivel_precio
                     pnl_bruto = diferencia_niveles * long_pos.filled_qty
-                    
-                    # Restar fees del par (2 órdenes)
                     fee_par = (long_pos.fee_pagada + short_pos.fee_pagada)
                     pnl_neto = pnl_bruto - fee_par
-                    
+
                     long_pos.estado = 'CERRADA'
-                    long_pos.pnl_cierre = pnl_neto / 2  # Distribuir proporcionalmente
+                    long_pos.pnl_cierre = pnl_neto / 2
                     short_pos.estado = 'CERRADA'
                     short_pos.pnl_cierre = pnl_neto / 2
-                    
+
                     sim.pnl_bruto += Decimal(str(pnl_bruto))
                     sim.pnl_neto = sim.pnl_bruto - sim.fees_totales
                     sim.trades_completados += 1
-                    
-                    print(f"  [GRID_SIM] {sim.symbol} PAR CERRADO | "
+
+                    print(f"  [GRID_SIM] {sim.symbol} PAR CERRADO FIFO | "
                           f"LONG ${long_pos.nivel_precio:.4f} → SELL ${short_pos.nivel_precio:.4f} | "
                           f"Diff: {diferencia_niveles:.4f} | PnL: {pnl_neto:+.4f}")
                     break  # Solo emparejar una vez por LONG
@@ -909,7 +906,8 @@ class GridSimulator:
 
             # Verificar si hay ticks recientes
             segundos_sin_tick = ahora - sim.ultimo_tick_ts
-            if segundos_sin_tick > 300:  # 5 minutos
+            timeout_sin_ticks = CONFIG.grid_neutral_sin_ticks_timeout_min * 60
+            if segundos_sin_tick > timeout_sin_ticks:
                 print(f"  [HEARTBEAT SIM] {symbol} Grid {sim.grid_id} SIN TICKS "
                       f"por {segundos_sin_tick:.0f}s → ABORTADO")
                 if self.audit_logger:

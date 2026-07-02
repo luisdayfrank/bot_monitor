@@ -82,16 +82,14 @@ class Config(BaseModel):
     adx_ideal: tuple = (25, 35)
     adx_reject: float = 55.0
 
-    #nuevo valor asx
-    adx_min_trend: float = 17.0
+    # FASE 1.1: ADX mínimo adaptativo por categoría de moneda
+    adx_min_trend_global: float = 14.0
+    adx_min_trend_memecoin: float = 12.0
+    adx_min_trend_major: float = 15.0
 
-    # RSI Macro 15m: Oxígeno (no gatillo).
-    rsi_macro_min: float = 45.0
-    rsi_macro_max: float = 80.0
-
-    # Para LONG (simetría)
-    rsi_macro_long_max: float = 60.0
-    rsi_macro_long_min: float = 20.0
+    # FASE 1.2: RSI direccional reformulado (solo 2 umbrales extremos)
+    rsi_extremo_short_min: float = 25.0   # Rechazar SHORT si RSI < 25
+    rsi_extremo_long_max: float = 75.0    # Rechazar LONG si RSI > 75
 
     # ─── Gatillo Micro (1m) ───
     rsi_micro_length: int = 7
@@ -224,7 +222,7 @@ class Config(BaseModel):
     # Activar estrategia de grid en mercados neutrales
     grid_neutral_enabled: bool = True  # Toggle global, sin confirmación manual
     # Tiempo máximo en estado NEUTRAL_GRID antes de aborto automático
-    grid_neutral_timeout_min: int = 90
+    grid_neutral_timeout_min: int = 75          # FASE 2.4: Sesión unificada (antes 90)
     # Aborto si ADX sube +5 sobre umbral de entrada
     grid_neutral_aborto_adx_delta: float = 5.0
     # Aborto si precio se mueve >2% de EMA50/200
@@ -290,7 +288,8 @@ class Config(BaseModel):
 
     # V5.9.2 MEJORA #1: Timeout por posición abierta (FIFO)
     # Cerrar posición si lleva N minutos abierta (evita posiciones eternas)
-    grid_neutral_posicion_timeout_min: int = 30
+    grid_neutral_posicion_timeout_min: int = 25  # FASE 2.4: Por posición (antes 30)
+    grid_neutral_sin_ticks_timeout_min: int = 10  # FASE 2.4: Sin ticks (10 min)
 
     # V5.9.2 MEJORA #2: Slippage absoluto de último recurso
     # Si el kill switch falla tras 10 intentos, market order con max 2% slippage
@@ -322,6 +321,35 @@ class Config(BaseModel):
 
     # V5.9.2: Parámetros de simulación virtual
     grid_neutral_sim_max_posiciones: int = 10  # Max posiciones simultáneas en sim
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 4.2: PERFILES DE MONEDA (categorías adaptativas)
+    # ═══════════════════════════════════════════════════════════════════════════════
+    perfiles_moneda: dict = {
+        'memecoin': {
+            'adx_min': 12.0,
+            'volume_threshold': 0.30,
+            'mfm_penalizacion_max': 3,
+            'grid_niveles_max': 5
+        },
+        'altcoin_bajo_vol': {
+            'adx_min': 13.0,
+            'volume_threshold': 0.40,
+            'mfm_penalizacion_max': 5,
+            'grid_niveles_max': 6
+        },
+        'major': {
+            'adx_min': 15.0,
+            'volume_threshold': 0.70,
+            'mfm_penalizacion_max': 7,
+            'grid_niveles_max': 8
+        },
+        'default': {
+            'adx_min': 14.0,
+            'volume_threshold': 0.50,
+            'mfm_penalizacion_max': 5,
+            'grid_niveles_max': 6
+        }
+    }
     grid_neutral_sim_fee_rate: float = 0.0005  # 0.05% fee Binance Futures
     grid_neutral_sim_slippage_base: float = 0.0005  # 0.05% slippage base simulado
 

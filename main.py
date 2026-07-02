@@ -63,6 +63,8 @@ async def lifespan(fastapi_app):
     signals.grid_simulator = grid_simulator
     grid_simulator.audit_logger = audit_logger
     grid_simulator.notifier = notifier
+    signals.notifier = notifier  # FASE 3.2: Para alertas pre-disparo Telegram
+
 
     print("⏳ Cold start en progreso...")
     await collector.cold_start()

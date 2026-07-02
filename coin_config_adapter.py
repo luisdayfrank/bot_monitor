@@ -83,6 +83,15 @@ def get_coin_config(symbol: str) -> dict:
         ),
     }
 
+    # FASE 4.2: Fusionar con perfil de categoría
+    perfil = CONFIG.perfiles_moneda.get(config['category'], CONFIG.perfiles_moneda['default'])
+    config['adx_min'] = perfil['adx_min']
+    config['mfm_penalizacion_max'] = perfil['mfm_penalizacion_max']
+    config['grid_niveles_max'] = perfil['grid_niveles_max']
+    # volume_threshold del registry tiene prioridad; si no existe, usar perfil
+    if raw.get('volume_threshold') is None:
+        config['volume_threshold'] = perfil['volume_threshold']
+
     _CACHE[symbol] = config
     return config
 

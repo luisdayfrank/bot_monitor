@@ -52,6 +52,11 @@ class SignalState:
         # ═══════════════════════════════════════════════════════════════════════════════
         self.neutral_grid_timestamp = 0  # Timestamp de entrada a NEUTRAL_GRID
         self.grid_params_neutral = None  # Parámetros del grid neutral activo
+        # FASE 2.3: Contador de velas consecutivas para aborto de NEUTRAL_GRID
+        self.neutral_grid_dir_consec = 0
+        self.neutral_grid_dir_previa = 'NEUTRAL'        
+
+
         # FASE 5.5: Metricas diarias acumuladas
         self.metricas_dia: dict = {
             'score_max': 0,
@@ -119,41 +124,37 @@ class SignalGenerator:
         coin_config = CONFIG.coin_registry.get(symbol, {})
         return coin_config.get('volume_threshold', 0.7)
 
+    def _calcular_adx_min(self, symbol: str) -> float:
+        """FASE 4.2: Usa adx_min del perfil ya fusionado en get_coin_config."""
+        coin_cfg = get_coin_config(symbol)
+        return coin_cfg.get('adx_min', CONFIG.adx_min_trend_global)
+
     # ═══════════════════════════════════════════════════════════════════════════════
     # FASE 3: RSI CONTEXTUALIZADO
     # ═══════════════════════════════════════════════════════════════════════════════
     def evaluar_rsi_oxigeno(self, rsi: float, direction: str, adx: float, trend_strength: str) -> Tuple[str, str]:
         """
-        Evalua RSI contextualizado segun direccion y fuerza de tendencia.
-        Retorna: (decision, razon)
-        decision: "PERMITIR" o "RECHAZAR"
+        FASE 1.2: RSI direccional reformulado.
+        ÚNICA autoridad. Elimina doble validación con CONFIG.rsi_macro_*.
         """
         if direction == "SHORT":
-            if adx > 25 and trend_strength == "BAJISTA_FUERTE":
-                if rsi < 20:
-                    return "RECHAZAR", f"RSI extremo {rsi:.1f}, posible rebote violento"
-                elif rsi < 40:
-                    return "PERMITIR", f"RSI bajo {rsi:.1f} en tendencia bajista = normal"
-                else:
-                    return "PERMITIR", f"RSI neutral {rsi:.1f} en SHORT"
+            if rsi < CONFIG.rsi_extremo_short_min:
+                return "RECHAZAR", f"RSI sobreventa extrema ({rsi:.1f}) — posible rebote"
+            elif rsi < 40:
+                return "PERMITIR", f"RSI {rsi:.1f} en SHORT — momentum bajista confirmado"
+            elif rsi < 50:
+                return "PERMITIR", f"RSI {rsi:.1f} en SHORT — aceptable"
             else:
-                if rsi < 30:
-                    return "RECHAZAR", f"RSI sobreventa {rsi:.1f} sin tendencia confirmada"
-                else:
-                    return "PERMITIR", f"RSI aceptable {rsi:.1f}"
+                return "RECHAZAR", f"RSI alto {rsi:.1f} para SHORT — momentum alcista interno"
         elif direction == "LONG":
-            if adx > 25 and trend_strength == "ALCISTA_FUERTE":
-                if rsi > 80:
-                    return "RECHAZAR", f"RSI extremo {rsi:.1f}, posible correccion"
-                elif rsi > 60:
-                    return "PERMITIR", f"RSI alto {rsi:.1f} en tendencia alcista = normal"
-                else:
-                    return "PERMITIR", f"RSI neutral {rsi:.1f} en LONG"
+            if rsi > CONFIG.rsi_extremo_long_max:
+                return "RECHAZAR", f"RSI sobrecompra extrema ({rsi:.1f}) — posible correccion"
+            elif rsi > 55:
+                return "PERMITIR", f"RSI {rsi:.1f} en LONG — momentum alcista confirmado"
+            elif rsi > 45:
+                return "PERMITIR", f"RSI {rsi:.1f} en LONG — aceptable"
             else:
-                if rsi > 70:
-                    return "RECHAZAR", f"RSI sobrecompra {rsi:.1f} sin tendencia confirmada"
-                else:
-                    return "PERMITIR", f"RSI aceptable {rsi:.1f}"
+                return "RECHAZAR", f"RSI bajo {rsi:.1f} para LONG — momentum bajista interno"
         else:
             return "PERMITIR", f"RSI {rsi:.1f} en direccion NEUTRAL"
 
@@ -621,159 +622,57 @@ class SignalGenerator:
                     }
                 )
 
-    # ================================================================
-    # CAPA 1: FILTRO MACRO (V5.7 con Fases 1-5)
-    # ================================================================
-    async def evaluar_filtro_macro(self, symbol: str):
-        """Evalua filtro macro con Plan 3.1 - Parametros adaptativos por moneda."""
-        i15 = self.indicadores_15m.get(symbol)
-        i4h = self.indicadores_4h.get(symbol)
-        state = self.states[symbol]
-
-        # PLAN 3.1: Extraer parametros adaptativos O(1)
-        coin_cfg = get_coin_config(symbol)
-        adx_techo = coin_cfg['adx_reject']
-        mfm_umb = coin_cfg['mfm_umbral']
-        grid_timeout = coin_cfg['grid_timeout']
-        adx_piso = CONFIG.adx_min_trend  # Global (mismo para todas)
-
-        if state.moneda_pausada_manual:
-            state.filtro_macro_aprobado = False
-            # F2.1: Logs antes de return temprano
-            await self._log_continuo(symbol, i15 or {})
-            await self._evaluar_near_misses(symbol, 0, 0, [], None, False)
-            return
-
-        if not i15 or not i4h:
-            state.filtro_macro_aprobado = False
-            # FIX #5: NO evaluar despausa durante cold start (evita pausa prematura)
-            # await self._evaluar_despausa_automatica(symbol, state, score_macro=0)
-            # F2.1: Logs antes de return temprano
-            await self._log_continuo(symbol, i15 or {})
-            await self._evaluar_near_misses(symbol, 0, 0, [], None, False)
-            return
-
-        required_15m = ['rsi', 'adx', 'atr', 'ema200_15m', 'macd_hist',
-                        'macd_hist_prev', 'volume', 'volume_sma20']
-        if any(i15.get(k) is None for k in required_15m):
-            state.filtro_macro_aprobado = False
-            # FIX #5: NO evaluar despausa durante cold start
-            # await self._evaluar_despausa_automatica(symbol, state, score_macro=0)
-            # F2.1: Logs antes de return temprano
-            await self._log_continuo(symbol, i15 or {})
-            await self._evaluar_near_misses(symbol, 0, 0, [], None, False)
-            return
-        if i4h.get('ema200_4h') is None:
-            state.filtro_macro_aprobado = False
-            # FIX #5: NO evaluar despausa durante cold start
-            # await self._evaluar_despausa_automatica(symbol, state, score_macro=0)
-            # F2.1: Logs antes de return temprano
-            await self._log_continuo(symbol, i15 or {})
-            await self._evaluar_near_misses(symbol, 0, 0, [], None, False)
-            return
-
-        price = i15['close']
-        ema15 = i15['ema200_15m']
-        ema4h = i4h['ema200_4h']
-        atr = i15['atr']
-        adx = i15['adx']
-        rsi = i15['rsi']
-        macd_hist = i15['macd_hist']
-        macd_hist_prev = i15['macd_hist_prev']
-        vol_ratio = i15['volume'] / i15['volume_sma20'] if i15['volume_sma20'] > 0 else 0
-
-        mfm = i15.get('mfm_15m', 0.0)
-        mfm_sma5 = i15.get('mfm_sma5', 0.0)
-
-        ema50 = i15.get('ema50_15m')
-        if ema50 is None:
-            ema50 = i15.get('ema25_15m', ema15)
-
-        trend_threshold_15m = ema15 * 0.002
-        trend_threshold_4h = ema4h * 0.02
-        trend_threshold_50 = ema50 * 0.002 if ema50 is not None else trend_threshold_15m
-
-        # Determinar direccion
-        if ema50 is not None and price > ema4h + trend_threshold_4h and price > ema50 + trend_threshold_50:
-            direction = 'LONG'
-        elif ema50 is not None and price < ema4h - trend_threshold_4h and price < ema50 - trend_threshold_50:
-            direction = 'SHORT'
-        elif ema50 is None:
-            if price > ema4h + trend_threshold_4h and price > ema15 + trend_threshold_15m:
-                direction = 'LONG'
-            elif price < ema4h - trend_threshold_4h and price < ema15 - trend_threshold_15m:
-                direction = 'SHORT'
-            else:
-                direction = 'NEUTRAL'
-        else:
-            direction = 'NEUTRAL'
-
-        # FASE 3: Determinar fuerza de tendencia para RSI contextualizado
-        trend_strength = "NEUTRAL"
-        if direction == 'SHORT':
-            if adx > 30:
-                trend_strength = "BAJISTA_FUERTE"
-            elif adx > 20:
-                trend_strength = "BAJISTA_MODERADA"
-        elif direction == 'LONG':
-            if adx > 30:
-                trend_strength = "ALCISTA_FUERTE"
-            elif adx > 20:
-                trend_strength = "ALCISTA_MODERADA"
-
+    def _evaluar_condiciones_macro(self, symbol: str, coin_cfg: dict, direction: str,
+                                    trend_strength: str, price: float, adx: float,
+                                    rsi: float, atr: float, macd_hist: float,
+                                    macd_hist_prev: float, vol_ratio: float,
+                                    mfm: float, mfm_sma5: float) -> tuple:
+        """
+        FASE 4.1: Cálculo de score macro, rechazos y umbrales.
+        Extraído de evaluar_filtro_macro para reducir complejidad.
+        """
         rechazos = []
         score_macro = 0
         umbral_entrada = 70
         umbral_mantenimiento = self.SCORE_MANTENIMIENTO_ARMED
         umbral_bloqueado = False
 
-        # PLAN 3.1: ADX scoring con umbral adaptativo por moneda
+        adx_techo = coin_cfg['adx_reject']
+        mfm_umb = coin_cfg['mfm_umbral']
+        adx_min = self._calcular_adx_min(symbol)
+
+        # ADX scoring (FASE 1.1 adaptativo)
         if adx is None or np.isnan(adx) or adx > adx_techo:
             rechazos.append(f"ADX extremo (>{adx_techo}): {adx:.1f}")
             umbral_entrada = self.UMBRAL_BLOQUEADO_ADX_EXTREMO
             umbral_mantenimiento = self.UMBRAL_BLOQUEADO_ADX_EXTREMO
             umbral_bloqueado = True
-        elif adx < adx_piso:
-            rechazos.append(f"ADX sin tendencia (<{adx_piso}): {adx:.1f}")
+        elif adx < adx_min - 2:
+            rechazos.append(f"ADX sin tendencia (<{adx_min - 2:.0f}): {adx:.1f}")
             umbral_entrada = self.UMBRAL_BLOQUEADO_ADX_BAJO
             umbral_mantenimiento = self.UMBRAL_BLOQUEADO_ADX_BAJO
             umbral_bloqueado = True
-        elif adx_piso <= adx < self.ADX_RECHAZO_MIN:
-            # Gap 17-20: ADX muy bajo para operar, no bloqueado pero penalizado
-            score_macro += 5
-            umbral_entrada = 80
-            umbral_mantenimiento = self.SCORE_MANTENIMIENTO_ARMED
-        elif self.ADX_RECHAZO_MIN <= adx < 25:
+        elif adx < adx_min + 3:
             score_macro += 10
             umbral_entrada = 75
-            umbral_mantenimiento = self.SCORE_MANTENIMIENTO_ARMED
         elif 25 <= adx <= 35:
             score_macro += 25
             umbral_entrada = 70
-            umbral_mantenimiento = self.SCORE_MANTENIMIENTO_ARMED
         else:
-            score_macro += 10
+            score_macro += 15
             umbral_entrada = 65
-            umbral_mantenimiento = self.SCORE_MANTENIMIENTO_ARMED
 
-        # FASE 3: RSI contextualizado — FIX 0.1
-        # La funcion evaluar_rsi_oxigeno() es la UNICA autoridad.
-        # Se elimina la doble validacion con CONFIG.rsi_macro_* que contradecia
-        # la logica direccional (ej: RSI 32 en SHORT era "PERMITIR" pero luego
-        # CONFIG.rsi_macro_min=45 lo rechazaba).
-        rsi_ok = False
+        # RSI direccional (FASE 1.2)
         if direction == 'SHORT':
             decision, razon = self.evaluar_rsi_oxigeno(rsi, direction, adx, trend_strength)
             if decision == "PERMITIR":
                 score_macro += 20
-                rsi_ok = True
             else:
                 rechazos.append(razon)
         elif direction == 'LONG':
             decision, razon = self.evaluar_rsi_oxigeno(rsi, direction, adx, trend_strength)
             if decision == "PERMITIR":
                 score_macro += 20
-                rsi_ok = True
             else:
                 rechazos.append(razon)
         else:
@@ -789,10 +688,8 @@ class SignalGenerator:
             score_macro += 15
 
         # MACD scoring
-        hist_change = abs(macd_hist - macd_hist_prev) if macd_hist_prev else 0
         hist_magnitude_pct = abs(macd_hist) / price * 100 if price > 0 else 0
         atr_pct_safe = atr_pct if atr_pct > 0 else 0.01
-
         if hist_magnitude_pct > CONFIG.macd_danger_threshold * atr_pct_safe:
             rechazos.append(f"MACD explosivo: {hist_magnitude_pct:.3f}%")
         elif hist_magnitude_pct > CONFIG.macd_stable_threshold * atr_pct_safe:
@@ -800,9 +697,7 @@ class SignalGenerator:
         else:
             score_macro += 15
 
-        # ═══════════════════════════════════════════════════════════════════════════════
-        # FASE 5.6: VOLUMEN DINAMICO CONDICIONAL — Bypass por conviccion alta
-        # ═══════════════════════════════════════════════════════════════════════════════
+        # Volumen dinámico condicional (FASE 5.6)
         atr_historico_hoy = self._atr15m_historico.get(symbol, [])
         atr_percentil_umbral = np.percentile(atr_historico_hoy, CONFIG.volumen_bypass_atr_percentil) if len(atr_historico_hoy) >= 10 else float('inf')
         atr_en_percentil_75 = atr >= atr_percentil_umbral and len(atr_historico_hoy) >= 10
@@ -832,7 +727,6 @@ class SignalGenerator:
                 bypass_razon = f"ATR percentil {CONFIG.volumen_bypass_atr_percentil:.0f} | ATR:{atr:.6f} >= p{CONFIG.volumen_bypass_atr_percentil:.0f}:{atr_percentil_umbral:.6f}"
             print(f"  [BYPASS] {symbol} BYPASS VOLUMEN — {bypass_razon}")
 
-        # FASE 2: Volumen adaptativo por clase de moneda
         volume_threshold = self._get_volume_threshold(symbol)
 
         if not bypass_volumen:
@@ -849,18 +743,24 @@ class SignalGenerator:
                 else:
                     mfm_fuerza = abs(mfm_sma5)
                     if mfm_fuerza >= 0.5:
-                        penalizacion = 20
+                        penalizacion = 7
                     elif mfm_fuerza >= 0.3:
-                        penalizacion = 15
-                    elif mfm_fuerza >= 0.1:
-                        penalizacion = 10
-                    else:
                         penalizacion = 5
+                    elif mfm_fuerza >= 0.1:
+                        penalizacion = 3
+                    else:
+                        penalizacion = 0
+
+                    # FASE 4.2: Tope de penalización por perfil
+                    perfil_max = coin_cfg.get('mfm_penalizacion_max', 5)
+                    if penalizacion > perfil_max:
+                        penalizacion = perfil_max
 
                     if adx > 40:
-                        penalizacion_antes = penalizacion
                         penalizacion = penalizacion // 2
-                        print(f"  [MFM] {symbol} MFM contradictorio REDUCIDO por ADX>40 | {penalizacion_antes} -> {penalizacion}pts")
+
+                    if direction == "NEUTRAL":
+                        penalizacion = 0
 
                     score_macro -= penalizacion
                     rechazos.append(f"MFM contradictorio: mfm={mfm_sma5:.3f} vs {direction} (-{penalizacion}pts)")
@@ -872,47 +772,20 @@ class SignalGenerator:
             print(f"  [VOLUMEN] {symbol} Volumen BYPASS (+{CONFIG.mfm_bonus_alineado}pts) | {bypass_razon}")
 
         score_macro = max(0, min(100, score_macro))
-        state.score_macro_actual = score_macro
+        return score_macro, rechazos, umbral_entrada, umbral_mantenimiento, umbral_bloqueado
 
-        # Acumular rechazos frecuentes
-        for r in rechazos:
-            tipo = r.split(':')[0] if ':' in r else r
-            state.metricas_dia['rechazos_frecuentes'][tipo] = state.metricas_dia['rechazos_frecuentes'].get(tipo, 0) + 1
 
-        await self._evaluar_despausa_automatica(symbol, state, score_macro)
-
-        # FASE 4: Umbral dinamico por volatilidad historica
-        if state.estado == 'ARMED':
-            umbral_dinamico = self._calcular_umbral_dinamico(symbol)
-            if umbral_dinamico > 0:
-                score_minimo = umbral_dinamico
-            else:
-                score_minimo = umbral_mantenimiento
-        else:
-            # Para entrada, aplicar umbral base dinamico
-            atr_percentil = self._get_atr_percentil(symbol)
-            umbral_base_dinamico = self.calcular_umbral_base(symbol, atr_percentil, coin_cfg)
-            score_minimo = umbral_base_dinamico
-
-        base_aprobado = len(rechazos) == 0 and direction != 'NEUTRAL'
-        filtro_aprobado = base_aprobado and score_macro >= score_minimo
-
-        # Si sigue auto-pausada tras calcular el umbral, loguear y salir sin tocar estado
-        if state.moneda_pausada and not state.moneda_pausada_manual:
-            state.filtro_macro_aprobado = False
-            await self._log_continuo(symbol, i15)
-            await self._evaluar_near_misses(symbol, score_macro, score_minimo, rechazos, direction, filtro_aprobado)
-            return
-
-        # ═══════════════════════════════════════════════════════════════════════════════
-        # FASE 5: TRANSICION A NEUTRAL_GRID
-        # Si la direccion es NEUTRAL y el grid neutral esta habilitado,
-        # evaluar si las condiciones de grid neutral se cumplen
-        # ═══════════════════════════════════════════════════════════════════════════════
-        # FIX #2: Flag para controlar flujo sin bloquear métricas
+    async def _evaluar_transicion_neutral_grid(self, symbol: str, state: SignalState,
+                                                direction: str, score_macro: int,
+                                                umbral_entrada: int, i15: dict,
+                                                price: float, coin_cfg: dict) -> bool:
+        """
+        FASE 4.1: Evalúa entrada y salida del estado NEUTRAL_GRID.
+        Retorna True si entró a NEUTRAL_GRID (el flujo principal debe detenerse).
+        """
         entro_neutral_grid = False
+
         if direction == 'NEUTRAL' and CONFIG.grid_neutral_enabled:
-            # V5.9.2 MEJORA #9: Circuit Breaker puede bloquear grid neutral
             cb_bloquea_grid = (
                 CONFIG.circuit_breaker_afecta_grid_neutral and
                 state.circuit_breaker_activo
@@ -920,20 +793,18 @@ class SignalGenerator:
             if cb_bloquea_grid:
                 print(f"  [NEUTRAL_GRID] {symbol} Grid neutral BLOQUEADO por Circuit Breaker activo")
             else:
-                coin_config = CONFIG.coin_registry.get(symbol, {})
                 entrar_grid, razon_grid = self.evaluar_grid_neutro(symbol, i15)
                 if entrar_grid and state.estado != 'NEUTRAL_GRID':
-                    # F2.2: Limpiar flags anteriores antes de entrar a NEUTRAL_GRID
                     state.filtro_macro_aprobado = False
                     state.direccion_filtro = None
                     state.score_bajo_desde = None
                     state._prev_filtro_aprobado = False
+                    state.neutral_grid_dir_consec = 0
+                    state.neutral_grid_dir_previa = 'NEUTRAL'
                     state.estado = 'NEUTRAL_GRID'
                     state.neutral_grid_timestamp = int(datetime.now(pytz.UTC).timestamp())
-                    # F2.4: [MOVIDO] Guardar grid params para aborto de emergencia 1m — ver después de calcular grid_params
                     print(f"  [NEUTRAL_GRID] {symbol} -> NEUTRAL_GRID | {razon_grid}")
 
-                    # V5.9.2: Calcular parámetros del grid e iniciar simulación
                     i15_gp = self.indicadores_15m.get(symbol, {})
                     i4h_gp = self.indicadores_4h.get(symbol, {})
                     atr_gp = i15_gp.get('atr', price * 0.01)
@@ -941,7 +812,6 @@ class SignalGenerator:
                         price=price, direction='NEUTRAL', atr=atr_gp, i15=i15_gp, i4h=i4h_gp,
                         symbol=symbol, state=state
                     )
-                    # F2.4: Guardar grid params para aborto de emergencia 1m
                     state.grid_params_neutral = grid_params
                     if grid_params and self.grid_simulator:
                         await self.grid_simulator.queue.put({
@@ -950,9 +820,8 @@ class SignalGenerator:
                             'grid_params': grid_params,
                             'precio_actual': price,
                         })
-                        # F3.1: Enviar primer tick inmediato con datos reales de vela 1m
                         i1m_actual = self.indicadores_1m.get(symbol, {})
-                        if i1m_actual and self.grid_simulator:
+                        if i1m_actual:
                             await self.grid_simulator.queue.put({
                                 'tipo': 'TICK',
                                 'symbol': symbol,
@@ -964,7 +833,6 @@ class SignalGenerator:
                     elif not grid_params:
                         print(f"  [NEUTRAL_GRID] {symbol} No se pudieron calcular params del grid: {gp_rechazos}")
 
-                    # F4.1: Asegurar params nunca sea None para notificaciones
                     if grid_params is None:
                         grid_params = {}
                     if self.audit_logger:
@@ -977,44 +845,66 @@ class SignalGenerator:
                         )
                         state._prev_estado = 'NEUTRAL_GRID'
                     await self.emitir_alerta(symbol, 'NEUTRAL_GRID', 'NEUTRAL', score_macro, [], grid_params, price)
-                    entro_neutral_grid = True  # FIX #2: No retornar, dejar que fluya a métricas
-                elif not entrar_grid:
-                    # No cumple condiciones de grid neutral, seguir con logica normal
-                    pass
+                    entro_neutral_grid = True
 
-        # Si ya estaba en NEUTRAL_GRID pero ahora hay direccion, salir del grid
         if state.estado == 'NEUTRAL_GRID' and direction != 'NEUTRAL':
-            state.estado = 'MONITOREO'
-            state.neutral_grid_timestamp = 0
-            state.grid_params_neutral = None
-            # F3.6: Auditoría de aborto por dirección detectada
-            if self.audit_logger:
-                await self.audit_logger.log_evento_grid_simulacion(
-                    symbol=symbol, tipo='NEUTRAL_GRID_ABORT', grid_id=0,
-                    evento_simulacion={'razon': 'direccion_detectada', 'nueva_direccion': direction},
-                    pnl_acumulado=0.0
-                )
-            # V5.9.2: Notificar al simulador para finalizar grid
-            if self.grid_simulator:
-                await self.grid_simulator.queue.put({
-                    'tipo': 'CERRAR_GRID_SUAVE',
-                    'symbol': symbol,
-                    'razon': 'direccion_detectada'
-                })
-            print(f"  [NEUTRAL_GRID] {symbol} -> MONITOREO (direccion detectada: {direction})")
+            if state.neutral_grid_dir_previa == direction:
+                state.neutral_grid_dir_consec += 1
+            else:
+                state.neutral_grid_dir_consec = 1
+                state.neutral_grid_dir_previa = direction
 
-        if filtro_aprobado:
-            state.direccion_filtro = direction
-            state.direccion_ultima_valida = direction
-            state.metricas_dia['veces_paso_umbral'] += 1
-        else:
-            state.direccion_filtro = None
+            if state.neutral_grid_dir_consec >= 2:
+                state.estado = 'MONITOREO'
+                state.neutral_grid_timestamp = 0
+                state.grid_params_neutral = None
+                state.neutral_grid_dir_consec = 0
+                if self.audit_logger:
+                    await self.audit_logger.log_evento_grid_simulacion(
+                        symbol=symbol, tipo='NEUTRAL_GRID_ABORT', grid_id=0,
+                        evento_simulacion={'razon': 'direccion_detectada_2velas', 'nueva_direccion': direction},
+                        pnl_acumulado=0.0
+                    )
+                if self.grid_simulator:
+                    await self.grid_simulator.queue.put({
+                        'tipo': 'CERRAR_GRID_SUAVE',
+                        'symbol': symbol,
+                        'razon': 'direccion_detectada_2velas'
+                    })
+                print(f"  [NEUTRAL_GRID] {symbol} -> MONITOREO (direccion {direction} confirmada x2)")
+            else:
+                print(f"  [NEUTRAL_GRID] {symbol} Dir {direction} ({state.neutral_grid_dir_consec}/2 velas)")
 
-        state.ultimo_filtro_timestamp = i15.get('timestamp', 0)
+        return entro_neutral_grid
 
-        # Inactividad tracking
+
+    async def _loguear_y_auditar_macro(self, symbol: str, state: SignalState,
+                                        score_macro: int, score_minimo: int,
+                                        rechazos: list, direction: str,
+                                        filtro_aprobado: bool, umbral_entrada: int,
+                                        umbral_bloqueado: bool, adx: float,
+                                        i15: dict, entro_neutral_grid: bool,
+                                        trend_strength: str, coin_cfg: dict):
+        """
+        FASE 4.1: Logs, near-misses, auditoría, métricas diarias y trackeo de precio.
+        """
+        if entro_neutral_grid:
+            return
+
+        for r in rechazos:
+            tipo = r.split(':')[0] if ':' in r else r
+            state.metricas_dia['rechazos_frecuentes'][tipo] = state.metricas_dia['rechazos_frecuentes'].get(tipo, 0) + 1
+
+        await self._evaluar_despausa_automatica(symbol, state, score_macro)
+
+        if state.moneda_pausada and not state.moneda_pausada_manual:
+            state.filtro_macro_aprobado = False
+            await self._log_continuo(symbol, i15)
+            await self._evaluar_near_misses(symbol, score_macro, score_minimo, rechazos, direction, filtro_aprobado)
+            return
+
         if state.estado == 'NEUTRAL_GRID':
-            state.score_bajo_desde = None  # No auto-pausar durante grid neutral
+            state.score_bajo_desde = None
         elif score_macro < 50:
             if state.score_bajo_desde is None:
                 state.score_bajo_desde = int(datetime.now(pytz.UTC).timestamp())
@@ -1028,13 +918,8 @@ class SignalGenerator:
         else:
             state.score_bajo_desde = None
 
-        # Auditoria granular
         await self._log_continuo(symbol, i15)
         await self._evaluar_near_misses(symbol, score_macro, score_minimo, rechazos, direction, filtro_aprobado)
-
-        # FIX #2: Si entró a NEUTRAL_GRID, retornar aquí (después de métricas)
-        if entro_neutral_grid:
-            return
 
         if self.audit_logger:
             estado_previo = state._prev_filtro_aprobado
@@ -1045,16 +930,15 @@ class SignalGenerator:
                 )
 
                 contexto_macro = {
-                    'precio': price,
-                    'rsi': rsi,
+                    'precio': i15.get('close'),
+                    'rsi': i15.get('rsi'),
                     'adx': adx,
-                    'atr': atr,
-                    'ema200_15m': ema15,
-                    'ema50_15m': ema50,
-                    'macd_hist': macd_hist,
-                    'volumen_ratio': vol_ratio,
-                    'mfm_15m': mfm,
-                    'mfm_sma5': mfm_sma5,
+                    'atr': i15.get('atr'),
+                    'ema200_15m': i15.get('ema200_15m'),
+                    'ema50_15m': i15.get('ema50_15m'),
+                    'macd_hist': i15.get('macd_hist'),
+                    'volumen_ratio': i15.get('volume') / i15.get('volume_sma20', 1) if i15.get('volume_sma20') else 0,
+                    'mfm_sma5': i15.get('mfm_sma5'),
                     'direccion': direction,
                     'score_macro': score_macro,
                     'umbral_aplicado': umbral_legible,
@@ -1065,12 +949,11 @@ class SignalGenerator:
                     'pausa_manual': state.moneda_pausada_manual,
                     'trend_strength': trend_strength,
                     'atr_percentil': self._get_atr_percentil(symbol),
-                    # PLAN 3.1: Telemetria de parametros adaptativos
-                    'categoria': coin_cfg['category'],
-                    'adx_reject_aplicado': adx_techo,
-                    'mfm_umbral_aplicado': mfm_umb,
-                    'grid_timeout_aplicado': grid_timeout,
-                    'volume_threshold_aplicado': coin_cfg['volume_threshold'],
+                    'categoria': coin_cfg.get('category', 'default'),
+                    'adx_reject_aplicado': coin_cfg.get('adx_reject'),
+                    'mfm_umbral_aplicado': coin_cfg.get('mfm_umbral'),
+                    'grid_timeout_aplicado': coin_cfg.get('grid_timeout'),
+                    'volume_threshold_aplicado': coin_cfg.get('volume_threshold'),
                 }
                 await self.audit_logger.log_cambio_estado(
                     symbol=symbol,
@@ -1083,9 +966,9 @@ class SignalGenerator:
                 state._prev_filtro_aprobado = state.filtro_macro_aprobado
 
         if filtro_aprobado:
-            mfm_str = f" | MFM={mfm_sma5:.3f}" if mfm_sma5 != 0 else ""
+            mfm_str = f" | MFM={i15.get('mfm_sma5', 0):.3f}" if i15.get('mfm_sma5', 0) != 0 else ""
             umbral_str = self._umbral_a_string(score_minimo)
-            print(f"  [FILTRO] {symbol} Filtro Macro OK ({direction}) | Score: {score_macro} | Umbral: {umbral_str} | RSI: {rsi:.1f} | ADX: {adx:.1f}{mfm_str}")
+            print(f"  [FILTRO] {symbol} Filtro Macro OK ({direction}) | Score: {score_macro} | Umbral: {umbral_str} | RSI: {i15.get('rsi', 0):.1f} | ADX: {adx:.1f}{mfm_str}")
         else:
             if state.estado == 'ARMED':
                 print(f"  [FILTRO] {symbol} Filtro Macro ROTO | Rechazos: {rechazos[:2]} | Score: {score_macro} | Umbral: {self._umbral_a_string(score_minimo)}")
@@ -1093,7 +976,6 @@ class SignalGenerator:
                 if score_macro > 40:
                     print(f"  [FILTRO] {symbol} Filtro Macro NO apto | Score: {score_macro} | {rechazos[:1]}")
 
-        # Trackear precio para near-misses (F3.5: usa timestamp de vela 1m)
         if self.audit_logger:
             i1m_nm = self.indicadores_1m.get(symbol, {})
             ts_nm = i1m_nm.get('timestamp')
@@ -1102,6 +984,164 @@ class SignalGenerator:
             else:
                 ts = datetime.now(pytz.UTC)
             await self.audit_logger.trackear_precio_near_miss(symbol, i1m_nm.get('close', i15.get('close', 0)), ts)
+
+
+    async def evaluar_filtro_macro(self, symbol: str):
+        """FASE 4.1: Director de orquesta del filtro macro. Delega en 3 métodos especializados."""
+        i15 = self.indicadores_15m.get(symbol)
+        i4h = self.indicadores_4h.get(symbol)
+        state = self.states[symbol]
+
+        coin_cfg = get_coin_config(symbol)
+
+        if state.moneda_pausada_manual:
+            state.filtro_macro_aprobado = False
+            await self._log_continuo(symbol, i15 or {})
+            await self._evaluar_near_misses(symbol, 0, 0, [], None, False)
+            return
+
+        if not i15 or not i4h:
+            state.filtro_macro_aprobado = False
+            await self._log_continuo(symbol, i15 or {})
+            await self._evaluar_near_misses(symbol, 0, 0, [], None, False)
+            return
+
+        required_15m = ['rsi', 'adx', 'atr', 'ema200_15m', 'macd_hist',
+                        'macd_hist_prev', 'volume', 'volume_sma20']
+        if any(i15.get(k) is None for k in required_15m):
+            state.filtro_macro_aprobado = False
+            await self._log_continuo(symbol, i15 or {})
+            await self._evaluar_near_misses(symbol, 0, 0, [], None, False)
+            return
+        if i4h.get('ema200_4h') is None:
+            state.filtro_macro_aprobado = False
+            await self._log_continuo(symbol, i15 or {})
+            await self._evaluar_near_misses(symbol, 0, 0, [], None, False)
+            return
+
+        price = i15['close']
+        ema15 = i15['ema200_15m']
+        ema4h = i4h['ema200_4h']
+        atr = i15['atr']
+        adx = i15['adx']
+        rsi = i15['rsi']
+        macd_hist = i15['macd_hist']
+        macd_hist_prev = i15['macd_hist_prev']
+        vol_ratio = i15['volume'] / i15['volume_sma20'] if i15['volume_sma20'] > 0 else 0
+        mfm = i15.get('mfm_15m', 0.0)
+        mfm_sma5 = i15.get('mfm_sma5', 0.0)
+        ema50 = i15.get('ema50_15m') or i15.get('ema25_15m', ema15)
+
+        trend_threshold_15m = ema15 * 0.002
+        trend_threshold_4h = ema4h * 0.02
+        trend_threshold_50 = ema50 * 0.002 if ema50 is not None else trend_threshold_15m
+
+        if ema50 is not None and price > ema4h + trend_threshold_4h and price > ema50 + trend_threshold_50:
+            direction = 'LONG'
+        elif ema50 is not None and price < ema4h - trend_threshold_4h and price < ema50 - trend_threshold_50:
+            direction = 'SHORT'
+        elif ema50 is None:
+            if price > ema4h + trend_threshold_4h and price > ema15 + trend_threshold_15m:
+                direction = 'LONG'
+            elif price < ema4h - trend_threshold_4h and price < ema15 - trend_threshold_15m:
+                direction = 'SHORT'
+            else:
+                direction = 'NEUTRAL'
+        else:
+            direction = 'NEUTRAL'
+
+        trend_strength = "NEUTRAL"
+        if direction == 'SHORT':
+            if adx > 30:
+                trend_strength = "BAJISTA_FUERTE"
+            elif adx > 20:
+                trend_strength = "BAJISTA_MODERADA"
+        elif direction == 'LONG':
+            if adx > 30:
+                trend_strength = "ALCISTA_FUERTE"
+            elif adx > 20:
+                trend_strength = "ALCISTA_MODERADA"
+
+        # BLOQUE 1: CÁLCULO DE SCORE Y RECHAZOS
+        score_macro, rechazos, umbral_entrada, umbral_mantenimiento, umbral_bloqueado = self._evaluar_condiciones_macro(
+            symbol, coin_cfg, direction, trend_strength, price, adx, rsi, atr,
+            macd_hist, macd_hist_prev, vol_ratio, mfm, mfm_sma5
+        )
+
+        # FASE 3.2: Alerta pre-disparo
+        if (direction != 'NEUTRAL' and umbral_entrada > 0 and
+            score_macro >= umbral_entrada * 0.90 and score_macro < umbral_entrada):
+            notifier = getattr(self, 'notifier', None)
+            if notifier:
+                await notifier.enviar_telegram(
+                    f"🟡 PRE-DISPARO — {symbol} | Score: {score_macro}/{umbral_entrada} "
+                    f"({score_macro/umbral_entrada*100:.0f}%) | Dir: {direction} | "
+                    f"ADX: {adx:.1f} | RSI: {rsi:.1f}"
+                )
+
+        # FASE 1.5: Seguimiento virtual NEUTRAL con convicción alta
+        if direction == 'NEUTRAL' and score_macro >= 55 and adx >= 20 and adx <= 35 and self.audit_logger:
+            await self.audit_logger.iniciar_seguimiento_near_miss(
+                symbol=symbol,
+                score=score_macro,
+                umbral=umbral_entrada if umbral_entrada > 0 else 70,
+                direccion='NEUTRAL',
+                precio=price,
+                contexto={
+                    'tipo': 'NEUTRAL_CONVICCION',
+                    'adx': adx,
+                    'rsi': rsi,
+                    'score_macro': score_macro,
+                }
+            )
+
+        state.score_macro_actual = score_macro
+
+        # BLOQUE 2: TRANSICIÓN A NEUTRAL_GRID
+        entro_neutral_grid = await self._evaluar_transicion_neutral_grid(
+            symbol, state, direction, score_macro, umbral_entrada, i15, price, coin_cfg
+        )
+
+        # BLOQUE 3: APROBACIÓN DEL FILTRO (FASE 4.3: Filtros ponderados opcional)
+        if state.estado == 'ARMED':
+            umbral_dinamico = self._calcular_umbral_dinamico(symbol)
+            score_minimo = umbral_dinamico if umbral_dinamico > 0 else umbral_mantenimiento
+        else:
+            atr_percentil = self._get_atr_percentil(symbol)
+            umbral_base_dinamico = self.calcular_umbral_base(symbol, atr_percentil, coin_cfg)
+            score_minimo = umbral_base_dinamico
+
+        # FASE 4.3: Score penalizado por tipo de rechazo
+        score_penalizado = score_macro
+        for r in rechazos:
+            if 'ADX' in r: score_penalizado -= 15
+            elif 'RSI' in r: score_penalizado -= 10
+            elif 'Volumen' in r: score_penalizado -= 8
+            elif 'MFM' in r: score_penalizado -= 5
+            else: score_penalizado -= 5
+
+        filtro_aprobado = False
+        if len(rechazos) == 0 and direction != 'NEUTRAL' and score_macro >= score_minimo:
+            filtro_aprobado = True
+            state.direccion_filtro = direction
+            state.direccion_ultima_valida = direction
+            state.metricas_dia['veces_paso_umbral'] += 1
+        elif (score_penalizado >= score_minimo and len(rechazos) <= 2 and
+              direction != 'NEUTRAL' and not umbral_bloqueado):
+            filtro_aprobado = True
+            state.direccion_filtro = direction
+            state.direccion_ultima_valida = direction
+            state.metricas_dia['veces_paso_umbral'] += 1
+            print(f"  [FILTRO] {symbol} DISPARO CON ADVERTENCIA | {score_macro}->{score_penalizado}")
+        else:
+            state.direccion_filtro = None
+
+        # BLOQUE 4: LOGS, AUDITORÍA Y NEAR-MISSES
+        await self._loguear_y_auditar_macro(
+            symbol, state, score_macro, score_minimo, rechazos, direction,
+            filtro_aprobado, umbral_entrada, umbral_bloqueado, adx, i15,
+            entro_neutral_grid, trend_strength, coin_cfg
+        )
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # METODOS AUXILIARES
@@ -1201,35 +1241,44 @@ class SignalGenerator:
                 print(f"  [PAUSA] {symbol} -> MONITOREO (pausa {tipo_pausa} activa)")
             return
 
-        # CIRCUIT BREAKER: Evaluar rentabilidad del último disparo (Bug Crítico #3)
+        # FASE 2.2: CIRCUIT BREAKER con PnL real del grid (Bug B)
         if state.ultimo_disparo_precio > 0 and not state.ultimo_disparo_evaluado:
             price_actual = self.indicadores_1m.get(symbol, {}).get('close', 0)
-            if price_actual > 0:
-                if state.ultimo_disparo_direccion == 'SHORT':
-                    if price_actual > state.ultimo_disparo_precio * 1.003:
-                        state.disparos_consecutivos += 1
-                        state.ultimo_disparo_fue_rentable = False
-                        print(f"  [CB] {symbol} Disparo SHORT en pérdida | #{state.disparos_consecutivos}")
-                    else:
-                        state.disparos_consecutivos = 0
-                        state.ultimo_disparo_fue_rentable = True
-                        print(f"  [CB] {symbol} Disparo SHORT rentable | Reset contador")
-                elif state.ultimo_disparo_direccion == 'LONG':
-                    if price_actual < state.ultimo_disparo_precio * 0.997:
-                        state.disparos_consecutivos += 1
-                        state.ultimo_disparo_fue_rentable = False
-                        print(f"  [CB] {symbol} Disparo LONG en pérdida | #{state.disparos_consecutivos}")
-                    else:
-                        state.disparos_consecutivos = 0
-                        state.ultimo_disparo_fue_rentable = True
-                        print(f"  [CB] {symbol} Disparo LONG rentable | Reset contador")
-                
-                state.ultimo_disparo_evaluado = True
-                
-                if state.disparos_consecutivos >= CONFIG.circuit_breaker_disparos:
-                    await self._activar_circuit_breaker(symbol)
-                    return
 
+            # Prioridad 1: PnL real del grid simulator si existe
+            pnl_grid = 0.0
+            if self.grid_simulator and symbol in self.grid_simulator.simulaciones:
+                pnl_grid = float(self.grid_simulator.simulaciones[symbol].pnl_neto)
+
+            if pnl_grid != 0:
+                fue_rentable = pnl_grid > 0
+                razon_pnl = f"PnL grid: {pnl_grid:+.4f}"
+            elif price_actual > 0:
+                # Fallback: estimación por precio spot si no hay grid activo
+                if state.ultimo_disparo_direccion == 'SHORT':
+                    fue_rentable = price_actual <= state.ultimo_disparo_precio * 1.003
+                else:
+                    fue_rentable = price_actual >= state.ultimo_disparo_precio * 0.997
+                razon_pnl = f"Precio spot: ${price_actual:.4f}"
+            else:
+                fue_rentable = True
+                razon_pnl = "Sin precio disponible"
+
+            if not fue_rentable:
+                state.disparos_consecutivos += 1
+                state.ultimo_disparo_fue_rentable = False
+                print(f"  [CB] {symbol} Disparo en pérdida | #{state.disparos_consecutivos} | {razon_pnl}")
+            else:
+                state.disparos_consecutivos = 0
+                state.ultimo_disparo_fue_rentable = True
+                print(f"  [CB] {symbol} Disparo rentable | Reset contador | {razon_pnl}")
+
+            state.ultimo_disparo_evaluado = True
+
+            if state.disparos_consecutivos >= CONFIG.circuit_breaker_disparos:
+                await self._activar_circuit_breaker(symbol)
+                return
+                
         # FASE 5: Si esta en NEUTRAL_GRID, evaluar aborto de emergencia por precio 1m
         # El aborto macro (ADX/RSI/EMA) se evalua en el loop principal (run) con evaluar_aborto_neutral_grid
         # F2.4: Aborto de emergencia por ruptura de límites del grid + 0.5% margen
@@ -1618,9 +1667,27 @@ class SignalGenerator:
         max_grids_por_densidad = int(rango_total / (atr_seguro * CONFIG.grid_min_dist_atr))
         grid_count = min(grid_count, max(2, max_grids_por_densidad))
         grid_count = max(grid_count, CONFIG.grid_min_grids)
+        
+        # FASE 4.2: Limitar grids por perfil de moneda
+        coin_cfg = get_coin_config(symbol)
+        perfil_max = coin_cfg.get('grid_niveles_max', CONFIG.grid_max_grids_hard)
+        grid_count = min(grid_count, perfil_max)
 
         step_usdt = rango_total / grid_count if grid_count > 0 else 0
         step_pct = (step_usdt / price) * 100 if price > 0 else 0
+
+        # FASE 2.5: Limitar grids para monedas caras (evita qty mínima inválida)
+        if price > 100 and grid_count > 6:
+            grid_count = 6
+            step_usdt = rango_total / grid_count if grid_count > 0 else 0
+            step_pct = (step_usdt / price) * 100 if price > 0 else 0
+            print(f"  [GRID] {symbol} Grid limitado a 6 por precio > $100")
+
+        # FASE 2.5: Validar distancia mínima entre grids (breakeven real)
+        min_dist_pct = 2 * CONFIG.grid_fee_rate * 100 + CONFIG.grid_slippage * 100 + 0.1
+        if step_pct < min_dist_pct:
+            rechazos.append(f"step_pct {step_pct:.3f}% < min {min_dist_pct:.3f}%")
+            return None, rechazos
 
         comisiones_ciclo = 2 * CONFIG.grid_fee_rate          # 0.10% (2 órdenes × 0.05%)
         slippage_total = 2 * CONFIG.grid_slippage              # 0.10% (2 órdenes × 0.05%)
@@ -1652,6 +1719,13 @@ class SignalGenerator:
 
         rentable = step_pct >= breakeven
 
+        qty_por_orden = round(poder_total / grid_count / price, 4) if grid_count > 0 and price > 0 else 0
+
+        # FASE 2.5: Validar qty mínima para monedas > $100
+        if qty_por_orden < 1.0 and price > 100:
+            rechazos.append(f"Qty {qty_por_orden:.3f} < 1.0 para moneda > $100")
+            return None, rechazos
+
         return {
             'direction': direction,
             'upper_limit': round(float(upper), 4),
@@ -1663,7 +1737,7 @@ class SignalGenerator:
             'capital_sugerido': capital,
             'apalancamiento_sugerido': leverage,
             'notional_por_orden': round(poder_total / grid_count, 2) if grid_count > 0 else 0,
-            'qty_por_orden': round(poder_total / grid_count / price, 4) if grid_count > 0 and price > 0 else 0,
+            'qty_por_orden': qty_por_orden,
             'margen_sobre_breakeven': round(step_pct - breakeven, 3),
             'rentable': rentable,
             'posicion_en_rango': round(float(posicion), 2),
