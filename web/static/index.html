@@ -1601,6 +1601,24 @@
                         if (p.estado.estado === 'FIRE' && prevEstado !== 'FIRE') {
                             showToast({ symbol: sym, tipo: 'FIRE', direction: p.estado.direccion, score: p.estado.score });
                         }
+                        
+                        if (p.estado.estado === 'NEUTRAL_GRID' && prevEstado !== 'NEUTRAL_GRID') {
+                            showToast({ symbol: sym, tipo: 'NEUTRAL_GRID', direction: 'NEUTRAL', score: 0 });
+                        }
+                        
+                        // F5.6 FIX: Actualizar panel grid neutral cuando llega snapshot NEUTRAL_GRID
+                        if (p.estado.estado === 'NEUTRAL_GRID' && sym === activeSymbol) {
+                            fetchGridNeutral(sym);
+                        }
+                        // F5.6 FIX: Limpiar panel grid neutral cuando sale de NEUTRAL_GRID
+                        if (prevEstado === 'NEUTRAL_GRID' && p.estado.estado !== 'NEUTRAL_GRID' && sym === activeSymbol) {
+                            const gridInfo = document.getElementById('grid-info');
+                            const gridStats = document.getElementById('grid-stats');
+                            const gridBadge = document.getElementById('grid-badge');
+                            if (gridInfo) gridInfo.innerText = 'Sin grid neutral activo';
+                            if (gridStats) gridStats.classList.add('hidden');
+                            if (gridBadge) gridBadge.classList.add('hidden');
+                        }
                     }
 
                     if (sym === activeSymbol) {
