@@ -411,18 +411,28 @@ class SignalGenerator:
                         self._rango_reciente[symbol]['highs'] = self._rango_reciente[symbol]['highs'][-20:]
                         self._rango_reciente[symbol]['lows'] = self._rango_reciente[symbol]['lows'][-20:]
 
-                # ═══════════════════════════════════════════════════════════════════
-                # FASE 5: Evaluar aborto de NEUTRAL_GRID en cada vela 15m
-                # ═══════════════════════════════════════════════════════════════════
-                state = self.states[symbol]
+            # ═══════════════════════════════════════════════════════════════════
+            # FASE 5: Evaluar aborto de NEUTRAL_GRID en cada vela 15m
+            # ═══════════════════════════════════════════════════════════════════
+            state = self.states[symbol]
+            
+            # FIX CRÍTICO: Definir abortar y razon antes de usarlas
+            if state.estado == 'NEUTRAL_GRID':
+                abortar, razon = self.evaluar_aborto_neutral_grid(
+                    symbol=symbol,
+                    i15=data,
+                    state=state,
+                    timeout_moneda=CONFIG.grid_neutral_timeout_min
+                )
                 if abortar:
                     state.estado = 'MONITOREO'
                     state.neutral_grid_timestamp = 0
+                    state.grid_params_neutral = None
                     state.filtro_macro_aprobado = False
                     state.direccion_filtro = None
                     print(f"  [NEUTRAL_GRID] {symbol} -> MONITOREO (aborto: {razon})")
                     
-                    # FIX: Notificar al simulador para finalizar grid (evita "sin_ticks_5min" fantasma)
+                    # FIX: Notificar al simulador para finalizar grid
                     if self.grid_simulator:
                         await self.grid_simulator.queue.put({
                             'tipo': 'FINALIZAR_GRID',
