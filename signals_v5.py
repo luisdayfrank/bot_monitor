@@ -415,30 +415,36 @@ class SignalGenerator:
                 # FASE 5: Evaluar aborto de NEUTRAL_GRID en cada vela 15m
                 # ═══════════════════════════════════════════════════════════════════
                 state = self.states[symbol]
-                if state.estado == 'NEUTRAL_GRID':
-                    coin_cfg = get_coin_config(symbol)
-                    abortar, razon = self.evaluar_aborto_neutral_grid(symbol, data, state, coin_cfg['grid_timeout'])
-                    if abortar:
-                        state.estado = 'MONITOREO'
-                        state.neutral_grid_timestamp = 0
-                        state.filtro_macro_aprobado = False
-                        state.direccion_filtro = None
-                        print(f"  [NEUTRAL_GRID] {symbol} -> MONITOREO (aborto: {razon})")
-                        # F3.6: Auditoría de aborto de grid neutral
-                        if self.audit_logger:
-                            await self.audit_logger.log_evento_grid_simulacion(
-                                symbol=symbol, tipo='NEUTRAL_GRID_ABORT', grid_id=0,
-                                evento_simulacion={'razon': razon}, pnl_acumulado=0.0
-                            )
-                            await self.audit_logger.log_cambio_estado(
-                                symbol=symbol,
-                                de='NEUTRAL_GRID',
-                                a='MONITOREO',
-                                direccion='NEUTRAL',
-                                score_macro=state.score_macro_actual
-                            )
-                            state._prev_estado = 'MONITOREO'
-                        continue  # No evaluar filtro macro este ciclo
+                if abortar:
+                    state.estado = 'MONITOREO'
+                    state.neutral_grid_timestamp = 0
+                    state.filtro_macro_aprobado = False
+                    state.direccion_filtro = None
+                    print(f"  [NEUTRAL_GRID] {symbol} -> MONITOREO (aborto: {razon})")
+                    
+                    # FIX: Notificar al simulador para finalizar grid (evita "sin_ticks_5min" fantasma)
+                    if self.grid_simulator:
+                        await self.grid_simulator.queue.put({
+                            'tipo': 'FINALIZAR_GRID',
+                            'symbol': symbol,
+                            'razon': razon
+                        })
+                    
+                    # F3.6: Auditoría de aborto de grid neutral
+                    if self.audit_logger:
+                        await self.audit_logger.log_evento_grid_simulacion(
+                            symbol=symbol, tipo='NEUTRAL_GRID_ABORT', grid_id=0,
+                            evento_simulacion={'razon': razon}, pnl_acumulado=0.0
+                        )
+                        await self.audit_logger.log_cambio_estado(
+                            symbol=symbol,
+                            de='NEUTRAL_GRID',
+                            a='MONITOREO',
+                            direccion='NEUTRAL',
+                            score_macro=state.score_macro_actual
+                        )
+                        state._prev_estado = 'MONITOREO'
+                    continue  # No evaluar filtro macro este ciclo
 
                 await self.evaluar_filtro_macro(symbol)
 
@@ -548,9 +554,20 @@ class SignalGenerator:
                 'rechazos': rechazos,
                 'direccion': direction
             }
-        elif score_macro >= umbral_efectivo * 0.75 and score_macro < umbral_efectivo * self.NEAR_MISS_UMBRAL_PCT:
-            # FIX 0.2: Nuevo tier "EN_ZONA_DE_INTERES" para scores entre 75% y 70% del umbral
-            # Captura oportunidades que estuvieron cerca pero no lo suficiente para "CERCA_DEL_UMBRAL"
+        # FIX 0.1: Reordenar tiers de mayor a menor para evitar solapamiento
+        elif score_macro >= umbral_efectivo * self.NEAR_MISS_MUY_CERCA_PCT:  # 0.85
+            near_miss = True
+            tipo_near_miss = "MUY_CERCA_DEL_UMBRAL"
+            detalle = {
+                'score': score_macro,
+                'umbral': umbral_efectivo,
+                'porcentaje_umbral': round(score_macro / umbral_efectivo * 100, 1),
+                'razon': f'Score al {round(score_macro / umbral_efectivo * 100, 0)}% del umbral',
+                'rechazos': rechazos,
+                'direccion': direction
+            }
+            state.metricas_dia['veces_muy_cerca'] += 1
+        elif score_macro >= umbral_efectivo * 0.75:  # FIX: Umbral 75% (antes era imposible)
             near_miss = True
             tipo_near_miss = "EN_ZONA_DE_INTERES"
             detalle = {
@@ -562,13 +579,9 @@ class SignalGenerator:
                 'direccion': direction
             }
             state.metricas_dia['veces_cerca_umbral'] += 1
-        elif score_macro >= umbral_efectivo * self.NEAR_MISS_UMBRAL_PCT:
+        elif score_macro >= umbral_efectivo * self.NEAR_MISS_UMBRAL_PCT:  # 0.70
             near_miss = True
-            if score_macro >= umbral_efectivo * self.NEAR_MISS_MUY_CERCA_PCT:
-                tipo_near_miss = "MUY_CERCA_DEL_UMBRAL"
-            else:
-                tipo_near_miss = "CERCA_DEL_UMBRAL"
-
+            tipo_near_miss = "CERCA_DEL_UMBRAL"
             detalle = {
                 'score': score_macro,
                 'umbral': umbral_efectivo,
@@ -578,9 +591,6 @@ class SignalGenerator:
                 'direccion': direction
             }
             state.metricas_dia['veces_cerca_umbral'] += 1
-            if score_macro >= umbral_efectivo * self.NEAR_MISS_MUY_CERCA_PCT:
-                state.metricas_dia['veces_muy_cerca'] += 1
-
         if near_miss and tipo_near_miss:
             print(f"  [NEAR-MISS] {symbol} NEAR-MISS: {tipo_near_miss} | Score:{score_macro} Umbral:{umbral_efectivo} Dir:{direction}")
             await self.audit_logger.log_near_miss(

@@ -393,10 +393,66 @@ class AuditReporter:
                 "objetivo": "Maximizar precision_near_miss (minimizar falsos negativos)",
                 "como_medir": "Si precision_near_miss sube despues de Plan 3.1, los parametros adaptativos funcionan",
                 "metricas": metricas_exito
-            }
+            },
+            # FASE 2.1 FIX: Resumen agregado de grid neutral
+            "grid_neutral_resumen": self._resumen_grid_neutral(eventos_neutral_grid)
         }
 
         return resultado
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 2.1: RESUMEN AGREGADO DE GRID NEUTRAL
+    # ═══════════════════════════════════════════════════════════════════════════════
+    def _resumen_grid_neutral(self, eventos_neutral_grid: List[dict]) -> dict:
+        """
+        Agrega métricas resumidas de grid neutral al JSON diario.
+        Se construye a partir de los eventos NEUTRAL_GRID_* ya logueados en auditoria.
+        """
+        if not eventos_neutral_grid:
+            return {
+                "total_grids": 0,
+                "abortados_por_timeout": 0,
+                "abortados_por_direccion": 0,
+                "abortados_por_sin_ticks": 0,
+                "posiciones_pendientes_al_cierre": 0,
+                "posiciones_atrapadas": 0,
+                "pnl_real_incluyendo_pendientes": 0.0
+            }
+
+        total = len([e for e in eventos_neutral_grid if e['tipo'] == 'NEUTRAL_GRID_INICIADO'])
+        abortados_timeout = len([e for e in eventos_neutral_grid if e['tipo'] == 'NEUTRAL_GRID_TIMEOUT'])
+        abortados_direccion = len([e for e in eventos_neutral_grid if e['tipo'] == 'NEUTRAL_GRID_ABORT'])
+        abortados_sin_ticks = len([e for e in eventos_neutral_grid if e['tipo'] == 'NEUTRAL_GRID_KILL'])
+
+        # Extraer PnL y posiciones del contexto_json de los eventos de simulación
+        pnl_total = 0.0
+        pos_atrapadas = 0
+        pos_pendientes = 0
+
+        for ev in eventos_neutral_grid:
+            if ev.get('contexto_json'):
+                try:
+                    ctx = json.loads(ev['contexto_json'])
+                    sim = ctx.get('evento_simulacion', {})
+                    if 'pnl_acumulado' in sim:
+                        pnl_total += float(sim['pnl_acumulado'])
+                    # Contar posiciones atrapadas/pendientes si están en el contexto
+                    if 'posiciones_atrapadas' in sim:
+                        pos_atrapadas += int(sim['posiciones_atrapadas'])
+                    if 'posiciones_pendientes' in sim:
+                        pos_pendientes += int(sim['posiciones_pendientes'])
+                except:
+                    pass
+
+        return {
+            "total_grids": total,
+            "abortados_por_timeout": abortados_timeout,
+            "abortados_por_direccion": abortados_direccion,
+            "abortados_por_sin_ticks": abortados_sin_ticks,
+            "posiciones_pendientes_al_cierre": pos_pendientes,
+            "posiciones_atrapadas": pos_atrapadas,
+            "pnl_real_incluyendo_pendientes": round(pnl_total, 4)
+        }
 
     def _analizar_evolucion_score(self, eventos_continuo: List[dict]) -> dict:
         """

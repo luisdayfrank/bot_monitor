@@ -63,6 +63,7 @@ async def lifespan(fastapi_app):
     signals.grid_simulator = grid_simulator
     grid_simulator.audit_logger = audit_logger
     grid_simulator.notifier = notifier
+    grid_simulator.signal_generator = signals
     signals.notifier = notifier  # FASE 3.2: Para alertas pre-disparo Telegram
 
 
@@ -118,34 +119,55 @@ async def lifespan(fastapi_app):
         while True:
             await asyncio.sleep(60)  # Cada minuto
             try:
-                for symbol in CONFIG.symbols:
-                    st = signals.states.get(symbol)
-                    if st and st.estado == 'NEUTRAL_GRID' and symbol in precios_vivo:
-                        i1m = signals.indicadores_1m.get(symbol, {})
-                        precio = precios_vivo[symbol]
-                        # FASE 6 FIX: Nunca estimar high/low desde precio spot
-                        high = i1m.get('high')
-                        low = i1m.get('low')
-                        close = i1m.get('close')
-                        if high is None or low is None or close is None:
-                            print(f"  [GRID_TICKER] {symbol} Sin vela 1m real, saltando tick")
-                            continue
-                        # F3.2: Usar timestamp real de la vela 1m
-                        ts_raw = i1m.get('timestamp')
-                        if ts_raw and ts_raw > 1e12:
-                            ts = int(ts_raw / 1000)
-                        elif ts_raw:
-                            ts = int(ts_raw)
-                        else:
-                            ts = int(datetime.now(pytz.UTC).timestamp())
-                        await grid_simulator.queue.put({
-                            'tipo': 'TICK',
-                            'symbol': symbol,
-                            'high': high,
-                            'low': low,
-                            'close': close,
-                            'timestamp': ts
-                        })
+                # FIX: Preguntar directamente al simulador qué grids están activos
+                # en lugar de confiar en signals.states (evita desincronización)
+                activos_en_simulador = list(grid_simulator.simulaciones.keys())
+                for symbol in activos_en_simulador:
+                    if symbol not in precios_vivo:
+                        continue
+                    
+                    i1m = signals.indicadores_1m.get(symbol, {})
+                    precio = precios_vivo[symbol]
+                    
+                    # FASE 1.1 FIX: Fallback de high/low desde precio spot
+                    high = i1m.get('high')
+                    low = i1m.get('low')
+                    close = i1m.get('close')
+                    
+                    if close is None:
+                        close = precio
+                    
+                    # Estimar high/low desde close si no hay vela real
+                    if high is None or low is None:
+                        atr_estimado = i1m.get('atr_1m', close * 0.001)
+                        if high is None:
+                            high = close + atr_estimado
+                        if low is None:
+                            low = close - atr_estimado
+                        print(f"  [GRID_TICKER] {symbol} Estimando high/low desde close+ATR | "
+                              f"H:{high:.4f} L:{low:.4f} C:{close:.4f}")
+                    
+                    # Solo saltar si ni siquiera tenemos close
+                    if close is None or close <= 0:
+                        print(f"  [GRID_TICKER] {symbol} Sin precio válido, saltando tick")
+                        continue
+                    
+                    # F3.2: Usar timestamp real de la vela 1m
+                    ts_raw = i1m.get('timestamp')
+                    if ts_raw and ts_raw > 1e12:
+                        ts = int(ts_raw / 1000)
+                    elif ts_raw:
+                        ts = int(ts_raw)
+                    else:
+                        ts = int(datetime.now(pytz.UTC).timestamp())
+                    await grid_simulator.queue.put({
+                        'tipo': 'TICK',
+                        'symbol': symbol,
+                        'high': high,
+                        'low': low,
+                        'close': close,
+                        'timestamp': ts
+                    })
             except Exception as e:
                 print(f"  ⚠️ [GRID_TICKER] Error: {e}")
 

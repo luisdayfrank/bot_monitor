@@ -172,6 +172,7 @@ class GridSimulator:
         self._db_lock = asyncio.Lock()
         self.audit_logger = None
         self.notifier = None
+        self.signal_generator = None
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # LOOP PRINCIPAL
@@ -380,6 +381,21 @@ class GridSimulator:
                             pos.estado = 'PENDIENTE_CIERRE'
                             print(f"  [GRID_SIM] {symbol} Posición SHORT {pos.id} marcada PENDIENTE_CIERRE (precio dentro de rango)")
 
+            # FIX 0.2 CORREGIDO: Liquidar posiciones PENDIENTE_CIERRE a precio de mercado
+            # MOVIDO FUERA del if para que siempre se ejecute, incluso si no hay abiertas pero sí pendientes
+            posiciones_pendientes = [p for p in sim.posiciones if p.estado == 'PENDIENTE_CIERRE']
+            if posiciones_pendientes:
+                precio_actual = Decimal(str(self.precios_vivo.get(symbol, float(sim.precio_inicio))))
+                print(f"  [GRID_SIM] {symbol} Liquidando {len(posiciones_pendientes)} posiciones pendientes a ${float(precio_actual):.4f}")
+                for pos in posiciones_pendientes:
+                    pnl = self._calcular_pnl(pos, float(precio_actual))
+                    pos.estado = 'CERRADA_FORZADA'
+                    pos.pnl_cierre = pnl
+                    sim.pnl_bruto += Decimal(str(pnl))
+                    # FIX CRÍTICO: Sincronizar pnl_neto después de cada liquidación
+                    sim.pnl_neto = sim.pnl_bruto - sim.fees_totales
+                    print(f"  [GRID_SIM] {symbol} Posición {pos.id} {pos.tipo} liquidada @ ${float(precio_actual):.4f} | PnL:{pnl:+.4f}")
+
             # Calcular métricas finales
             pnl_neto_final = float(sim.pnl_neto)
             fees_total = float(sim.fees_totales)
@@ -408,10 +424,38 @@ class GridSimulator:
                 posiciones_atrapadas_json=pos_atrapadas_json,
             )
 
-            print(f"  [GRID_SIM] {symbol} Grid finalizado ({razon}) | "
-                  f"PnL Neto:{pnl_neto_final:+.4f} | Fees:{fees_total:.4f} | "
-                  f"Trades:{sim.trades_completados} | KS:{sim.trades_kill_switch} | "
-                  f"Atrapadas:{len(sim.posiciones_atrapadas)}")
+            # V5.7.4: Resumen transparente de PnL
+            pnl_bruto_real = float(sim.pnl_bruto)
+            pnl_atrapadas_total = sum(
+                getattr(p, 'pnl_cierre', 0) or 0 
+                for p in sim.posiciones_atrapadas
+            )
+            pnl_real_estimado = pnl_bruto_real - fees_total
+            pos_abiertas_restantes = len([p for p in sim.posiciones if p.estado in ('ABIERTA', 'PENDIENTE_CIERRE')])
+            
+            print(f"  [GRID_SIM] {symbol} ════════════════════════════════════════")
+            print(f"  [GRID_SIM] {symbol} Grid finalizado ({razon})")
+            print(f"  [GRID_SIM] {symbol} • PnL Bruto (emparejados): {pnl_bruto_real - pnl_atrapadas_total:+.4f}")
+            if pnl_atrapadas_total != 0:
+                print(f"  [GRID_SIM] {symbol} • PnL Atrapadas estimado: {pnl_atrapadas_total:+.4f}")
+            print(f"  [GRID_SIM] {symbol} • PnL Bruto TOTAL: {pnl_bruto_real:+.4f}")
+            print(f"  [GRID_SIM] {symbol} • Fees: {fees_total:.4f}")
+            print(f"  [GRID_SIM] {symbol} • PnL Neto REPORTADO: {pnl_neto_final:+.4f}")
+            print(f"  [GRID_SIM] {symbol} • PnL Neto REAL (bruto - fees): {pnl_real_estimado:+.4f}")
+            print(f"  [GRID_SIM] {symbol} • Trades emparejados: {sim.trades_completados}")
+            print(f"  [GRID_SIM] {symbol} • Kill Switches: {sim.trades_kill_switch}")
+            print(f"  [GRID_SIM] {symbol} • Posiciones atrapadas: {len(sim.posiciones_atrapadas)}")
+            print(f"  [GRID_SIM] {symbol} • Posiciones sin cerrar: {pos_abiertas_restantes}")
+            print(f"  [GRID_SIM] {symbol} ════════════════════════════════════════")
+            
+            # Notificar al signal_generator que el grid terminó
+            if self.signal_generator and symbol in self.signal_generator.states:
+                state = self.signal_generator.states[symbol]
+                if state.estado == 'NEUTRAL_GRID':
+                    state.estado = 'MONITOREO'
+                    state.neutral_grid_timestamp = 0
+                    state.grid_params_neutral = None
+                    print(f"  [GRID_SIM] {symbol} Estado sincronizado a MONITOREO")
 
             # Notificación
             if self.notifier:
@@ -429,11 +473,53 @@ class GridSimulator:
         except Exception as e:
             print(f"  ❌ [GRID_SIM] {symbol} Error finalizando grid: {e}")
 
+    async def cerrar_grid_suave(self, symbol: str, razon: str = 'direccion_detectada'):
+        """
+        Cierre suave: no abrir nuevas posiciones, pero dejar que las existentes se emparejen.
+        Se usa cuando se detecta dirección pero aún hay posiciones pendientes.
+        """
+        if symbol not in self.simulaciones:
+            return
+
+        sim = self.simulaciones[symbol]
+        if not sim.activa:
+            return
+
+        print(f"  [GRID_SIM] {symbol} Cierre suave iniciado ({razon})")
+
+        # Marcar como inactivo para no abrir nuevas posiciones
+        sim.activa = False
+
+        # Las posiciones existentes seguirán emparejándose por _emparejar_posiciones
+        # en los ticks siguientes. No forzar cierre aquí.
+
+        # Persistir estado
+        await self._persistir_estado(sim)
+
+        # Notificar al audit logger
+        if self.audit_logger:
+            await self.audit_logger.log_evento_grid_simulacion(
+                symbol=symbol,
+                tipo='NEUTRAL_GRID_ABORT',
+                grid_id=sim.grid_id,
+                evento_simulacion={'razon': razon, 'tipo_cierre': 'suave'},
+                pnl_acumulado=float(sim.pnl_neto)
+            )
+
+        # Notificar al signal_generator
+        if self.signal_generator and symbol in self.signal_generator.states:
+            state = self.signal_generator.states[symbol]
+            if state.estado == 'NEUTRAL_GRID':
+                state.estado = 'MONITOREO'
+                state.neutral_grid_timestamp = 0
+                state.grid_params_neutral = None
+                print(f"  [GRID_SIM] {symbol} Estado sincronizado a MONITOREO (cierre suave)")
+
+        print(f"  [GRID_SIM] {symbol} Grid inactivo, esperando emparejamiento natural")
+
     # ═══════════════════════════════════════════════════════════════════════════════
     # SIMULAR TICK (CORE)
     # ═══════════════════════════════════════════════════════════════════════════════
-
-
 
     async def simular_tick(self, symbol: str, high: float, low: float, close: float, timestamp: int):
         """
@@ -766,19 +852,19 @@ class GridSimulator:
             return True
 
         # INCLUSO EL ÚLTIMO RECURSO FALLÓ — posición ATRAPADA
+        # FIX 0.3: Contabilizar la pérdida estimada aunque esté atrapada
+        precio_actual_float = float(precio_actual)
+        pnl_atrapada = self._calcular_pnl(posicion, precio_actual_float)
         posicion.estado = 'ATRAPADA'
+        posicion.pnl_cierre = pnl_atrapada
         sim.posiciones_atrapadas.append(posicion)
+        sim.pnl_bruto += Decimal(str(pnl_atrapada))  # ← SUMAR LA PÉRDIDA
+        
+        # No sumar fees extra (ya se pagaron en apertura)
+        sim.pnl_neto = sim.pnl_bruto - sim.fees_totales
 
         print(f"  [KILL_SWITCH CRÍTICO] {symbol} Posición ATRAPADA | "
-              f"Slippage:{slippage_ultimo:.4f} > 2%")
-
-        if self.notifier:
-            await self.notifier.enviar_telegram(
-                f"🚨 <b>KILL SWITCH CRÍTICO — {symbol}</b>\n"
-                f"Posición {posicion.tipo} ATRAPADA\n"
-                f"Slippage: {slippage_ultimo:.4f} > 2%\n"
-                f"Intervención manual requerida"
-            )
+              f"PnL estimado:{pnl_atrapada:+.4f} | Slippage:{slippage_ultimo:.4f} > 2%")
         return False
 
     def _calcular_pnl(self, posicion: SimPosicion, precio_cierre: float) -> float:
@@ -907,7 +993,18 @@ class GridSimulator:
             # Verificar si hay ticks recientes
             segundos_sin_tick = ahora - sim.ultimo_tick_ts
             timeout_sin_ticks = CONFIG.grid_neutral_sin_ticks_timeout_min * 60
-            if segundos_sin_tick > timeout_sin_ticks:
+            
+            # FASE 1.2 FIX: Advertencia antes de aborto (60% del timeout = 6 min)
+            warning_threshold = timeout_sin_ticks * 0.6
+            
+            if segundos_sin_tick > warning_threshold and segundos_sin_tick <= timeout_sin_ticks:
+                # Solo loguear advertencia, NO abortar todavía
+                # El heartbeat corre cada 15 min, así que logueamos siempre que esté en zona de advertencia
+                print(f"  [HEARTBEAT SIM] {symbol} ⚠️ ADVERTENCIA: Sin ticks "
+                      f"por {segundos_sin_tick:.0f}s (aborto en {timeout_sin_ticks - segundos_sin_tick:.0f}s)")
+                # NO usar continue aquí — dejar que verifique posiciones vencidas abajo
+            
+            elif segundos_sin_tick > timeout_sin_ticks:
                 print(f"  [HEARTBEAT SIM] {symbol} Grid {sim.grid_id} SIN TICKS "
                       f"por {segundos_sin_tick:.0f}s → ABORTADO")
                 if self.audit_logger:
