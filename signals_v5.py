@@ -411,53 +411,51 @@ class SignalGenerator:
                         self._rango_reciente[symbol]['highs'] = self._rango_reciente[symbol]['highs'][-20:]
                         self._rango_reciente[symbol]['lows'] = self._rango_reciente[symbol]['lows'][-20:]
 
-            # ═══════════════════════════════════════════════════════════════════
-            # FASE 5: Evaluar aborto de NEUTRAL_GRID en cada vela 15m
-            # ═══════════════════════════════════════════════════════════════════
-            state = self.states[symbol]
-            
-            # FIX CRÍTICO: Definir abortar y razon antes de usarlas
-            if state.estado == 'NEUTRAL_GRID':
-                abortar, razon = self.evaluar_aborto_neutral_grid(
-                    symbol=symbol,
-                    i15=data,
-                    state=state,
-                    timeout_moneda=CONFIG.grid_neutral_timeout_min
-                )
-                if abortar:
-                    state.estado = 'MONITOREO'
-                    state.neutral_grid_timestamp = 0
-                    state.grid_params_neutral = None
-                    state.filtro_macro_aprobado = False
-                    state.direccion_filtro = None
-                    print(f"  [NEUTRAL_GRID] {symbol} -> MONITOREO (aborto: {razon})")
-                    
-                    # FIX: Notificar al simulador para finalizar grid
-                    if self.grid_simulator:
-                        await self.grid_simulator.queue.put({
-                            'tipo': 'FINALIZAR_GRID',
-                            'symbol': symbol,
-                            'razon': razon
-                        })
-                    
-                    # F3.6: Auditoría de aborto de grid neutral
-                    if self.audit_logger:
-                        await self.audit_logger.log_evento_grid_simulacion(
-                            symbol=symbol, tipo='NEUTRAL_GRID_ABORT', grid_id=0,
-                            evento_simulacion={'razon': razon}, pnl_acumulado=0.0
-                        )
-                        await self.audit_logger.log_cambio_estado(
-                            symbol=symbol,
-                            de='NEUTRAL_GRID',
-                            a='MONITOREO',
-                            direccion='NEUTRAL',
-                            score_macro=state.score_macro_actual
-                        )
-                        state._prev_estado = 'MONITOREO'
-                    continue  # No evaluar filtro macro este ciclo
+                # ═══════════════════════════════════════════════════════════════════
+                # FASE 5: Evaluar aborto de NEUTRAL_GRID en cada vela 15m
+                # ═══════════════════════════════════════════════════════════════════
+                state = self.states[symbol]
+                
+                # FIX: Solo evaluar aborto si estamos realmente en NEUTRAL_GRID
+                if state.estado == 'NEUTRAL_GRID':
+                    abortar, razon = self.evaluar_aborto_neutral_grid(
+                        symbol=symbol,
+                        i15=data,
+                        state=state,
+                        timeout_moneda=CONFIG.grid_neutral_timeout_min
+                    )
+                    if abortar:
+                        state.estado = 'MONITOREO'
+                        state.neutral_grid_timestamp = 0
+                        state.grid_params_neutral = None
+                        state.filtro_macro_aprobado = False
+                        state.direccion_filtro = None
+                        print(f"  [NEUTRAL_GRID] {symbol} -> MONITOREO (aborto: {razon})")
+                        
+                        if self.grid_simulator:
+                            await self.grid_simulator.queue.put({
+                                'tipo': 'FINALIZAR_GRID',
+                                'symbol': symbol,
+                                'razon': razon
+                            })
+                        
+                        if self.audit_logger:
+                            await self.audit_logger.log_evento_grid_simulacion(
+                                symbol=symbol, tipo='NEUTRAL_GRID_ABORT', grid_id=0,
+                                evento_simulacion={'razon': razon}, pnl_acumulado=0.0
+                            )
+                            await self.audit_logger.log_cambio_estado(
+                                symbol=symbol,
+                                de='NEUTRAL_GRID',
+                                a='MONITOREO',
+                                direccion='NEUTRAL',
+                                score_macro=state.score_macro_actual
+                            )
+                            state._prev_estado = 'MONITOREO'
+                        continue  # No evaluar filtro macro este ciclo
 
                 await self.evaluar_filtro_macro(symbol)
-
+                
             elif tf == '4h':
                 self.indicadores_4h[symbol] = data
 
