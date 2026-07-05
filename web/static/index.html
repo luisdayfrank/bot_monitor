@@ -3,14 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Crypto Monitor V5.7 — Multi-Timeframe Sniper</title>
+    <title>Crypto Monitor V6.1 — Análisis en Caliente</title>
     <link rel="icon" href="data:,">
 
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = { darkMode: 'class' }
     </script>
-
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
     <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 
     <style>
@@ -52,7 +52,6 @@
             box-shadow: 0 0 0 0 rgba(168, 85, 247, 0.7);
             animation: pulse-purple 1.0s infinite;
         }
-        /* V5.7 FIX: Estilos para NEUTRAL_GRID (Grid Neutral) */
         .pulse-dot-neutral {
             box-shadow: 0 0 0 0 rgba(6, 182, 212, 0.7);
             animation: pulse-cyan 1.5s infinite;
@@ -83,7 +82,6 @@
             70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(168, 85, 247, 0); }
             100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(168, 85, 247, 0); }
         }
-        /* V5.7 FIX: Keyframes para animación de NEUTRAL_GRID */
         @keyframes pulse-cyan {
             0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(6, 182, 212, 0.7); }
             70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(6, 182, 212, 0); }
@@ -103,7 +101,6 @@
         .state-badge-fire { background: #7f1d1d; color: #fca5a5; border: 1px solid #ef4444; animation: shake 0.5s infinite; }
         .state-badge-cooldown { background: #431407; color: #fdba74; border: 1px solid #f97316; }
         .state-badge-circuit { background: #581c87; color: #e9d5ff; border: 1px solid #a855f7; }
-        /* V5.7 FIX: Badge para estado NEUTRAL_GRID */
         .state-badge-neutral { 
             background: #164e63;
             color: #67e8f9;
@@ -159,7 +156,6 @@
             transform: translateX(16px);
         }
 
-        /* Glassmorphism panels */
         .glass-panel {
             background: rgba(17, 24, 39, 0.85);
             backdrop-filter: blur(12px);
@@ -168,8 +164,47 @@
         }
 
         #tvchart { min-height: 400px; position: relative; }
+
+        .analysis-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        .analysis-table th {
+            background: #1f2937; color: #9ca3af; text-align: left;
+            padding: 8px 12px; font-weight: 600; text-transform: uppercase; font-size: 10px;
+            position: sticky; top: 0; z-index: 10;
+        }
+        .analysis-table td {
+            padding: 8px 12px; border-bottom: 1px solid #374151;
+            color: #d1d5db; vertical-align: top;
+        }
+        .analysis-table tr:hover td { background: rgba(59,130,246,0.08); }
+        .analysis-table tr.selected td { background: rgba(59,130,246,0.2); }
+
+        .kpi-card {
+            background: rgba(31, 41, 55, 0.6);
+            border: 1px solid #374151;
+            border-radius: 12px;
+            padding: 16px;
+        }
+        .sub-tab-btn {
+            padding: 6px 14px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 600;
+            color: #9ca3af;
+            background: transparent;
+            border: 1px solid transparent;
+            transition: all 0.2s;
+            white-space: nowrap;
+        }
+        .sub-tab-btn.active {
+            background: #3b82f6;
+            color: white;
+            border-color: #3b82f6;
+        }
+        .sub-tab-btn:hover:not(.active) {
+            background: rgba(255,255,255,0.05);
+            color: #e5e7eb;
+        }
     </style>
-<base target="_blank">
 <base target="_blank">
 </head>
 <body class="bg-[#0b0e14] text-white font-sans h-screen flex overflow-hidden">
@@ -182,7 +217,7 @@
         <div class="p-4 border-b border-gray-800 flex justify-between items-center bg-gray-900/50">
             <h1 class="text-lg font-bold flex items-center gap-2 tracking-wide">
                 <span id="status-dot" class="w-3 h-3 rounded-full bg-yellow-500"></span>
-                Sniper <span class="text-blue-500">V5.7</span>
+                Sniper <span class="text-blue-500">V6.1</span>
             </h1>
             <div class="flex flex-col items-end gap-0.5">
                 <span id="ws-status" class="text-xs text-yellow-500 font-mono">Conectando...</span>
@@ -215,7 +250,6 @@
                     <option value="FIRE">FIRE</option>
                     <option value="ARMED">ARMED</option>
                     <option value="COOLDOWN">COOLDOWN</option>
-                    <!-- V5.7 FIX: Opción para filtrar monedas en Grid Neutral -->
                     <option value="NEUTRAL_GRID">GRID NEUTRAL</option>
                 </select>
             </div>
@@ -240,7 +274,7 @@
     <!-- MAIN -->
     <main class="flex-1 flex flex-col h-full relative min-w-0">
 
-        <!-- HEADER MÓVIL (solo visible en móvil) -->
+        <!-- HEADER MÓVIL -->
         <div class="md:hidden glass-panel flex items-center justify-between p-3 shrink-0 z-30">
             <button onclick="toggleMobileMenu()" class="text-gray-300 p-1">
                 <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path></svg>
@@ -256,14 +290,13 @@
         <nav class="flex border-b border-gray-800 bg-gray-900/50 shrink-0">
             <button onclick="switchTab('chart-view')" id="tab-chart" class="tab-btn flex-1 py-3 text-sm font-semibold text-blue-400 border-b-2 border-blue-500 bg-gray-800/50">📈 Gráfico</button>
             <button onclick="switchTab('stats-view')" id="tab-stats" class="tab-btn flex-1 py-3 text-sm font-semibold text-gray-400 hover:text-gray-200 border-b-2 border-transparent">📊 Estadísticas</button>
+            <button onclick="switchTab('analysis-view')" id="tab-analysis" class="tab-btn flex-1 py-3 text-sm font-semibold text-gray-400 hover:text-gray-200 border-b-2 border-transparent">🔬 Análisis</button>
         </nav>
 
         <div class="flex-1 relative overflow-hidden">
 
             <!-- VISTA GRÁFICO -->
             <div id="chart-view" class="absolute inset-0 flex flex-col">
-
-                <!-- HEADER DESKTOP -->
                 <header class="h-24 bg-gray-900 border-b border-gray-700 p-4 flex items-center justify-between shrink-0 z-20">
                     <div class="flex items-end gap-4 min-w-0">
                         <h2 id="active-coin-title" class="text-3xl font-bold text-blue-400 truncate">SELECCIONA MONEDA</h2>
@@ -330,7 +363,6 @@
                     </div>
                 </header>
 
-                <!-- V5.7: BOTÓN DE PAUSA RÁPIDA -->
                 <div class="px-4 py-2 bg-gray-900/80 border-b border-gray-800 flex items-center gap-3 shrink-0">
                     <button onclick="pauseCurrentCoin()" id="btn-pause" class="px-3 py-1.5 bg-orange-500/10 hover:bg-orange-500/20 text-orange-400 border border-orange-500/20 rounded-lg text-xs font-bold transition flex items-center gap-1.5 disabled:opacity-30 disabled:cursor-not-allowed" disabled>
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
@@ -339,7 +371,6 @@
                     <span class="text-[10px] text-gray-500">Pausa temporal (no afecta el registro)</span>
                 </div>
 
-                <!-- Selector de Timeframe -->
                 <div class="flex gap-2 p-2 bg-gray-800 border-b border-gray-700">
                     <button onclick="switchTimeframe('1m')" id="btn-1m" class="px-3 py-1 text-xs font-bold rounded bg-blue-600 text-white">1M</button>
                     <button onclick="switchTimeframe('15m')" id="btn-15m" class="px-3 py-1 text-xs font-bold rounded bg-gray-700 text-gray-400 hover:bg-gray-600">15M</button>
@@ -358,7 +389,6 @@
                 <h2 class="text-2xl font-bold text-white mb-2">Rendimiento del Bot</h2>
                 <p class="text-xs text-gray-500 mb-6">Datos extraídos directamente de la base de datos SQLite</p>
 
-                <!-- V5.7 FIX: Grid ampliado a 2x2 para métricas adicionales -->
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
                     <div class="bg-gray-800/40 p-5 rounded-xl border border-gray-700/50 hover:border-blue-500/30 transition">
                         <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
@@ -382,7 +412,6 @@
                             Win Rate Rechazos
                         </div>
                         <div class="text-3xl font-mono text-green-400" id="stat-winrate">--%</div>
-                        <!-- V5.7 FIX: Leyenda corregida para reflejar cálculo real -->
                         <div class="text-xs text-gray-500 mt-1">Tasa de acierto de seguimientos finalizados hoy</div>
                     </div>
                     <div class="bg-gray-800/40 p-5 rounded-xl border border-gray-700/50 hover:border-blue-500/30 transition">
@@ -395,19 +424,16 @@
                     </div>
                 </div>
 
-                <!-- V5.7 FIX: Información actualizada sobre el cálculo del Win Rate -->
                 <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50 mb-6">
-                    <h3 class="text-sm font-bold text-gray-300 mb-2">ℹ️ Sobre estas métricas (V5.7)</h3>
+                    <h3 class="text-sm font-bold text-gray-300 mb-2">ℹ️ Sobre estas métricas (V6.1)</h3>
                     <ul class="text-xs text-gray-500 space-y-1 list-disc list-inside">
                         <li><b>Disparos Hoy:</b> Eventos FIRE registrados hoy (hora local).</li>
                         <li><b>Near-Misses Hoy:</b> Seguimientos iniciados hoy (incluye los que aún están en curso de sus 2h).</li>
                         <li><b>Finalizados Hoy:</b> Seguimientos que completaron sus 2h de tracking y tienen veredicto.</li>
-                        <!-- V5.7 FIX: Explicación corregida del Win Rate -->
                         <li><b>Win Rate:</b> <span class="text-cyan-400">Aciertos ÷ Finalizados</span> (NO incluye seguimientos en curso). Un seguimiento "acierta" cuando el bot rechazó correctamente (precio se movió en contra).</li>
                     </ul>
                 </div>
 
-                <!-- V5.9.2: Panel de Grid Neutral -->
                 <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50 mt-6 mb-6">
                     <h3 class="text-sm font-bold text-gray-300 mb-3 flex items-center gap-2">
                         <span>🌐</span> Grid Neutral (V5.9.2)
@@ -448,6 +474,126 @@
                 </button>
             </div>
 
+            <!-- VISTA ANÁLISIS -->
+            <div id="analysis-view" class="hidden absolute inset-0 overflow-hidden flex flex-col bg-[#0b0e14]">
+
+                <!-- Sub-nav de análisis -->
+                <div class="flex items-center gap-2 p-3 border-b border-gray-800 bg-gray-900/50 shrink-0 overflow-x-auto no-scrollbar">
+                    <button onclick="switchAnalysisTab('resumen')" id="analysis-tab-resumen" class="sub-tab-btn active">🌍 Resumen Global</button>
+                    <button onclick="switchAnalysisTab('auditoria')" id="analysis-tab-auditoria" class="sub-tab-btn">📋 Auditoría</button>
+                    <button onclick="switchAnalysisTab('nearmiss')" id="analysis-tab-nearmiss" class="sub-tab-btn">🎯 Near-Misses</button>
+                    <button onclick="switchAnalysisTab('grids')" id="analysis-tab-grids" class="sub-tab-btn">💠 Grid Neutral</button>
+                    <div class="flex-1"></div>
+                    <button onclick="refreshAnalysis()" class="text-xs px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg font-semibold transition">🔄 Actualizar</button>
+                </div>
+
+                <div class="flex-1 overflow-y-auto p-4 md:p-6 relative">
+
+                    <!-- RESUMEN GLOBAL -->
+                    <div id="analysis-resumen" class="analysis-panel">
+                        <h2 class="text-xl font-bold text-white mb-4">🌍 Resumen Global del Bot</h2>
+                        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6" id="kpi-container">
+                            <div class="kpi-card"><div class="text-xs text-gray-400">Cargando...</div></div>
+                        </div>
+                        <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                            <h3 class="text-sm font-bold text-gray-300 mb-2">📊 Distribución de Eventos Hoy</h3>
+                            <div id="chart-distribucion" class="h-64"></div>
+                        </div>
+                    </div>
+
+                    <!-- AUDITORÍA -->
+                    <div id="analysis-auditoria" class="analysis-panel hidden">
+                        <div class="flex flex-wrap items-center gap-3 mb-4">
+                            <h2 class="text-xl font-bold text-white">📋 Registro de Auditoría</h2>
+                            <select id="audit-symbol-filter" onchange="loadAuditoria()" class="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300">
+                                <option value="">Todas las monedas</option>
+                            </select>
+                            <select id="audit-type-filter" onchange="loadAuditoria()" class="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300">
+                                <option value="">Todos los tipos</option>
+                                <option value="FIRE">FIRE</option>
+                                <option value="RECHAZADO">RECHAZADO</option>
+                                <option value="ARMED">ARMED</option>
+                                <option value="CAMBIO_ESTADO">CAMBIO_ESTADO</option>
+                                <option value="CIRCUIT_BREAKER">CIRCUIT_BREAKER</option>
+                                <option value="NEUTRAL_GRID_INICIADO">NEUTRAL_GRID_INICIADO</option>
+                                <option value="NEUTRAL_GRID_ABORT">NEUTRAL_GRID_ABORT</option>
+                            </select>
+                            <input type="date" id="audit-date" onchange="loadAuditoria()" class="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300">
+                        </div>
+                        <div class="overflow-x-auto rounded-xl border border-gray-700/50">
+                            <table class="analysis-table" id="audit-table">
+                                <thead><tr>
+                                    <th>Hora</th><th>Moneda</th><th>Tipo</th><th>Dir</th><th>Precio</th><th>Score</th><th>Estado</th>
+                                </tr></thead>
+                                <tbody><tr><td colspan="7" class="text-center text-gray-500 py-8">Cargando datos...</td></tr></tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- NEAR-MISSES -->
+                    <div id="analysis-nearmiss" class="analysis-panel hidden">
+                        <div class="flex flex-wrap items-center gap-3 mb-4">
+                            <h2 class="text-xl font-bold text-white">🎯 Seguimientos Near-Miss</h2>
+                            <select id="nm-symbol-filter" onchange="loadNearMisses()" class="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300">
+                                <option value="">Todas las monedas</option>
+                            </select>
+                            <select id="nm-estado-filter" onchange="loadNearMisses()" class="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300">
+                                <option value="todos">Todos</option>
+                                <option value="finalizados">Finalizados</option>
+                                <option value="en_curso">En curso</option>
+                            </select>
+                        </div>
+                        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                            <div class="overflow-x-auto rounded-xl border border-gray-700/50 max-h-[500px] overflow-y-auto">
+                                <table class="analysis-table" id="nm-table">
+                                    <thead><tr>
+                                        <th>Inicio</th><th>Moneda</th><th>Dir</th><th>Score</th><th>Umbral</th><th>¿Acertó?</th><th>Mov %</th>
+                                    </tr></thead>
+                                    <tbody><tr><td colspan="7" class="text-center text-gray-500 py-8">Cargando...</td></tr></tbody>
+                                </table>
+                            </div>
+                            <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                                <h3 class="text-sm font-bold text-gray-300 mb-2">📈 Trayectoria del Near-Miss</h3>
+                                <div id="nm-chart" class="h-80"></div>
+                                <div id="nm-detail" class="mt-3 text-xs text-gray-400 space-y-1"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- GRIDS -->
+                    <div id="analysis-grids" class="analysis-panel hidden">
+                        <div class="flex flex-wrap items-center gap-3 mb-4">
+                            <h2 class="text-xl font-bold text-white">💠 Grids Neutrales</h2>
+                            <select id="grid-symbol-filter" onchange="loadGrids()" class="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300">
+                                <option value="">Todas las monedas</option>
+                            </select>
+                            <select id="grid-estado-filter" onchange="loadGrids()" class="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300">
+                                <option value="todos">Todos</option>
+                                <option value="ACTIVO">ACTIVO</option>
+                                <option value="ABORTADO">ABORTADO</option>
+                                <option value="COMPLETADO">COMPLETADO</option>
+                            </select>
+                        </div>
+                        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                            <div class="overflow-x-auto rounded-xl border border-gray-700/50 max-h-[500px] overflow-y-auto">
+                                <table class="analysis-table" id="grids-table">
+                                    <thead><tr>
+                                        <th>Inicio</th><th>Moneda</th><th>Estado</th><th>PnL Neto</th><th>Fees</th><th>Trades</th><th>KS</th>
+                                    </tr></thead>
+                                    <tbody><tr><td colspan="7" class="text-center text-gray-500 py-8">Cargando...</td></tr></tbody>
+                                </table>
+                            </div>
+                            <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                                <h3 class="text-sm font-bold text-gray-300 mb-2">📐 Ejecución del Grid</h3>
+                                <div id="grid-chart" class="h-80"></div>
+                                <div id="grid-detail" class="mt-3 text-xs text-gray-400 space-y-1"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+
         </div>
 
     </main>
@@ -455,7 +601,7 @@
     <script>
 
         // ============================================
-        // ESTADO GLOBAL V5.7
+        // ESTADO GLOBAL V6.1
         // ============================================
         let activeSymbol = null;
         let activeTimeframe = '1m';
@@ -469,7 +615,7 @@
         let isFirstConnect = true;
 
         const MAX_ALERTS = 50;
-        const ALERTS_KEY = 'crypto_monitor_v5_alerts';
+        const ALERTS_KEY = 'crypto_monitor_v61_alerts';
         let unreadAlerts = 0;
 
         // ============================================
@@ -539,45 +685,398 @@
         }
 
         // ============================================
-        // V5.7: SISTEMA DE TABS
+        // V6.1: SISTEMA DE TABS PRINCIPALES
         // ============================================
         function switchTab(tabId) {
             document.getElementById('chart-view').classList.add('hidden');
             document.getElementById('stats-view').classList.add('hidden');
-            document.getElementById(tabId).classList.remove('hidden');
+            document.getElementById('analysis-view').classList.add('hidden');
 
             const btnChart = document.getElementById('tab-chart');
             const btnStats = document.getElementById('tab-stats');
+            const btnAnalysis = document.getElementById('tab-analysis');
+
+            [btnChart, btnStats, btnAnalysis].forEach(b => {
+                b.classList.remove('text-blue-400', 'border-blue-500', 'bg-gray-800/50');
+                b.classList.add('text-gray-400', 'border-transparent');
+            });
+
+            document.getElementById(tabId).classList.remove('hidden');
 
             if (tabId === 'chart-view') {
                 btnChart.classList.add('text-blue-400', 'border-blue-500', 'bg-gray-800/50');
                 btnChart.classList.remove('text-gray-400', 'border-transparent');
-                btnStats.classList.remove('text-blue-400', 'border-blue-500', 'bg-gray-800/50');
-                btnStats.classList.add('text-gray-400', 'border-transparent');
-                // Resize chart when switching back
                 setTimeout(() => {
                     if (chartContainer.clientWidth > 0 && chartContainer.clientHeight > 0) {
-                        chart.applyOptions({
-                            width: chartContainer.clientWidth,
-                            height: chartContainer.clientHeight
-                        });
+                        chart.applyOptions({ width: chartContainer.clientWidth, height: chartContainer.clientHeight });
                     }
                 }, 50);
-            } else {
+            } else if (tabId === 'stats-view') {
                 btnStats.classList.add('text-blue-400', 'border-blue-500', 'bg-gray-800/50');
                 btnStats.classList.remove('text-gray-400', 'border-transparent');
-                btnChart.classList.remove('text-blue-400', 'border-blue-500', 'bg-gray-800/50');
-                btnChart.classList.add('text-gray-400', 'border-transparent');
                 fetchStats();
-                // F5.6: Refrescar grid neutral al cambiar a pestaña STATS
-                if (activeSymbol) {
-                    fetchGridNeutral(activeSymbol);
-                }
+                if (activeSymbol) fetchGridNeutral(activeSymbol);
+            } else if (tabId === 'analysis-view') {
+                btnAnalysis.classList.add('text-blue-400', 'border-blue-500', 'bg-gray-800/50');
+                btnAnalysis.classList.remove('text-gray-400', 'border-transparent');
+                refreshAnalysis();
             }
         }
 
         // ============================================
-        // V5.7: MENÚ MÓVIL
+        // V6.1: SUB-TABS DE ANÁLISIS
+        // ============================================
+        function switchAnalysisTab(subTab) {
+            ['resumen', 'auditoria', 'nearmiss', 'grids'].forEach(t => {
+                document.getElementById('analysis-' + t).classList.add('hidden');
+                document.getElementById('analysis-tab-' + t).classList.remove('active');
+            });
+            document.getElementById('analysis-' + subTab).classList.remove('hidden');
+            document.getElementById('analysis-tab-' + subTab).classList.add('active');
+
+            if (subTab === 'resumen') loadResumenGlobal();
+            if (subTab === 'auditoria') loadAuditoria();
+            if (subTab === 'nearmiss') loadNearMisses();
+            if (subTab === 'grids') loadGrids();
+        }
+
+        function refreshAnalysis() {
+            const active = document.querySelector('.sub-tab-btn.active');
+            if (active) {
+                const tab = active.id.replace('analysis-tab-', '');
+                if (tab === 'resumen') loadResumenGlobal();
+                if (tab === 'auditoria') loadAuditoria();
+                if (tab === 'nearmiss') loadNearMisses();
+                if (tab === 'grids') loadGrids();
+            }
+        }
+
+        // ============================================
+        // V6.1: RESUMEN GLOBAL
+        // ============================================
+        async function loadResumenGlobal() {
+            try {
+                const res = await fetch('/api/stats/extended');
+                const d = await res.json();
+                if (d.estado !== 'success') return;
+
+                const kpiContainer = document.getElementById('kpi-container');
+                const items = [
+                    { label: '🔥 Disparos (FIRE)', value: d.fires_hoy, color: 'text-red-400' },
+                    { label: '❌ Rechazados', value: d.rechazados_hoy, color: 'text-orange-400' },
+                    { label: '🟡 ARMED', value: d.armed_hoy, color: 'text-yellow-400' },
+                    { label: '🎯 Near-Misses', value: d.near_miss_total, color: 'text-blue-400' },
+                    { label: '✅ NM Finalizados', value: d.near_miss_finalizados, color: 'text-green-400' },
+                    { label: '📊 Win Rate NM', value: d.near_miss_win_rate !== null ? d.near_miss_win_rate + '%' : 'PEND', color: 'text-cyan-400' },
+                    { label: '💠 Grids', value: d.grids_total, color: 'text-purple-400' },
+                    { label: '💰 PnL Grid', value: (d.pnl_total > 0 ? '+' : '') + d.pnl_total.toFixed(2) + ' USDT', color: d.pnl_total >= 0 ? 'text-green-400' : 'text-red-400' },
+                ];
+
+                kpiContainer.innerHTML = items.map(it => `
+                    <div class="kpi-card">
+                        <div class="text-xs text-gray-400 mb-1">${it.label}</div>
+                        <div class="text-2xl font-mono font-bold ${it.color}">${it.value}</div>
+                    </div>
+                `).join('');
+
+                // Gráfico de distribución
+                const dataPlot = [{
+                    values: [d.fires_hoy, d.rechazados_hoy, d.armed_hoy, d.near_miss_total],
+                    labels: ['FIRE', 'RECHAZADO', 'ARMED', 'NEAR-MISS'],
+                    type: 'pie',
+                    hole: 0.4,
+                    marker: { colors: ['#ef4444', '#f97316', '#eab308', '#3b82f6'] },
+                    textinfo: 'label+value',
+                    textposition: 'outside'
+                }];
+                Plotly.newPlot('chart-distribucion', dataPlot, {
+                    paper_bgcolor: 'rgba(0,0,0,0)',
+                    plot_bgcolor: 'rgba(0,0,0,0)',
+                    font: { color: '#9ca3af', size: 11 },
+                    margin: { t: 10, b: 10, l: 10, r: 10 },
+                    showlegend: false
+                }, { responsive: true, displayModeBar: false });
+
+            } catch (e) { console.error('[ANALYSIS] Error cargando resumen:', e); }
+        }
+
+        // ============================================
+        // V6.1: AUDITORÍA
+        // ============================================
+        async function loadAuditoria() {
+            const symbol = document.getElementById('audit-symbol-filter').value;
+            const tipo = document.getElementById('audit-type-filter').value;
+            const fecha = document.getElementById('audit-date').value;
+
+            let url = '/api/auditoria?';
+            if (symbol) url += `symbol=${symbol}&`;
+            if (tipo) url += `tipos=${tipo}&`;
+            if (fecha) url += `fecha_inicio=${fecha}&fecha_fin=${fecha}&`;
+
+            try {
+                const res = await fetch(url);
+                const d = await res.json();
+                const tbody = document.querySelector('#audit-table tbody');
+                if (!d.data || d.data.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="text-center text-gray-500 py-8">Sin eventos</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = d.data.map(row => {
+                    const ts = row.timestamp_local ? new Date(row.timestamp_local).toLocaleString() : row.timestamp_utc;
+                    const tipoClass = row.tipo === 'FIRE' ? 'text-red-400 font-bold' : (row.tipo === 'RECHAZADO' ? 'text-orange-400' : 'text-gray-300');
+                    return `<tr>
+                        <td class="font-mono text-[11px]">${ts}</td>
+                        <td class="font-bold">${row.symbol}</td>
+                        <td class="${tipoClass}">${row.tipo}</td>
+                        <td>${row.direccion || '-'}</td>
+                        <td class="font-mono">${row.precio ? '$'+row.precio.toFixed(4) : '-'}</td>
+                        <td>${row.score !== null ? row.score : '-'}</td>
+                        <td class="text-[11px] text-gray-500">${row.estado_maquina || ''}</td>
+                    </tr>`;
+                }).join('');
+            } catch (e) { console.error('[ANALYSIS] Error auditoría:', e); }
+        }
+
+        // ============================================
+        // V6.1: NEAR-MISSES
+        // ============================================
+        let nmDataCache = [];
+
+        async function loadNearMisses() {
+            const symbol = document.getElementById('nm-symbol-filter').value;
+            const estado = document.getElementById('nm-estado-filter').value;
+
+            let url = '/api/near-misses?';
+            if (symbol) url += `symbol=${symbol}&`;
+            if (estado && estado !== 'todos') url += `estado=${estado}&`;
+
+            try {
+                const res = await fetch(url);
+                const d = await res.json();
+                nmDataCache = d.data || [];
+                const tbody = document.querySelector('#nm-table tbody');
+                if (!nmDataCache.length) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="text-center text-gray-500 py-8">Sin near-misses</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = nmDataCache.map((row, idx) => {
+                    const inicio = row.timestamp_inicio ? new Date(row.timestamp_inicio * 1000).toLocaleString() : '-';
+                    const acerto = row.acerto_bot === 1 ? '✅ Sí' : (row.acerto_bot === 0 ? '❌ No' : '⏳ En curso');
+                    const acertoColor = row.acerto_bot === 1 ? 'text-green-400' : (row.acerto_bot === 0 ? 'text-red-400' : 'text-yellow-400');
+                    return `<tr onclick="selectNearMiss(${idx})" class="cursor-pointer" id="nm-row-${idx}">
+                        <td class="font-mono text-[11px]">${inicio}</td>
+                        <td class="font-bold">${row.symbol}</td>
+                        <td>${row.direccion_nm}</td>
+                        <td>${row.score}</td>
+                        <td>${row.umbral}</td>
+                        <td class="${acertoColor} font-bold">${acerto}</td>
+                        <td class="font-mono">${row.movimiento_pct !== null ? row.movimiento_pct.toFixed(2)+'%' : '-'}</td>
+                    </tr>`;
+                }).join('');
+            } catch (e) { console.error('[ANALYSIS] Error near-misses:', e); }
+        }
+
+        async function selectNearMiss(idx) {
+            document.querySelectorAll('#nm-table tbody tr').forEach(tr => tr.classList.remove('selected'));
+            const rowEl = document.getElementById('nm-row-' + idx);
+            if (rowEl) rowEl.classList.add('selected');
+
+            const row = nmDataCache[idx];
+            if (!row) return;
+
+            const detail = document.getElementById('nm-detail');
+            detail.innerHTML = `
+                <div><b>ID:</b> ${row.id}</div>
+                <div><b>Precio inicio:</b> $${row.precio_inicio?.toFixed(4) || '-'}</div>
+                <div><b>Precio fin:</b> $${row.precio_fin?.toFixed(4) || '-'}</div>
+                <div><b>Máximo:</b> $${row.precio_max?.toFixed(4) || '-'}</div>
+                <div><b>Mínimo:</b> $${row.precio_min?.toFixed(4) || '-'}</div>
+                <div><b>Dirección real:</b> ${row.direccion_real || '-'}</div>
+                <div><b>Hubiera sido rentable:</b> ${row.hubiera_sido_rentable === 1 ? 'Sí' : 'No'}</div>
+                <div><b>Notas:</b> ${row.notas || '-'}</div>
+            `;
+
+            if (!row.timestamp_inicio) return;
+            const tIni = Math.floor(row.timestamp_inicio * 1000) - (30 * 60 * 1000);
+            const tFin = Math.floor((row.timestamp_fin || (row.timestamp_inicio + 7200)) * 1000) + (30 * 60 * 1000);
+
+            try {
+                const res = await fetch(`/api/velas/range?symbol=${row.symbol}&tf=1m&t_ini_ms=${tIni}&t_fin_ms=${tFin}`);
+                const velasData = await res.json();
+                const velas = velasData.velas || [];
+
+                if (velas.length === 0) {
+                    Plotly.purge('nm-chart');
+                    return;
+                }
+
+                const x = velas.map(v => new Date(v.timestamp));
+                const y = velas.map(v => v.close);
+
+                const traces = [{
+                    x: x, y: y, mode: 'lines', name: 'Precio',
+                    line: { color: '#3b82f6', width: 2 },
+                    fill: 'tozeroy', fillcolor: 'rgba(59,130,246,0.1)'
+                }];
+
+                if (row.precio_inicio) {
+                    traces.push({
+                        x: [x[0], x[x.length-1]], y: [row.precio_inicio, row.precio_inicio],
+                        mode: 'lines', name: 'Inicio', line: { color: '#fbbf24', width: 2, dash: 'dash' }
+                    });
+                }
+
+                if (row.direccion_nm === 'LONG') {
+                    traces.push({
+                        x: [...x, ...x.slice().reverse()],
+                        y: [...x.map(() => row.precio_inicio), ...x.map(() => row.precio_inicio * 0.95)],
+                        fill: 'toself', fillcolor: 'rgba(239,68,68,0.1)', line: { width: 0 }, showlegend: false
+                    });
+                    traces.push({
+                        x: [...x, ...x.slice().reverse()],
+                        y: [...x.map(() => row.precio_inicio * 1.05), ...x.map(() => row.precio_inicio)],
+                        fill: 'toself', fillcolor: 'rgba(34,197,94,0.1)', line: { width: 0 }, showlegend: false
+                    });
+                } else if (row.direccion_nm === 'SHORT') {
+                    traces.push({
+                        x: [...x, ...x.slice().reverse()],
+                        y: [...x.map(() => row.precio_inicio), ...x.map(() => row.precio_inicio * 1.05)],
+                        fill: 'toself', fillcolor: 'rgba(239,68,68,0.1)', line: { width: 0 }, showlegend: false
+                    });
+                    traces.push({
+                        x: [...x, ...x.slice().reverse()],
+                        y: [...x.map(() => row.precio_inicio * 0.95), ...x.map(() => row.precio_inicio)],
+                        fill: 'toself', fillcolor: 'rgba(34,197,94,0.1)', line: { width: 0 }, showlegend: false
+                    });
+                }
+
+                Plotly.newPlot('nm-chart', traces, {
+                    title: { text: `Near-Miss: ${row.symbol} (${row.direccion_nm})`, font: { color: '#e5e7eb', size: 14 } },
+                    paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: '#111827',
+                    font: { color: '#9ca3af' },
+                    xaxis: { gridcolor: '#374151', title: '' },
+                    yaxis: { gridcolor: '#374151', title: 'Precio (USDT)' },
+                    margin: { t: 40, b: 30, l: 50, r: 20 },
+                    showlegend: false
+                }, { responsive: true, displayModeBar: false });
+
+            } catch (e) { console.error('[ANALYSIS] Error cargando velas near-miss:', e); }
+        }
+
+        // ============================================
+        // V6.1: GRIDS NEUTRALES
+        // ============================================
+        let gridDataCache = [];
+
+        async function loadGrids() {
+            const symbol = document.getElementById('grid-symbol-filter').value;
+            const estado = document.getElementById('grid-estado-filter').value;
+
+            let url = '/api/grids?';
+            if (symbol) url += `symbol=${symbol}&`;
+            if (estado && estado !== 'todos') url += `estado_grid=${estado}&`;
+
+            try {
+                const res = await fetch(url);
+                const d = await res.json();
+                gridDataCache = d.data || [];
+                const tbody = document.querySelector('#grids-table tbody');
+                if (!gridDataCache.length) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="text-center text-gray-500 py-8">Sin grids</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = gridDataCache.map((row, idx) => {
+                    const inicio = row.timestamp_inicio ? new Date(row.timestamp_inicio * 1000).toLocaleString() : '-';
+                    const pnlColor = (row.pnl_neto || 0) >= 0 ? 'text-green-400' : 'text-red-400';
+                    return `<tr onclick="selectGrid(${idx})" class="cursor-pointer" id="grid-row-${idx}">
+                        <td class="font-mono text-[11px]">${inicio}</td>
+                        <td class="font-bold">${row.symbol}</td>
+                        <td><span class="px-2 py-0.5 rounded text-[10px] font-bold ${row.grid_estado === 'ACTIVO' ? 'bg-purple-900 text-purple-300' : (row.grid_estado === 'ABORTADO' ? 'bg-red-900 text-red-300' : 'bg-green-900 text-green-300')}">${row.grid_estado}</span></td>
+                        <td class="font-mono ${pnlColor}">${row.pnl_neto !== null ? (row.pnl_neto > 0 ? '+' : '') + row.pnl_neto.toFixed(4) : '-'}</td>
+                        <td class="font-mono text-gray-400">${row.fees_totales !== null ? row.fees_totales.toFixed(4) : '-'}</td>
+                        <td>${row.trades_completados || 0}</td>
+                        <td class="text-orange-400">${row.trades_kill_switch || 0}</td>
+                    </tr>`;
+                }).join('');
+            } catch (e) { console.error('[ANALYSIS] Error grids:', e); }
+        }
+
+        async function selectGrid(idx) {
+            document.querySelectorAll('#grids-table tbody tr').forEach(tr => tr.classList.remove('selected'));
+            const rowEl = document.getElementById('grid-row-' + idx);
+            if (rowEl) rowEl.classList.add('selected');
+
+            const row = gridDataCache[idx];
+            if (!row) return;
+
+            const detail = document.getElementById('grid-detail');
+            let params = {};
+            try { params = JSON.parse(row.grid_params_json || '{}'); } catch(e) {}
+
+            detail.innerHTML = `
+                <div><b>Grid ID:</b> ${row.grid_id}</div>
+                <div><b>Sim ID:</b> ${row.sim_id || '-'}</div>
+                <div><b>Rango:</b> $${params.lower_limit?.toFixed(4) || '-'} - $${params.upper_limit?.toFixed(4) || '-'}</div>
+                <div><b>Grids:</b> ${params.grid_count || '-'}</div>
+                <div><b>Step:</b> ${params.step_pct ? params.step_pct + '%' : '-'}</div>
+                <div><b>Capital:</b> $${params.capital_sugerido || '-'}</div>
+                <div><b>Posiciones abiertas:</b> ${row.posiciones_abiertas_json ? 'Ver tabla' : 'Ninguna'}</div>
+            `;
+
+            if (!row.timestamp_inicio) return;
+            const tIni = Math.floor(row.timestamp_inicio * 1000) - (30 * 60 * 1000);
+            const tFin = Math.floor((row.timestamp_fin || (row.timestamp_inicio + 3600 * 4)) * 1000) + (30 * 60 * 1000);
+
+            try {
+                const res = await fetch(`/api/velas/range?symbol=${row.symbol}&tf=1m&t_ini_ms=${tIni}&t_fin_ms=${tFin}`);
+                const velasData = await res.json();
+                const velas = velasData.velas || [];
+
+                if (velas.length === 0) {
+                    Plotly.purge('grid-chart');
+                    return;
+                }
+
+                const x = velas.map(v => new Date(v.timestamp));
+                const traces = [{
+                    x: x, y: velas.map(v => v.close), mode: 'lines', name: 'Precio',
+                    line: { color: '#3b82f6', width: 2 }
+                }];
+
+                if (params.lower_limit && params.upper_limit && params.grid_count) {
+                    const step = (params.upper_limit - params.lower_limit) / params.grid_count;
+                    for (let i = 0; i <= params.grid_count; i++) {
+                        const nivel = params.lower_limit + step * i;
+                        traces.push({
+                            x: [x[0], x[x.length-1]], y: [nivel, nivel],
+                            mode: 'lines', line: { color: 'rgba(6,182,212,0.5)', width: 1, dash: 'dot' },
+                            showlegend: false, hoverinfo: 'skip'
+                        });
+                    }
+                }
+
+                if (row.precio_entrada) {
+                    traces.push({
+                        x: [x[0], x[x.length-1]], y: [row.precio_entrada, row.precio_entrada],
+                        mode: 'lines', name: 'Entrada', line: { color: '#fbbf24', width: 2 }
+                    });
+                }
+
+                Plotly.newPlot('grid-chart', traces, {
+                    title: { text: `Grid Neutral: ${row.symbol}`, font: { color: '#e5e7eb', size: 14 } },
+                    paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: '#111827',
+                    font: { color: '#9ca3af' },
+                    xaxis: { gridcolor: '#374151' },
+                    yaxis: { gridcolor: '#374151', title: 'Precio (USDT)' },
+                    margin: { t: 40, b: 30, l: 50, r: 20 },
+                    showlegend: false
+                }, { responsive: true, displayModeBar: false });
+
+            } catch (e) { console.error('[ANALYSIS] Error cargando velas grid:', e); }
+        }
+
+        // ============================================
+        // V6.1: MENÚ MÓVIL
         // ============================================
         function toggleMobileMenu() {
             const sidebar = document.getElementById('sidebar');
@@ -587,9 +1086,8 @@
         }
 
         // ============================================
-        // V5.7: ESTADÍSTICAS DESDE DB
+        // V6.1: ESTADÍSTICAS DESDE DB
         // ============================================
-        /* V5.7 FIX: fetchStats actualizado para mostrar métricas de transparencia */
         async function fetchStats() {
             try {
                 const res = await fetch('/api/stats/summary');
@@ -597,7 +1095,6 @@
                 if (data.estado === 'success') {
                     document.getElementById('stat-fires').innerText = data.fires_hoy;
                     document.getElementById('stat-nearmiss').innerText = data.total_near_miss;
-                    /* V5.7 FIX: Mostrar seguimientos finalizados si el elemento existe */
                     const elFinalizados = document.getElementById('stat-finalizados');
                     if (elFinalizados) elFinalizados.innerText = data.finalizados_hoy || 0;
                     const winRateEl = document.getElementById('stat-winrate');
@@ -625,14 +1122,11 @@
                 if (elFinalizados) elFinalizados.innerText = 'ERR';
                 document.getElementById('stat-winrate').innerText = 'ERR';
             }
-
-            // V5.9.2: Cargar estado del grid neutral para la moneda activa
             if (activeSymbol) {
                 await fetchGridNeutral(activeSymbol);
             }
         }
 
-        // V5.9.2: Cargar estado del grid neutral desde /api/grid-neutral/{symbol}
         async function fetchGridNeutral(symbol) {
             try {
                 const res = await fetch(`/api/grid-neutral/${symbol}`);
@@ -661,7 +1155,6 @@
 
                     document.getElementById('grid-last-tick').innerText = (data.ultimo_tick_minutos || 0) + 'm ago';
 
-                    // V5.9.2 MEJORA #1: Alertar si hay posiciones vencidas
                     if ((data.posiciones_vencidas || 0) > 0) {
                         gridInfo.innerHTML += ` <span class="text-red-400 font-bold">⚠️ ${data.posiciones_vencidas} vencidas</span>`;
                     }
@@ -672,16 +1165,11 @@
                 }
             } catch (e) {
                 console.error("[GRID] Error cargando grid neutral:", e);
-                const gridInfo = document.getElementById('grid-info');
-                gridInfo.innerText = 'Error al cargar estado del grid';
-                gridInfo.classList.add('text-red-400');
-                document.getElementById('grid-stats').classList.add('hidden');
-                document.getElementById('grid-badge').classList.add('hidden');
             }
         }
 
         // ============================================
-        // V5.7: PAUSA RÁPIDA DE MONEDA
+        // V6.1: PAUSA RÁPIDA DE MONEDA
         // ============================================
         async function pauseCurrentCoin() {
             if (!activeSymbol) return;
@@ -746,7 +1234,7 @@
         }
 
         // ============================================
-        // SISTEMA DE ALERTAS (ORIGINAL - SIN CAMBIOS)
+        // SISTEMA DE ALERTAS
         // ============================================
         function toggleAlertMenu() {
             const dropdown = document.getElementById('alert-dropdown');
@@ -784,7 +1272,6 @@
             const isRechazado = alertData.tipo === 'RECHAZADO';
             const isCB = alertData.tipo === 'CIRCUIT_BREAKER';
             const isPause = alertData.tipo === 'PAUSA_MANUAL';
-            /* V5.7 FIX: Detectar alertas de Grid Neutral */
             const isNeutralGrid = alertData.tipo === 'NEUTRAL_GRID';
 
             let bgColor, borderColor, textColor;
@@ -796,7 +1283,6 @@
                 bgColor = 'bg-purple-900/90'; borderColor = 'border-purple-500'; textColor = 'text-purple-400';
             } else if (isPause) {
                 bgColor = 'bg-orange-900/90'; borderColor = 'border-orange-500'; textColor = 'text-orange-400';
-            /* V5.7 FIX: Color cyan para toast de NEUTRAL_GRID */
             } else if (isNeutralGrid) {
                 bgColor = 'bg-cyan-900/90'; borderColor = 'border-cyan-500'; textColor = 'text-cyan-400';
             } else {
@@ -825,7 +1311,6 @@
                 msg = `🔒 CIRCUIT BREAKER | ${alertData.rechazos[0]}`;
             } else if (isPause) {
                 msg = `⏸️ PAUSADA MANUALMENTE | ${alertData.rechazos[0]}`;
-            /* V5.7 FIX: Mensaje específico para Grid Neutral */
             } else if (isNeutralGrid) {
                 msg = `💠 GRID NEUTRAL ACTIVADO | El bot asume control lateral`;
             } else {
@@ -897,7 +1382,6 @@
             if (isFire) { color = 'text-red-400'; borderColor = 'border-red-800'; bgColor = 'bg-red-900/20'; }
             else if (isRechazado) { color = 'text-orange-400'; borderColor = 'border-orange-800'; bgColor = 'bg-orange-900/20'; }
             else if (isCB) { color = 'text-purple-400'; borderColor = 'border-purple-800'; bgColor = 'bg-purple-900/20'; }
-            /* V5.7 FIX: Estilo cyan para alertas NEUTRAL_GRID en el log */
             else if (isNeutralGrid) { color = 'text-cyan-400'; borderColor = 'border-cyan-800'; bgColor = 'bg-cyan-900/20'; }
             else { color = 'text-yellow-400'; borderColor = 'border-yellow-800'; bgColor = 'bg-yellow-900/20'; }
 
@@ -911,7 +1395,6 @@
                 msg = `❌ RECHAZADO <span class="font-bold">${alertData.direction}</span> | ${alertData.rechazos[0]}`;
             } else if (isCB) {
                 msg = `🔒 CIRCUIT BREAKER | ${alertData.rechazos[0]}`;
-            /* V5.7 FIX: Mensaje para alertas NEUTRAL_GRID en el log */
             } else if (isNeutralGrid) {
                 msg = `💠 GRID NEUTRAL ACTIVADO | El bot asume control lateral`;
             } else {
@@ -961,7 +1444,7 @@
         }
 
         // ============================================
-        // TOGGLE MONEDAS (ORIGINAL - SIN CAMBIOS)
+        // TOGGLE MONEDAS
         // ============================================
         function toggleCoin(symbol, event) {
             if (event) event.stopPropagation();
@@ -1052,16 +1535,16 @@
         }
 
         // ============================================
-        // CARGAR SNAPSHOT REST — SIN DATOS HISTÓRICOS
+        // CARGAR SNAPSHOT REST
         // ============================================
         async function loadSnapshot() {
             try {
-                console.log('[SNAPSHOT] Cargando estado completo vía REST...');
+                console.log('[SNAPSHOT] Cargando estado completo via REST...');
                 const res = await fetch('/api/snapshot');
                 const data = await res.json();
 
                 if (!data.snapshot) {
-                    console.warn('[SNAPSHOT] Respuesta vacía del servidor');
+                    console.warn('[SNAPSHOT] Respuesta vacia del servidor');
                     return;
                 }
 
@@ -1119,7 +1602,6 @@
                     updateCoinListItem(sym);
                 }
 
-                // Restaurar selección guardada si existe y sigue activa
                 const savedSymbol = sessionStorage.getItem('activeSymbol');
                 if (savedSymbol && marketData[savedSymbol] && coinConfig[savedSymbol] && coinConfig[savedSymbol].active) {
                     selectCoin(savedSymbol);
@@ -1133,14 +1615,33 @@
                 }
 
                 updateCoinCount();
-                console.log(`[SNAPSHOT] Estado reconstruido para ${Object.keys(data.snapshot).length} símbolos`);
+                console.log(`[SNAPSHOT] Estado reconstruido para ${Object.keys(data.snapshot).length} simbolos`);
+
+                populateAnalysisFilters();
+
             } catch (e) {
                 console.error('[SNAPSHOT] Error cargando snapshot:', e);
             }
         }
 
+        function populateAnalysisFilters() {
+            const symbols = Object.keys(coinConfig).sort();
+            const populate = (id) => {
+                const sel = document.getElementById(id);
+                if (!sel || sel.options.length > 1) return;
+                symbols.forEach(sym => {
+                    const opt = document.createElement('option');
+                    opt.value = sym; opt.innerText = sym;
+                    sel.appendChild(opt);
+                });
+            };
+            populate('audit-symbol-filter');
+            populate('nm-symbol-filter');
+            populate('grid-symbol-filter');
+        }
+
         // ============================================
-        // CARGAR VELAS — NO SE CARGA AUTOMÁTICAMENTE AL INICIAR
+        // CARGAR VELAS
         // ============================================
         async function loadChartData(symbol, tf = '1m') {
             try {
@@ -1237,13 +1738,11 @@
                 updatePauseButton();
             }
             loadChartData(symbol, activeTimeframe);
-
-            // V5.9.2: Cargar estado del grid neutral al seleccionar moneda
             fetchGridNeutral(symbol);
         }
 
         // ============================================
-        // COLORES DE ESTADO (ORIGINAL - SIN CAMBIOS)
+        // COLORES DE ESTADO
         // ============================================
         function getStateColor(estado, circuitBreaker = false) {
             if (circuitBreaker) return 'bg-purple-600 text-white';
@@ -1251,7 +1750,6 @@
                 case 'FIRE': return 'bg-red-600 text-white';
                 case 'ARMED': return 'bg-yellow-600 text-black';
                 case 'COOLDOWN': return 'bg-orange-700 text-white';
-                /* V5.7 FIX: Color cyan para NEUTRAL_GRID */
                 case 'NEUTRAL_GRID': return 'bg-cyan-700 text-white';
                 case 'MONITOREO': return 'bg-gray-700 text-gray-400';
                 default: return 'bg-gray-700 text-gray-400';
@@ -1264,7 +1762,6 @@
                 case 'FIRE': return 'bg-red-500 pulse-dot-fire';
                 case 'ARMED': return 'bg-yellow-500 pulse-dot-armed';
                 case 'COOLDOWN': return 'bg-orange-500 pulse-dot-cooldown';
-                /* V5.7 FIX: Punto cyan pulsante para NEUTRAL_GRID */
                 case 'NEUTRAL_GRID': return 'bg-cyan-500 pulse-dot-neutral';
                 case 'MONITOREO': return 'bg-gray-500';
                 default: return 'bg-gray-500';
@@ -1277,7 +1774,6 @@
                 case 'FIRE': return 'state-badge-fire';
                 case 'ARMED': return 'state-badge-armed';
                 case 'COOLDOWN': return 'state-badge-cooldown';
-                /* V5.7 FIX: Badge cyan para NEUTRAL_GRID */
                 case 'NEUTRAL_GRID': return 'state-badge-neutral';
                 case 'MONITOREO': return 'state-badge-monitoreo';
                 default: return 'state-badge-monitoreo';
@@ -1285,7 +1781,7 @@
         }
 
         // ============================================
-        // ACTUALIZAR UI DE INDICADORES (ORIGINAL - SIN CAMBIOS)
+        // ACTUALIZAR UI DE INDICADORES
         // ============================================
         function updateIndicatorsUI(data) {
             if (!data) {
@@ -1409,7 +1905,7 @@
         setInterval(updateConnectionQuality, 5000);
 
         // ============================================
-        // WEBSOCKET (ORIGINAL - SIN CAMBIOS)
+        // WEBSOCKET
         // ============================================
         function setStatus(connected, msg) {
             const dot = document.getElementById('status-dot');
@@ -1488,7 +1984,7 @@
                     }
                 };
                 ws.onclose = (event) => {
-                    console.warn(`[WS] Cerrado. Código: ${event.code}, Razón: ${event.reason || 'N/A'}`);
+                    console.warn(`[WS] Cerrado. Codigo: ${event.code}, Razon: ${event.reason || 'N/A'}`);
                     setStatus(false, 'Desconectado');
                     startReconnectCountdown();
                     reconnectDelay = Math.min(reconnectDelay * 1.5, 30000);
@@ -1499,7 +1995,7 @@
                     setStatus(false, 'Error WS');
                 };
             } catch (e) {
-                console.error('[WS] Error creando conexión:', e);
+                console.error('[WS] Error creando conexion:', e);
                 setStatus(false, 'Error de Red');
                 startReconnectCountdown();
                 reconnectTimer = setTimeout(connectWebSocket, reconnectDelay);
@@ -1513,24 +2009,24 @@
             if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ action: "ping" }));
                 if (timeSinceLastPing > 45000) {
-                    console.warn(`[WS] Zombie connection detectada (${timeSinceLastPing}ms sin pong). Forzando reconexión...`);
+                    console.warn(`[WS] Zombie connection detectada (${timeSinceLastPing}ms sin pong). Forzando reconexion...`);
                     ws.close();
                     ws = null;
                     setTimeout(connectWebSocket, 1000);
                 }
             } else if (!ws || ws.readyState === WebSocket.CLOSED) {
-                console.log('[WS] No conectado, intentando reconexión...');
+                console.log('[WS] No conectado, intentando reconexion...');
                 connectWebSocket();
             }
         }, 20000);
 
         // ============================================
-        // MANEJADOR DE MENSAJES WS (ORIGINAL - CON ADICIONES V5.7)
+        // MANEJADOR DE MENSAJES WS (COMPLETO)
         // ============================================
         function handleMessage(data) {
             try {
                 if (!data) {
-                    console.warn('[WS] Mensaje vacío recibido');
+                    console.warn('[WS] Mensaje vacio recibido');
                     return;
                 }
 
@@ -1601,16 +2097,14 @@
                         if (p.estado.estado === 'FIRE' && prevEstado !== 'FIRE') {
                             showToast({ symbol: sym, tipo: 'FIRE', direction: p.estado.direccion, score: p.estado.score });
                         }
-                        
+
                         if (p.estado.estado === 'NEUTRAL_GRID' && prevEstado !== 'NEUTRAL_GRID') {
                             showToast({ symbol: sym, tipo: 'NEUTRAL_GRID', direction: 'NEUTRAL', score: 0 });
                         }
-                        
-                        // F5.6 FIX: Actualizar panel grid neutral cuando llega snapshot NEUTRAL_GRID
+
                         if (p.estado.estado === 'NEUTRAL_GRID' && sym === activeSymbol) {
                             fetchGridNeutral(sym);
                         }
-                        // F5.6 FIX: Limpiar panel grid neutral cuando sale de NEUTRAL_GRID
                         if (prevEstado === 'NEUTRAL_GRID' && p.estado.estado !== 'NEUTRAL_GRID' && sym === activeSymbol) {
                             const gridInfo = document.getElementById('grid-info');
                             const gridStats = document.getElementById('grid-stats');
@@ -1659,7 +2153,7 @@
         }
 
         // ============================================
-        // CREAR / ACTUALIZAR ITEM DE MONEDA (ORIGINAL)
+        // CREAR / ACTUALIZAR ITEM DE MONEDA
         // ============================================
         function createCoinListItem(symbol) {
             const list = document.getElementById('coin-list');
@@ -1686,7 +2180,6 @@
                         <span id="list-dir-${symbol}" class="text-[9px] text-gray-600 font-mono mt-0.5 hidden">--</span>
                     </div>
                 </div>
-            
             `;
             list.insertAdjacentHTML('beforeend', html);
             updateCoinCount();
@@ -1718,12 +2211,11 @@
         }
 
         // ============================================
-        // INICIALIZACIÓN
+        // INICIALIZACION
         // ============================================
         document.addEventListener('DOMContentLoaded', () => {
             renderAlertsFromStorage();
             window.dispatchEvent(new Event('resize'));
-            // Restaurar símbolo guardado antes de cargar datos
             const savedSymbol = sessionStorage.getItem('activeSymbol');
             if (savedSymbol) {
                 activeSymbol = savedSymbol;
