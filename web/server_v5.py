@@ -121,7 +121,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 # FASE 5 FIX: El notifier se inyecta desde main.py vía app.state
-# notifier = Notifier()  ← ELIMINADO (era instancia huérfana sin signal_generator)
+# notifier = Notifier()  ? ELIMINADO (era instancia huérfana sin signal_generator)
 
 
 @app.websocket("/ws")
@@ -373,9 +373,9 @@ async def get_snapshot(request: Request):
     })
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------------------
 # V5.7: ENDPOINT DE ESTADÍSTICAS DESDE LA BASE DE DATOS
-# ═══════════════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------------------
 
 @app.get("/api/stats/summary")
 async def get_stats_summary(request: Request):
@@ -457,9 +457,9 @@ async def get_stats_summary(request: Request):
         return {"error": str(e), "estado": "failed"}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------------------
 # V4.2: NUEVOS ENDPOINTS REST PARA PAUSA MANUAL
-# ═══════════════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------------------
 
 @app.post("/api/pause/{symbol}")
 async def pause_symbol(symbol: str, request: Request):
@@ -545,9 +545,9 @@ async def get_paused(request: Request):
         "timestamp": int(time.time() * 1000)
     }
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------------------
 # V5.9.2: ENDPOINT GRID NEUTRAL
-# ═══════════════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------------------
 
 @app.get("/api/grid-neutral/{symbol}")
 async def get_grid_neutral(symbol: str, request: Request):
@@ -602,9 +602,9 @@ async def get_grid_neutral(symbol: str, request: Request):
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------------------
 # ENDPOINTS PARA COIN REGISTRY (Toggle desde dashboard)
-# ═══════════════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------------------
 
 @app.get("/api/coin-registry")
 async def get_coin_registry():
@@ -639,9 +639,9 @@ async def toggle_coin(request: Request):
 
         status_text = "ACTIVADA" if active else "DESACTIVADA"
         msg_text = (
-            "🔄 <b>Registro actualizado</b>\n"
-            + f"{symbol}: {'✅' if active else '❌'} {status_text}\n"
-            + "⚠️ Ejecuta <code>/restart</code> para aplicar cambios."
+            "?? <b>Registro actualizado</b>\n"
+            + f"{symbol}: {'?' if active else '?'} {status_text}\n"
+            + "?? Ejecuta <code>/restart</code> para aplicar cambios."
         )
         # FASE 5 FIX: Usar notifier desde app.state (instancia real de main.py)
         _notifier_rest = getattr(request.app.state, 'notifier', None)
@@ -693,9 +693,9 @@ async def toggle_all_coins(request: Request):
         cat_msg = f" en categoría '{category}'" if category else ""
         status_text = "ACTIVADAS" if active else "DESACTIVADAS"
         msg_text = (
-            f"🔄 <b>Todas {status_text}{cat_msg}</b>\n"
+            f"?? <b>Todas {status_text}{cat_msg}</b>\n"
             + f"Monedas afectadas: {len(changed)}\n"
-            + "⚠️ Ejecuta <code>/restart</code> para aplicar cambios."
+            + "?? Ejecuta <code>/restart</code> para aplicar cambios."
         )
         # FASE 5 FIX: Usar notifier desde app.state (instancia real de main.py)
         _notifier_rest = getattr(request.app.state, 'notifier', None)
@@ -744,17 +744,17 @@ async def orquestador_eventos(queue_eventos: asyncio.Queue, precios_vivo: dict,
                 print(f"  [ORQUESTADOR] Alerta guardada en DB: {evento.get('tipo')} {evento.get('symbol')}")
             except Exception as e:
                 logger.exception(f"Error guardando alerta en DB: {e}")
-                print(f"  ❌ [ORQUESTADOR] ERROR guardando alerta DB: {e}")
+                print(f"  ? [ORQUESTADOR] ERROR guardando alerta DB: {e}")
 
             try:
                 await _notifier.procesar_alerta(evento)
             except Exception as e:
                 # FASE 3 FIX: Traceback completo + notificación de fallback
                 logger.exception(f"ERROR notificando alerta {evento.get('tipo')} para {evento.get('symbol')}: {e}")
-                print(f"  ❌ [ORQUESTADOR] ERROR alerta {evento.get('tipo')} {evento.get('symbol')}: {e}")
+                print(f"  ? [ORQUESTADOR] ERROR alerta {evento.get('tipo')} {evento.get('symbol')}: {e}")
                 try:
                     await _notifier.enviar_telegram(
-                        f"⚠️ <b>Error procesando alerta {evento.get('tipo')}</b> para {evento.get('symbol')}\n"
+                        f"?? <b>Error procesando alerta {evento.get('tipo')}</b> para {evento.get('symbol')}\n"
                         f"<code>{str(e)[:200]}</code>"
                     )
                 except Exception:
@@ -849,3 +849,222 @@ async def orquestador_eventos(queue_eventos: asyncio.Queue, precios_vivo: dict,
             await asyncio.sleep(sleep_time)
 
     await asyncio.gather(escuchar_alertas(), empujar_telemetria())
+
+
+# -------------------------------------------------------------------------------
+# V6.1: ENDPOINTS ANALÍTICOS (Adaptados de main_dashboard.py)
+# -------------------------------------------------------------------------------
+
+@app.get("/api/stats/extended")
+async def get_stats_extended(request: Request):
+    """KPIs globales agregados de toda la base de datos."""
+    try:
+        db = await _get_db()
+        hoy_local = now_local().strftime("%Y-%m-%d")
+        ts_inicio_dia = datetime.datetime.now(pytz.UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+        # Fires hoy
+        cursor = await db.execute("SELECT count(*) FROM auditoria_eventos WHERE tipo = 'FIRE' AND fecha = ?", (hoy_local,))
+        fires_hoy = (await cursor.fetchone())[0]
+
+        # Rechazados hoy
+        cursor = await db.execute("SELECT count(*) FROM auditoria_eventos WHERE tipo = 'RECHAZADO' AND fecha = ?", (hoy_local,))
+        rechazados_hoy = (await cursor.fetchone())[0]
+
+        # Armed hoy
+        cursor = await db.execute("SELECT count(*) FROM auditoria_eventos WHERE tipo = 'ARMED' AND fecha = ?", (hoy_local,))
+        armed_hoy = (await cursor.fetchone())[0]
+
+        # Near-misses totales hoy
+        cursor = await db.execute("SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ?", (ts_inicio_dia,))
+        nm_total = (await cursor.fetchone())[0]
+
+        # Near-misses finalizados hoy
+        cursor = await db.execute("SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND timestamp_fin IS NOT NULL", (ts_inicio_dia,))
+        nm_finalizados = (await cursor.fetchone())[0]
+
+        # Near-misses acertados hoy
+        cursor = await db.execute("SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND timestamp_fin IS NOT NULL AND acerto_bot = 1", (ts_inicio_dia,))
+        nm_acertados = (await cursor.fetchone())[0]
+
+        # Grids totales hoy
+        cursor = await db.execute("SELECT count(*) FROM grid_estados WHERE date(datetime(timestamp_inicio, 'unixepoch')) = ?", (hoy_local,))
+        grids_total = (await cursor.fetchone())[0]
+
+        # PnL acumulado grids hoy
+        cursor = await db.execute("SELECT COALESCE(SUM(pnl_neto), 0), COALESCE(SUM(fees_totales), 0), COALESCE(SUM(trades_kill_switch), 0) FROM grid_simulaciones WHERE date(datetime(timestamp_inicio, 'unixepoch')) = ?", (hoy_local,))
+        row = await cursor.fetchone()
+        pnl_total = row[0] or 0
+        fees_total = row[1] or 0
+        ks_total = row[2] or 0
+
+        # Score promedio FIRE hoy
+        cursor = await db.execute("SELECT AVG(score) FROM auditoria_eventos WHERE tipo = 'FIRE' AND fecha = ?", (hoy_local,))
+        avg_score_fire = (await cursor.fetchone())[0]
+
+        return {
+            "estado": "success",
+            "hoy": hoy_local,
+            "fires_hoy": fires_hoy,
+            "rechazados_hoy": rechazados_hoy,
+            "armed_hoy": armed_hoy,
+            "near_miss_total": nm_total,
+            "near_miss_finalizados": nm_finalizados,
+            "near_miss_acertados": nm_acertados,
+            "near_miss_win_rate": round((nm_acertados / nm_finalizados * 100), 1) if nm_finalizados > 0 else None,
+            "grids_total": grids_total,
+            "pnl_total": round(pnl_total, 4),
+            "fees_total": round(fees_total, 4),
+            "kill_switches_total": ks_total,
+            "avg_score_fire": round(avg_score_fire, 1) if avg_score_fire else None,
+        }
+    except Exception as e:
+        logger.error(f"Error en stats extended: {e}")
+        return {"estado": "failed", "error": str(e)}
+
+
+@app.get("/api/auditoria")
+async def get_auditoria(request: Request, symbol: str = None, fecha_inicio: str = None, fecha_fin: str = None, tipos: str = None):
+    """Eventos de auditoria_eventos con filtros."""
+    try:
+        db = await _get_db()
+        params = []
+        where_clauses = []
+
+        if symbol:
+            where_clauses.append("symbol = ?")
+            params.append(symbol)
+        if fecha_inicio and fecha_fin:
+            where_clauses.append("fecha BETWEEN ? AND ?")
+            params.append(fecha_inicio)
+            params.append(fecha_fin)
+        elif fecha_inicio:
+            where_clauses.append("fecha = ?")
+            params.append(fecha_inicio)
+
+        if tipos:
+            tipo_list = [t.strip() for t in tipos.split(',')]
+            placeholders = ','.join('?' * len(tipo_list))
+            where_clauses.append(f"tipo IN ({placeholders})")
+            params.extend(tipo_list)
+
+        where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+        query = f"SELECT * FROM auditoria_eventos {where_sql} ORDER BY timestamp_utc DESC LIMIT 500"
+        cursor = await db.execute(query, tuple(params))
+        rows = await cursor.fetchall()
+        columns = [description[0] for description in cursor.description]
+        result = [dict(zip(columns, row)) for row in rows]
+        return {"estado": "success", "count": len(result), "data": result}
+    except Exception as e:
+        return {"estado": "failed", "error": str(e)}
+
+
+@app.get("/api/near-misses")
+async def get_near_misses(request: Request, symbol: str = None, fecha_inicio: str = None, fecha_fin: str = None, estado: str = "todos"):
+    """Seguimientos de near_miss_seguimientos."""
+    try:
+        db = await _get_db()
+        params = []
+        where_clauses = []
+
+        if symbol:
+            where_clauses.append("symbol = ?")
+            params.append(symbol)
+
+        # Convertir fechas a timestamps si se proporcionan
+        if fecha_inicio:
+            try:
+                dt_ini = datetime.datetime.strptime(fecha_inicio, "%Y-%m-%d")
+                dt_ini = pytz.timezone(CONFIG.timezone).localize(dt_ini)
+                ts_ini = dt_ini.astimezone(pytz.UTC).timestamp()
+                where_clauses.append("timestamp_inicio >= ?")
+                params.append(ts_ini)
+            except:
+                pass
+
+        if fecha_fin:
+            try:
+                dt_fin = datetime.datetime.strptime(fecha_fin, "%Y-%m-%d") + datetime.timedelta(days=1)
+                dt_fin = pytz.timezone(CONFIG.timezone).localize(dt_fin)
+                ts_fin = dt_fin.astimezone(pytz.UTC).timestamp()
+                where_clauses.append("timestamp_inicio < ?")
+                params.append(ts_fin)
+            except:
+                pass
+
+        if estado == "finalizados":
+            where_clauses.append("timestamp_fin IS NOT NULL")
+        elif estado == "en_curso":
+            where_clauses.append("timestamp_fin IS NULL")
+
+        where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+        query = f"SELECT * FROM near_miss_seguimientos {where_sql} ORDER BY timestamp_inicio DESC LIMIT 500"
+        cursor = await db.execute(query, tuple(params))
+        rows = await cursor.fetchall()
+        columns = [description[0] for description in cursor.description]
+        result = [dict(zip(columns, row)) for row in rows]
+        return {"estado": "success", "count": len(result), "data": result}
+    except Exception as e:
+        return {"estado": "failed", "error": str(e)}
+
+
+@app.get("/api/grids")
+async def get_grids(request: Request, symbol: str = None, estado_grid: str = None):
+    """Grid estados + simulaciones unidos."""
+    try:
+        db = await _get_db()
+        params = []
+        where_clauses = []
+
+        if symbol:
+            where_clauses.append("g.symbol = ?")
+            params.append(symbol)
+        if estado_grid and estado_grid != "todos":
+            where_clauses.append("g.estado = ?")
+            params.append(estado_grid)
+
+        where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+
+        query = f"""
+            SELECT 
+                g.id AS grid_id, g.symbol, g.timestamp_inicio, g.timestamp_fin,
+                g.estado AS grid_estado, g.direccion, g.precio_entrada, g.grid_params_json,
+                s.id AS sim_id, s.precio_inicio, s.precio_fin, s.pnl_bruto,
+                s.pnl_neto, s.fees_totales, s.slippage_total, s.trades_completados,
+                s.trades_kill_switch, s.posiciones_abiertas_json, s.posiciones_atrapadas_json,
+                s.estado AS sim_estado
+            FROM grid_estados g
+            LEFT JOIN grid_simulaciones s ON g.id = s.grid_id
+            {where_sql}
+            ORDER BY g.timestamp_inicio DESC
+            LIMIT 500
+        """
+        cursor = await db.execute(query, tuple(params))
+        rows = await cursor.fetchall()
+        columns = [description[0] for description in cursor.description]
+        result = [dict(zip(columns, row)) for row in rows]
+        return {"estado": "success", "count": len(result), "data": result}
+    except Exception as e:
+        return {"estado": "failed", "error": str(e)}
+
+
+@app.get("/api/velas/range")
+async def get_velas_range(symbol: str, request: Request, tf: str = "1m", t_ini_ms: int = 0, t_fin_ms: int = 0):
+    """Velas en un rango de tiempo para graficar trayectorias."""
+    try:
+        db = await _get_db()
+        tabla = f"velas_{tf}"
+        cursor = await db.execute(
+            f"SELECT timestamp, open, high, low, close, volume FROM {tabla} WHERE symbol = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC",
+            (symbol, t_ini_ms, t_fin_ms)
+        )
+        rows = await cursor.fetchall()
+        records = []
+        for row in rows:
+            records.append({
+                "timestamp": row[0], "open": row[1], "high": row[2],
+                "low": row[3], "close": row[4], "volume": row[5]
+            })
+        return {"velas": records, "symbol": symbol, "tf": tf, "count": len(records)}
+    except Exception as e:
+        return {"estado": "failed", "error": str(e), "velas": []}
