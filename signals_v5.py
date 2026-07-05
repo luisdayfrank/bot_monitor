@@ -817,6 +817,55 @@ class SignalGenerator:
             else:
                 entrar_grid, razon_grid = self.evaluar_grid_neutro(symbol, i15)
                 if entrar_grid and state.estado != 'NEUTRAL_GRID':
+                    # ═════════════════════════════════════════════════════════════════
+                    # FIX: Calcular parámetros ANTES de cambiar estado. Fallback si ATR bajo.
+                    # ═════════════════════════════════════════════════════════════════
+                    i15_gp = self.indicadores_15m.get(symbol, {})
+                    i4h_gp = self.indicadores_4h.get(symbol, {})
+                    atr_gp = i15_gp.get('atr', price * 0.01)
+                    grid_params, gp_rechazos = self.calcular_parametros_grid_blindado(
+                        price=price, direction='NEUTRAL', atr=atr_gp, i15=i15_gp, i4h=i4h_gp,
+                        symbol=symbol, state=state
+                    )
+
+                    # Fallback para monedas de bajo precio / bajo ATR (ADA, etc.)
+                    if not grid_params:
+                        print(f"  [NEUTRAL_GRID] {symbol} Fallback: rango fijo ±2% | Razón original: {gp_rechazos}")
+                        fallback_rango = price * 0.02
+                        capital = state.capital_actual if state else CONFIG.grid_default_capital
+                        leverage = CONFIG.grid_default_leverage
+                        notional = (capital * leverage) / 2
+                        grid_params = {
+                            'direction': 'NEUTRAL',
+                            'upper_limit': round(price + fallback_rango, 4),
+                            'lower_limit': round(price - fallback_rango, 4),
+                            'grid_count': 2,
+                            'step_usdt': round(fallback_rango, 4),
+                            'step_pct': round((fallback_rango / price) * 100, 3),
+                            'breakeven_pct': 0.2,
+                            'capital_sugerido': capital,
+                            'apalancamiento_sugerido': leverage,
+                            'notional_por_orden': round(notional, 2),
+                            'qty_por_orden': round(notional / price, 4) if price > 0 else 0,
+                            'margen_sobre_breakeven': 1.8,
+                            'rentable': True,
+                            'posicion_en_rango': 0.5,
+                            'recent_high': round(price * 1.02, 4),
+                            'recent_low': round(price * 0.98, 4),
+                            'auto_compressed': False,
+                            'posicion_extrema': False,
+                            'atr_seguro': round(atr_gp, 6),
+                            'rango_mult': 4.0,
+                            'fallback': True,
+                        }
+
+                    if not grid_params:
+                        print(f"  [NEUTRAL_GRID] {symbol} RECHAZADO: sin parámetros ni fallback")
+                        return False  # No entrar a NEUTRAL_GRID
+
+                    # ═════════════════════════════════════════════════════════════════
+                    # Solo ahora cambiar estado (tenemos parámetros garantizados)
+                    # ═════════════════════════════════════════════════════════════════
                     state.filtro_macro_aprobado = False
                     state.direccion_filtro = None
                     state.score_bajo_desde = None
@@ -827,15 +876,8 @@ class SignalGenerator:
                     state.neutral_grid_timestamp = int(datetime.now(pytz.UTC).timestamp())
                     print(f"  [NEUTRAL_GRID] {symbol} -> NEUTRAL_GRID | {razon_grid}")
 
-                    i15_gp = self.indicadores_15m.get(symbol, {})
-                    i4h_gp = self.indicadores_4h.get(symbol, {})
-                    atr_gp = i15_gp.get('atr', price * 0.01)
-                    grid_params, gp_rechazos = self.calcular_parametros_grid_blindado(
-                        price=price, direction='NEUTRAL', atr=atr_gp, i15=i15_gp, i4h=i4h_gp,
-                        symbol=symbol, state=state
-                    )
                     state.grid_params_neutral = grid_params
-                    if grid_params and self.grid_simulator:
+                    if self.grid_simulator:
                         await self.grid_simulator.queue.put({
                             'tipo': 'INICIAR_GRID',
                             'symbol': symbol,
@@ -852,11 +894,7 @@ class SignalGenerator:
                                 'close': i1m_actual.get('close', price),
                                 'timestamp': i1m_actual.get('timestamp', int(datetime.now(pytz.UTC).timestamp()))
                             })
-                    elif not grid_params:
-                        print(f"  [NEUTRAL_GRID] {symbol} No se pudieron calcular params del grid: {gp_rechazos}")
 
-                    if grid_params is None:
-                        grid_params = {}
                     if self.audit_logger:
                         await self.audit_logger.log_cambio_estado(
                             symbol=symbol,
@@ -885,7 +923,7 @@ class SignalGenerator:
                         
                     await self.emitir_alerta(symbol, 'NEUTRAL_GRID', 'NEUTRAL', score_macro, [], grid_params, price)
                     entro_neutral_grid = True
-
+                    
         if state.estado == 'NEUTRAL_GRID' and direction != 'NEUTRAL':
             if state.neutral_grid_dir_previa == direction:
                 state.neutral_grid_dir_consec += 1
