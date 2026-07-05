@@ -406,6 +406,25 @@ async def get_stats_summary(request: Request):
         )
         total_near_miss = (await cursor.fetchone())[0]
 
+        # Grids neutral hoy
+        cursor = await db.execute(
+            "SELECT count(*) FROM grid_estados WHERE date(datetime(timestamp_inicio, 'unixepoch')) = ?",
+            (hoy_local,)
+        )
+        grids_total_hoy = (await cursor.fetchone())[0]
+
+        cursor = await db.execute(
+            "SELECT count(*) FROM grid_estados WHERE estado = 'ACTIVO' AND date(datetime(timestamp_inicio, 'unixepoch')) = ?",
+            (hoy_local,)
+        )
+        grids_activos_hoy = (await cursor.fetchone())[0]
+
+        cursor = await db.execute(
+            "SELECT COALESCE(SUM(pnl_neto), 0) FROM grid_simulaciones WHERE date(datetime(timestamp_inicio, 'unixepoch')) = ?",
+            (hoy_local,)
+        )
+        pnl_grids_hoy = (await cursor.fetchone())[0] or 0
+
         # 3. V5.7 FIX: Win Rate SOLO sobre seguimientos FINALIZADOS del día
         # Los seguimientos en curso (timestamp_fin IS NULL) NO se cuentan
         # como fracasos, evitando distorsión del 0% win rate
@@ -448,10 +467,14 @@ async def get_stats_summary(request: Request):
             "aciertos_bot": aciertos,
             "win_rate_rechazos": win_rate_val,
             "win_rate_estado": win_rate_estado,
+            "grids_total_hoy": grids_total_hoy,
+            "grids_activos_hoy": grids_activos_hoy,
+            "pnl_grids_hoy": round(pnl_grids_hoy, 4),
             "mensaje": f"{seguimientos_activos} seguimiento(s) en curso (2h). "
                        f"Win Rate calculable cuando finalicen.",
             "estado": "success"
         }
+    
     except Exception as e:
         logger.error(f"Error obteniendo stats: {e}")
         return {"error": str(e), "estado": "failed"}
