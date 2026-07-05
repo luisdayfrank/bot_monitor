@@ -390,7 +390,7 @@
                 <p class="text-xs text-gray-500 mb-6">Datos extraídos directamente de la base de datos SQLite</p>
 
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
-                    <div class="bg-gray-800/40 p-5 rounded-xl border border-gray-700/50 hover:border-blue-500/30 transition">
+                    <div class="bg-gray-800/40 p-5 rounded-xl border border-gray-700/50 hover:border-red-500/30 transition">
                         <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
                             <span class="w-2 h-2 rounded-full bg-red-500"></span>
                             Disparos Hoy (FIRE)
@@ -421,6 +421,24 @@
                         </div>
                         <div class="text-3xl font-mono text-blue-400" id="stat-finalizados">--</div>
                         <div class="text-xs text-gray-600 mt-1">Seguimientos que completaron sus 2h</div>
+                    </div>
+                    <!-- NUEVO: Grids Neutral -->
+                    <div class="bg-gray-800/40 p-5 rounded-xl border border-gray-700/50 hover:border-purple-500/30 transition">
+                        <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
+                            <span class="w-2 h-2 rounded-full bg-purple-500"></span>
+                            Grids Neutral Hoy
+                        </div>
+                        <div class="text-3xl font-mono text-purple-400" id="stat-grids">--</div>
+                        <div class="text-xs text-gray-600 mt-1">Activos ahora: <span id="stat-grids-active" class="text-purple-300 font-mono">--</span></div>
+                    </div>
+                    <!-- NUEVO: PnL Grid -->
+                    <div class="bg-gray-800/40 p-5 rounded-xl border border-gray-700/50 hover:border-pink-500/30 transition">
+                        <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
+                            <span class="w-2 h-2 rounded-full bg-pink-500"></span>
+                            PnL Grid Hoy
+                        </div>
+                        <div class="text-3xl font-mono" id="stat-pnl-grid">--</div>
+                        <div class="text-xs text-gray-600 mt-1">Acumulado neto de simulaciones</div>
                     </div>
                 </div>
 
@@ -1095,8 +1113,22 @@
                 if (data.estado === 'success') {
                     document.getElementById('stat-fires').innerText = data.fires_hoy;
                     document.getElementById('stat-nearmiss').innerText = data.total_near_miss;
+
+                    // NUEVO: Métricas de Grid Neutral
+                    document.getElementById('stat-grids').innerText = data.grids_total_hoy !== undefined ? data.grids_total_hoy : '--';
+                    const gridsActiveEl = document.getElementById('stat-grids-active');
+                    if (gridsActiveEl) gridsActiveEl.innerText = data.grids_activos_hoy !== undefined ? data.grids_activos_hoy : '--';
+
+                    const pnlGridEl = document.getElementById('stat-pnl-grid');
+                    if (pnlGridEl) {
+                        const pnl = data.pnl_grids_hoy || 0;
+                        pnlGridEl.innerText = (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + ' USDT';
+                        pnlGridEl.className = 'text-3xl font-mono ' + (pnl >= 0 ? 'text-green-400' : 'text-red-400');
+                    }
+
                     const elFinalizados = document.getElementById('stat-finalizados');
                     if (elFinalizados) elFinalizados.innerText = data.finalizados_hoy || 0;
+
                     const winRateEl = document.getElementById('stat-winrate');
                     if (data.win_rate_estado === "CALCULABLE" && data.win_rate_rechazos !== null) {
                         winRateEl.innerText = data.win_rate_rechazos + '%';
@@ -1106,8 +1138,14 @@
                         winRateEl.className = 'text-3xl font-mono text-yellow-400';
                     }
                 } else {
+                    // ERROR: Limpiar TODOS los campos incluyendo los nuevos
                     document.getElementById('stat-fires').innerText = 'ERR';
                     document.getElementById('stat-nearmiss').innerText = 'ERR';
+                    document.getElementById('stat-grids').innerText = 'ERR';
+                    const gridsActiveEl = document.getElementById('stat-grids-active');
+                    if (gridsActiveEl) gridsActiveEl.innerText = 'ERR';
+                    const pnlGridEl = document.getElementById('stat-pnl-grid');
+                    if (pnlGridEl) { pnlGridEl.innerText = 'ERR'; pnlGridEl.className = 'text-3xl font-mono text-red-400'; }
                     const elFinalizados = document.getElementById('stat-finalizados');
                     if (elFinalizados) elFinalizados.innerText = 'ERR';
                     const winRateEl = document.getElementById('stat-winrate');
@@ -1116,8 +1154,14 @@
                 }
             } catch (e) {
                 console.error("[STATS] Error cargando estadísticas:", e);
+                // CATCH: Limpiar TODOS los campos incluyendo los nuevos
                 document.getElementById('stat-fires').innerText = 'ERR';
                 document.getElementById('stat-nearmiss').innerText = 'ERR';
+                document.getElementById('stat-grids').innerText = 'ERR';
+                const gridsActiveEl = document.getElementById('stat-grids-active');
+                if (gridsActiveEl) gridsActiveEl.innerText = 'ERR';
+                const pnlGridEl = document.getElementById('stat-pnl-grid');
+                if (pnlGridEl) { pnlGridEl.innerText = 'ERR'; pnlGridEl.className = 'text-3xl font-mono text-red-400'; }
                 const elFinalizados = document.getElementById('stat-finalizados');
                 if (elFinalizados) elFinalizados.innerText = 'ERR';
                 document.getElementById('stat-winrate').innerText = 'ERR';
