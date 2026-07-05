@@ -391,7 +391,9 @@ class AuditLogger:
     # ═══════════════════════════════════════════════════════════════════════════════
 
     async def log_evento_grid_simulacion(self, symbol: str, tipo: str, grid_id: int,
-                                          evento_simulacion: dict, pnl_acumulado: float):
+                                          evento_simulacion: dict, pnl_acumulado: float,
+                                          grid_params: dict = None,
+                                          score_macro: int = None):
         """
         Registra eventos de simulación grid neutral en auditoria_eventos.
         Esto garantiza que el reporte JSON diario incluya:
@@ -411,7 +413,7 @@ class AuditLogger:
             "grid_id": grid_id,
             "evento_simulacion": evento_simulacion,
             "pnl_acumulado": pnl_acumulado,
-            "version": "5.9.2"
+            "version": "6.0"
         })
 
         # F4.1: Unificar nomenclatura de eventos grid neutral
@@ -437,8 +439,8 @@ class AuditLogger:
             "direccion": None,
             "precio": evento_simulacion.get('precio_ejecucion') if evento_simulacion else None,
             "contexto_json": contexto_json,
-            "grid_params_json": json.dumps({"grid_id": grid_id}),
-            "score": None,
+            "grid_params_json": json.dumps(grid_params) if grid_params else json.dumps({"grid_id": grid_id}),
+            "score": score_macro,
             "rechazos_json": None,
             "estado_maquina": "NEUTRAL_GRID_SIM"
         }

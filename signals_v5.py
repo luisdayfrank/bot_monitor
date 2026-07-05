@@ -781,8 +781,12 @@ class SignalGenerator:
                         penalizacion = 0
 
                     score_macro -= penalizacion
-                    rechazos.append(f"MFM contradictorio: mfm={mfm_sma5:.3f} vs {direction} (-{penalizacion}pts)")
-                    print(f"  [MFM] {symbol} Volumen+MFM CONTRADICTORIO | mfm={mfm_sma5:.3f} vs {direction} | -{penalizacion}pts")
+                    if penalizacion > 0:
+                        rechazos.append(f"MFM contradictorio: mfm={mfm_sma5:.3f} vs {direction} (-{penalizacion}pts)")
+                        print(f"  [MFM] {symbol} Volumen+MFM CONTRADICTORIO | mfm={mfm_sma5:.3f} vs {direction} | -{penalizacion}pts")
+                    else:
+                        rechazos.append(f"MFM contradictorio débil: mfm={mfm_sma5:.3f} vs {direction}")
+                        print(f"  [MFM] {symbol} Volumen+MFM CONTRADICTORIO débil | mfm={mfm_sma5:.3f} vs {direction} | sin penalización")
             else:
                 rechazos.append(f"Volumen bajo: {vol_ratio:.1%} (umbral: {volume_threshold})")
         else:
@@ -859,9 +863,26 @@ class SignalGenerator:
                             de=state._prev_estado if state._prev_estado != 'NEUTRAL_GRID' else 'MONITOREO',
                             a='NEUTRAL_GRID',
                             direccion='NEUTRAL',
-                            score_macro=score_macro
+                            score_macro=score_macro,
+                            contexto_macro={
+                                "precio": price,
+                                "adx": i15.get('adx'),
+                                "rsi": i15.get('rsi'),
+                                "atr": i15.get('atr'),
+                                "macd_hist": i15.get('macd_hist'),
+                                "ema200_15m": i15.get('ema200_15m'),
+                                "ema50_15m": i15.get('ema50_15m'),
+                                "volumen_ratio": i15.get('volume') / i15.get('volume_sma20', 1) if i15.get('volume_sma20') else 0,
+                                "mfm_sma5": i15.get('mfm_sma5'),
+                                "score_macro": score_macro,
+                                "umbral_entrada": umbral_entrada,
+                                "direccion_detectada": direction,
+                                "grid_params": grid_params,
+                                "categoria": coin_cfg.get('category', 'default')
+                            }
                         )
                         state._prev_estado = 'NEUTRAL_GRID'
+                        
                     await self.emitir_alerta(symbol, 'NEUTRAL_GRID', 'NEUTRAL', score_macro, [], grid_params, price)
                     entro_neutral_grid = True
 
@@ -875,6 +896,22 @@ class SignalGenerator:
             if state.neutral_grid_dir_consec >= 2:
                 state.estado = 'MONITOREO'
                 state.neutral_grid_timestamp = 0
+
+                if self.audit_logger:
+                    await self.audit_logger.log_cambio_estado(
+                        symbol=symbol,
+                        de='NEUTRAL_GRID',
+                        a='MONITOREO',
+                        direccion=direction,
+                        score_macro=state.score_macro_actual,
+                        contexto_macro={
+                            "precio": self.indicadores_1m.get(symbol, {}).get('close', price),
+                            "razon": "direccion_detectada_2velas",
+                            "nueva_direccion": direction
+                        }
+                    )
+                    state._prev_estado = 'MONITOREO'
+                    
                 state.grid_params_neutral = None
                 state.neutral_grid_dir_consec = 0
                 if self.audit_logger:
@@ -1009,6 +1046,11 @@ class SignalGenerator:
         i15 = self.indicadores_15m.get(symbol)
         i4h = self.indicadores_4h.get(symbol)
         state = self.states[symbol]
+
+        # FIX: No evaluar filtro direccional si estamos en grid neutral
+        if state.estado == 'NEUTRAL_GRID':
+            # El aborto ya se evalúa en run() cada 15m
+            return
 
         coin_cfg = get_coin_config(symbol)
 

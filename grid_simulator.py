@@ -334,8 +334,15 @@ class GridSimulator:
                         'niveles': len(niveles),
                         'qty_por_orden': float(qty_por_orden),
                         'precio_inicio': precio_actual,
+                        'lower_limit': float(grid_params['lower_limit']) if grid_params and 'lower_limit' in grid_params else None,
+                        'upper_limit': float(grid_params['upper_limit']) if grid_params and 'upper_limit' in grid_params else None,
+                        'grid_count': int(grid_params['grid_count']) if grid_params and 'grid_count' in grid_params else None,
+                        'step_pct': float(grid_params['step_pct']) if grid_params and 'step_pct' in grid_params else None,
+                        'capital': float(grid_params['capital_sugerido']) if grid_params and 'capital_sugerido' in grid_params else None,
                     },
-                    pnl_acumulado=0.0
+                    pnl_acumulado=0.0,
+                    grid_params=grid_params,  # <-- ESTO ES LO IMPORTANTE
+                    score_macro=0             # o el score que tenía antes de entrar
                 )
 
         except Exception as e:

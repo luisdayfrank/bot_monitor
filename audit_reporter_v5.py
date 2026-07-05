@@ -398,6 +398,51 @@ class AuditReporter:
             "grid_neutral_resumen": self._resumen_grid_neutral(eventos_neutral_grid)
         }
 
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # FIX 6: DETECCIÓN DE ANOMALÍAS EN AUDITORÍA
+        # ═══════════════════════════════════════════════════════════════════════════════
+        anomalias = []
+        
+        # Anomalía 1: Near-misses direccionales mientras estaba en grid neutral
+        for ev in eventos_near_miss:
+            estado_en_momento = ev.get('estado_maquina')
+            if estado_en_momento == 'NEUTRAL_GRID':
+                anomalias.append({
+                    "tipo": "NEAR_MISS_EN_GRID_NEUTRAL",
+                    "timestamp": ev['timestamp_utc'],
+                    "detalle": f"Score {ev.get('score')} {ev.get('direccion')} mientras estado era NEUTRAL_GRID"
+                })
+        
+        # Anomalía 2: Cambio de estado a NEUTRAL_GRID sin precio
+        for ev in eventos_cambio_estado:
+            if ev.get('tipo') == 'CAMBIO_ESTADO' and ev.get('estado_maquina') == 'NEUTRAL_GRID':
+                if ev.get('precio') is None:
+                    anomalias.append({
+                        "tipo": "CAMBIO_ESTADO_SIN_PRECIO",
+                        "timestamp": ev['timestamp_utc'],
+                        "detalle": "Transición a NEUTRAL_GRID sin precio registrado"
+                    })
+        
+        # Anomalía 3: Grid iniciado sin parámetros completos
+        for ev in eventos_neutral_grid:
+            if ev.get('tipo') == 'NEUTRAL_GRID_INICIADO':
+                ctx = {}
+                if ev.get('contexto_json'):
+                    try:
+                        ctx = json.loads(ev['contexto_json'])
+                    except:
+                        pass
+                evento_sim = ctx.get('evento_simulacion', {})
+                if not evento_sim.get('lower_limit') or not evento_sim.get('upper_limit'):
+                    anomalias.append({
+                        "tipo": "GRID_SIN_LIMITES",
+                        "timestamp": ev['timestamp_utc'],
+                        "detalle": "Grid neutral iniciado sin lower_limit o upper_limit en auditoría"
+                    })
+
+        resultado['anomalias_detectadas'] = anomalias
+        resultado['total_anomalias'] = len(anomalias)
+
         return resultado
 
     # ═══════════════════════════════════════════════════════════════════════════════

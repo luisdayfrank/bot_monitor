@@ -182,7 +182,7 @@ class Notifier:
         elif tipo == 'NEUTRAL_GRID':
             titulo = f"GRID NEUTRAL {symbol}"
             i15 = evento.get('indicadores_15m') or {}
-            p = evento.get('params') or {}  # FASE 2 FIX: Proteger contra params=None
+            p = evento.get('params') or {}
             adx = i15.get('adx')
             rsi = i15.get('rsi')
 
@@ -191,7 +191,7 @@ class Notifier:
 
             # V6.0: Parámetros formateados para copiar-pegar en Binance
             params_binance = ""
-            if p:
+            if p and p.get('lower_limit') is not None:
                 params_binance = (
                     f"\n\n<b>⚙️ PARÁMETROS PARA REPLICAR EN BINANCE:</b>\n"
                     f"<code>"
@@ -218,20 +218,20 @@ class Notifier:
                 f"Estado: <b>{estado}</b>\n"
                 f"Precio: 💲{price:.4f}\n\n"
                 f"<b>📊 Condiciones de entrada:</b>\n"
-                f"• ADX: {adx_str} (< 25, sin tendencia fuerte)\n"
-                f"• RSI: {rsi_str} (40-60, neutral)\n"
+                f"• ADX: {adx_str} (menor a {CONFIG.grid_neutral_adx_max}, sin tendencia fuerte)\n"
+                f"• RSI: {rsi_str} ({CONFIG.grid_neutral_rsi_min}-{CONFIG.grid_neutral_rsi_max}, neutral)\n"
                 f"• Precio cerca de EMA50\n"
                 f"• Volatilidad moderada"
                 f"{params_binance}\n\n"
                 f"<b>🛑 Aborto automático en:</b>\n"
                 f"• Timeout: ⏳ {CONFIG.grid_neutral_timeout_min} min\n"
-                f"• ADX > {CONFIG.grid_neutral_adx_max}\n"
-                f"• RSI < {CONFIG.grid_neutral_rsi_min} o RSI > {CONFIG.grid_neutral_rsi_max}\n"
-                f"• Precio se aleja > {CONFIG.grid_neutral_aborto_precio_pct}% de EMA50\n"
-                f"• ATR explosivo (> p80 x 1.5)\n\n"
+                f"• ADX mayor a {CONFIG.grid_neutral_adx_max}\n"
+                f"• RSI menor a {CONFIG.grid_neutral_rsi_min} o RSI mayor a {CONFIG.grid_neutral_rsi_max}\n"
+                f"• Precio se aleja más de {CONFIG.grid_neutral_aborto_precio_pct}% de EMA50\n"
+                f"• ATR explosivo (mayor a p80 x 1.5)\n\n"
                 f"<i>🤖 Estado autónomo. Sin confirmación manual.</i>"
             )
-
+            
         elif tipo == 'RECHAZADO':
             titulo = f"RECHAZADO {symbol}"
             motivos = ", ".join(evento['rechazos']) if evento.get('rechazos') else "Condiciones no cumplidas"
