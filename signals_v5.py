@@ -818,7 +818,7 @@ class SignalGenerator:
                 entrar_grid, razon_grid = self.evaluar_grid_neutro(symbol, i15)
                 if entrar_grid and state.estado != 'NEUTRAL_GRID':
                     # ═════════════════════════════════════════════════════════════════
-                    # FIX: Calcular parámetros ANTES de cambiar estado. Fallback si ATR bajo.
+                    # FIX V6.1: Eliminado fallback tóxico. Si el motor rechaza, respetamos.
                     # ═════════════════════════════════════════════════════════════════
                     i15_gp = self.indicadores_15m.get(symbol, {})
                     i4h_gp = self.indicadores_4h.get(symbol, {})
@@ -828,41 +828,36 @@ class SignalGenerator:
                         symbol=symbol, state=state
                     )
 
-                    # Fallback para monedas de bajo precio / bajo ATR (ADA, etc.)
                     if not grid_params:
-                        print(f"  [NEUTRAL_GRID] {symbol} Fallback: rango fijo ±2% | Razón original: {gp_rechazos}")
-                        fallback_rango = price * 0.02
-                        capital = state.capital_actual if state else CONFIG.grid_default_capital
-                        leverage = CONFIG.grid_default_leverage
-                        notional = (capital * leverage) / 2
-                        grid_params = {
-                            'direction': 'NEUTRAL',
-                            'upper_limit': round(price + fallback_rango, 4),
-                            'lower_limit': round(price - fallback_rango, 4),
-                            'grid_count': 2,
-                            'step_usdt': round(fallback_rango, 4),
-                            'step_pct': round((fallback_rango / price) * 100, 3),
-                            'breakeven_pct': 0.2,
-                            'capital_sugerido': capital,
-                            'apalancamiento_sugerido': leverage,
-                            'notional_por_orden': round(notional, 2),
-                            'qty_por_orden': round(notional / price, 4) if price > 0 else 0,
-                            'margen_sobre_breakeven': 1.8,
-                            'rentable': True,
-                            'posicion_en_rango': 0.5,
-                            'recent_high': round(price * 1.02, 4),
-                            'recent_low': round(price * 0.98, 4),
-                            'auto_compressed': False,
-                            'posicion_extrema': False,
-                            'atr_seguro': round(atr_gp, 6),
-                            'rango_mult': 4.0,
-                            'fallback': True,
-                        }
+                        causas = '; '.join(gp_rechazos) if gp_rechazos else 'Parámetros no rentables (ATR bajo / capital insuficiente / fees > step)'
+                        print(f"  [NEUTRAL_GRID] {symbol} RECHAZADO: {causas}")
 
-                    if not grid_params:
-                        print(f"  [NEUTRAL_GRID] {symbol} RECHAZADO: sin parámetros ni fallback")
+                        # Notificación Telegram con causa real
+                        notifier = getattr(self, 'notifier', None)
+                        if notifier:
+                            await notifier.enviar_telegram(
+                                f"❌ <b>GRID NEUTRAL RECHAZADO — {symbol}</b>\n"
+                                f"<i>Causas:</i> <code>{causas}</code>\n"
+                                f"Precio: ${price:.4f} | ATR: {atr_gp:.6f}\n"
+                                f"El bot permanece en MONITOREO."
+                            )
+
+                        # Auditoría del rechazo
+                        if self.audit_logger:
+                            await self.audit_logger.log_evento_grid_simulacion(
+                                symbol=symbol,
+                                tipo='NEUTRAL_GRID_ABORT',
+                                grid_id=0,
+                                evento_simulacion={
+                                    'razon': 'rechazo_parametros',
+                                    'causas': gp_rechazos,
+                                    'precio': price,
+                                    'atr': atr_gp
+                                },
+                                pnl_acumulado=0.0
+                            )
                         return False  # No entrar a NEUTRAL_GRID
-
+                    
                     # ═════════════════════════════════════════════════════════════════
                     # Solo ahora cambiar estado (tenemos parámetros garantizados)
                     # ═════════════════════════════════════════════════════════════════
@@ -1796,8 +1791,8 @@ class SignalGenerator:
         if CONFIG.grid_auto_compress and step_pct < margen_seguridad and grid_count > 2:
             step_pct_objetivo = margen_seguridad
             step_usdt_objetivo = (step_pct_objetivo / 100) * price
-            grid_count_nuevo = max(2, int(rango_total / step_usdt_objetivo))
-
+            grid_count_nuevo = max(CONFIG.grid_min_grids, int(rango_total / step_usdt_objetivo))
+            
             if grid_count_nuevo < grid_count:
                 grid_count = grid_count_nuevo
                 step_usdt = rango_total / grid_count
@@ -1819,8 +1814,8 @@ class SignalGenerator:
 
         qty_por_orden = round(poder_total / grid_count / price, 4) if grid_count > 0 and price > 0 else 0
 
-        # FASE 2.5: Validar qty mínima para monedas > $100
-        if qty_por_orden < 1.0 and price > 100:
+        # FASE 2.5: Validar qty mínima para monedas > $100 (solo si no es grid neutral)
+        if qty_por_orden < 1.0 and price > 100 and direction != 'NEUTRAL':
             rechazos.append(f"Qty {qty_por_orden:.3f} < 1.0 para moneda > $100")
             return None, rechazos
 
