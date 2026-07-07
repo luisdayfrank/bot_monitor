@@ -835,9 +835,12 @@ class SignalGenerator:
                         # Notificación Telegram con causa real
                         notifier = getattr(self, 'notifier', None)
                         if notifier:
+                            # FIX: Escapar HTML para evitar error de parseo en Telegram
+                            causas_escaped = causas.replace("<", "&lt;").replace(">", "&gt;")
+                            
                             await notifier.enviar_telegram(
                                 f"❌ <b>GRID NEUTRAL RECHAZADO — {symbol}</b>\n"
-                                f"<i>Causas:</i> <code>{causas}</code>\n"
+                                f"<i>Causas:</i> <code>{causas_escaped}</code>\n"
                                 f"Precio: ${price:.4f} | ATR: {atr_gp:.6f}\n"
                                 f"El bot permanece en MONITOREO."
                             )
@@ -1088,12 +1091,14 @@ class SignalGenerator:
         coin_cfg = get_coin_config(symbol)
 
         if state.moneda_pausada_manual:
+            print(f"  [BLOQUEO] {symbol} PAUSA MANUAL activa — filtro no evaluado")
             state.filtro_macro_aprobado = False
             await self._log_continuo(symbol, i15 or {})
             await self._evaluar_near_misses(symbol, 0, 0, [], None, False)
             return
 
         if not i15 or not i4h:
+            print(f"  [BLOQUEO] {symbol} Indicadores faltantes: i15={i15 is not None}, i4h={i4h is not None}")
             state.filtro_macro_aprobado = False
             await self._log_continuo(symbol, i15 or {})
             await self._evaluar_near_misses(symbol, 0, 0, [], None, False)
@@ -1101,11 +1106,15 @@ class SignalGenerator:
 
         required_15m = ['rsi', 'adx', 'atr', 'ema200_15m', 'macd_hist',
                         'macd_hist_prev', 'volume', 'volume_sma20']
-        if any(i15.get(k) is None for k in required_15m):
+        
+        faltantes = [k for k in required_15m if i15.get(k) is None]
+        if faltantes:
+            print(f"  [BLOQUEO] {symbol} Campos 15m faltantes: {faltantes}")
             state.filtro_macro_aprobado = False
             await self._log_continuo(symbol, i15 or {})
             await self._evaluar_near_misses(symbol, 0, 0, [], None, False)
             return
+
         if i4h.get('ema200_4h') is None:
             state.filtro_macro_aprobado = False
             await self._log_continuo(symbol, i15 or {})
@@ -1216,17 +1225,20 @@ class SignalGenerator:
         filtro_aprobado = False
         if len(rechazos) == 0 and direction != 'NEUTRAL' and score_macro >= score_minimo:
             filtro_aprobado = True
+            state.filtro_macro_aprobado = True          # ← FIX
             state.direccion_filtro = direction
             state.direccion_ultima_valida = direction
             state.metricas_dia['veces_paso_umbral'] += 1
         elif (score_penalizado >= score_minimo and len(rechazos) <= 2 and
               direction != 'NEUTRAL' and not umbral_bloqueado):
             filtro_aprobado = True
+            state.filtro_macro_aprobado = True          # ← FIX
             state.direccion_filtro = direction
             state.direccion_ultima_valida = direction
             state.metricas_dia['veces_paso_umbral'] += 1
             print(f"  [FILTRO] {symbol} DISPARO CON ADVERTENCIA | {score_macro}->{score_penalizado}")
         else:
+            state.filtro_macro_aprobado = False         # ← FIX
             state.direccion_filtro = None
 
         # BLOQUE 4: LOGS, AUDITORÍA Y NEAR-MISSES
@@ -1438,6 +1450,7 @@ class SignalGenerator:
             return
 
         if state.estado == 'MONITOREO':
+            print(f"  [MAQUINA] {symbol} MONITOREO | filtro_aprobado={state.filtro_macro_aprobado} | direccion={state.direccion_filtro} | pausa={state.moneda_pausada} | pausa_manual={state.moneda_pausada_manual}")
             if state.filtro_macro_aprobado and state.direccion_filtro:
                 # FASE 6: Transicion DIRECTA a ARMED (sin commitment score)
                 state.estado = 'ARMED'

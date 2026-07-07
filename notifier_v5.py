@@ -20,6 +20,12 @@ class Notifier:
         self._ws_connected = False
         self._process_start_time = datetime.now(pytz.UTC)
 
+    def _escape_html(self, text: str) -> str:
+        """Escapa caracteres HTML para evitar errores de parseo en Telegram."""
+        if not isinstance(text, str):
+            text = str(text)
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
     # ═══════════════════════════════════════════════════════════════════════════════
     # FIX CRITICO: Limpiar mensajes pendientes de Telegram al iniciar
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -151,8 +157,7 @@ class Notifier:
             dir_icon = "🟢" if dir_ == "LONG" else "🔴"
 
             # V6.0: Parámetros formateados para copiar-pegar en Binance
-            params_binance = (
-                f"<code>"
+            params_binance_raw = (
                 f"Tipo: {dir_}\n"
                 f"Rango: {p['lower_limit']} - {p['upper_limit']}\n"
                 f"Grids: {p['grid_count']}\n"
@@ -162,8 +167,8 @@ class Notifier:
                 f"Notional/orden: ${p['notional_por_orden']}\n"
                 f"Breakeven: {p['breakeven_pct']}%\n"
                 f"Margen seguro: +{p['margen_sobre_breakeven']:.3f}%"
-                f"</code>"
             )
+            params_binance = f"<code>{self._escape_html(params_binance_raw)}</code>"
 
             msg = (
                 f"<b>🔥 DISPARO {dir_icon} {dir_} - {symbol}</b>\n"
@@ -192,9 +197,7 @@ class Notifier:
             # V6.0: Parámetros formateados para copiar-pegar en Binance
             params_binance = ""
             if p and p.get('lower_limit') is not None:
-                params_binance = (
-                    f"\n\n<b>⚙️ PARÁMETROS PARA REPLICAR EN BINANCE:</b>\n"
-                    f"<code>"
+                params_binance_raw = (
                     f"Tipo: NEUTRAL\n"
                     f"Rango: {p.get('lower_limit', 'N/A')} - {p.get('upper_limit', 'N/A')}\n"
                     f"Grids: {p.get('grid_count', 'N/A')}\n"
@@ -204,8 +207,8 @@ class Notifier:
                     f"Notional/orden: ${p.get('notional_por_orden', 'N/A')}\n"
                     f"Breakeven: {p.get('breakeven_pct', 'N/A')}%\n"
                     f"Margen seguro: +{p.get('margen_sobre_breakeven', 'N/A')}%"
-                    f"</code>"
                 )
+                params_binance = f"\n\n<b>⚙️ PARÁMETROS PARA REPLICAR EN BINANCE:</b>\n<code>{self._escape_html(params_binance_raw)}</code>"
                 if p.get('auto_compressed'):
                     params_binance += "\n<i>⚠️ Grid auto-comprimido por bajo ATR</i>"
                 if p.get('posicion_extrema'):
@@ -235,6 +238,7 @@ class Notifier:
         elif tipo == 'RECHAZADO':
             titulo = f"RECHAZADO {symbol}"
             motivos = ", ".join(evento['rechazos']) if evento.get('rechazos') else "Condiciones no cumplidas"
+            motivos_safe = self._escape_html(motivos)
             msg = (
                 f"<b>❌ DISPARO RECHAZADO - {symbol}</b>\n"
                 f"Dirección: {dir_}\n"
@@ -245,6 +249,7 @@ class Notifier:
         elif tipo == 'CIRCUIT_BREAKER':
             titulo = f"CIRCUIT BREAKER {symbol}"
             motivos = ", ".join(evento['rechazos']) if evento.get('rechazos') else "Pérdidas consecutivas"
+            motivos_safe = self._escape_html(motivos)
             msg = (
                 f"<b>🔒 CIRCUIT BREAKER - {symbol}</b>\n"
                 f"Motivo: <i>{motivos}</i>\n"
@@ -260,6 +265,7 @@ class Notifier:
         else:
             titulo = f"ALERTA {symbol} | {tipo}"
             motivos = ", ".join(evento['rechazos']) if evento.get('rechazos') else "Cambio de condiciones."
+            motivos_safe = self._escape_html(motivos)
             msg = (
                 f"<b>⚠️ {symbol} - ALERTA</b>\n"
                 f"Tipo: {tipo}\n"
