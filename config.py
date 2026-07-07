@@ -129,7 +129,7 @@ class Config(BaseModel):
     grid_fee_rate: float = 0.0005
     grid_slippage: float = 0.0005
     grid_default_capital: float = 100.0
-    grid_default_leverage: int = 3
+    grid_default_leverage: int = 5
 
     # Nocional mínimo por orden (Binance Futures)
     grid_notional_min: float = 10.0
