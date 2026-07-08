@@ -1,5 +1,28 @@
 import asyncio
 import json
+import numpy as np
+
+# FIX: Monkey-patch json.dumps para manejar tipos numpy en este módulo
+_original_json_dumps = json.dumps
+
+def _json_dumps_with_numpy(obj, **kwargs):
+    def default(o):
+        if isinstance(o, (np.bool_, bool)):
+            return bool(o)
+        if isinstance(o, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+            return int(o)
+        if isinstance(o, (np.floating, np.float64, np.float32, np.float16)):
+            if np.isnan(o) or np.isinf(o):
+                return None
+            return float(o)
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+    kwargs.setdefault('default', default)
+    return _original_json_dumps(obj, **kwargs)
+
+json.dumps = _json_dumps_with_numpy
+
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import pytz
