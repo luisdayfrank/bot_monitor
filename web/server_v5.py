@@ -658,7 +658,7 @@ async def get_stats_rechazos(request: Request):
         hoy_local = now_local().strftime("%Y-%m-%d")
 
         cursor = await db.execute(
-            "SELECT mensaje FROM auditoria_eventos WHERE tipo = 'RECHAZADO' AND fecha = ?",
+            "SELECT rechazos_json FROM auditoria_eventos WHERE tipo = 'RECHAZADO' AND fecha = ?",
             (hoy_local,)
         )
         rows = await cursor.fetchall()
@@ -667,6 +667,14 @@ async def get_stats_rechazos(request: Request):
         total = 0
         for row in rows:
             msg = row[0] or ""
+
+            if msg:
+                try:
+                    rechazos_list = json.loads(msg)
+                    msg = "; ".join(rechazos_list) if rechazos_list else ""
+                except:
+                    pass
+            
             causa = "OTRO"
             if msg:
                 if "ADX" in msg.upper():
