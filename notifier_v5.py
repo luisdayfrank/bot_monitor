@@ -725,7 +725,7 @@ class Notifier:
         await self.limpiar_updates_pendientes()
 
         print("  ✅ Polling de comandos Telegram iniciado (cada 3s)")
-        print("  📋 Comandos: /status, /pause, /resume, /list_paused, /restart, /stop, /config, /logs, /health, /symbol, /set_threshold, /grid_neutral, /reset_circuit, /backup, /help")
+        print("  📋 Comandos: /status, /pause, /resume, /list_paused, /restart, /stop, /config, /logs, /health, /symbol, /set_threshold, /grid_neutral, /reset_circuit, /backup, /force_fire, /force_close, /help")
 
         while True:
             try:
@@ -849,6 +849,9 @@ class Notifier:
                             "<code>/grid_neutral on</code> — Activar grid neutral\n"
                             "<code>/grid_neutral off</code> — Desactivar grid neutral\n"
                             "<code>/grid_neutral</code> — Ver estado\n\n"
+                            "<b>[FIRE] Fuerza manual:</b>\n"
+                            "<code>/force_fire SYMBOL DIRECTION</code> — Forzar grid (LONG/SHORT/NEUTRAL)\n"
+                            "<code>/force_close SYMBOL</code> — Forzar cierre de grid\n\n"
                             "<b>[CONTROL] Control:</b>\n"
                             "<code>/pause SYMBOL</code> — Pausar moneda\n"
                             "<code>/pause_all</code> — Pausar todas\n"
@@ -874,6 +877,142 @@ class Notifier:
                             "⏸️[A] = Pausa Auto (se reactiva sola)"
                         )
 
+                    elif cmd == '/force_fire' and args:
+                        parts = args.strip().split()
+                        if len(parts) < 2:
+                            await self.enviar_telegram(
+                                "❌ Uso: <code>/force_fire SYMBOL DIRECTION</code>\n"
+                                "Ejemplo: <code>/force_fire WIFUSDT LONG</code>"
+                            )
+                            continue
+                        symbol = parts[0].upper()
+                        direction = parts[1].upper()
+                        if direction not in ('LONG', 'SHORT', 'NEUTRAL'):
+                            await self.enviar_telegram(f"❌ Dirección debe ser LONG, SHORT o NEUTRAL")
+                            continue
+
+                        # Obtener precio vivo
+                        precio = precios.get(symbol, 0)
+                        if not precio:
+                            await self.enviar_telegram(f"❌ Sin precio vivo para {symbol}")
+                            continue
+
+                        # Obtener executor desde signal_generator (inyectado en main.py)
+                        executor = getattr(self.signal_generator, 'executor', None) if self.signal_generator else None
+                        if not executor:
+                            await self.enviar_telegram("❌ Executor no disponible")
+                            continue
+
+                        # Intentar usar motor blindado primero; fallback hardcodeado si falla
+                        params = None
+                        rechazos = []
+                        modo_fallback = False
+
+                        if self.signal_generator:
+                            state = self.signal_generator.states.get(symbol)
+                            i15 = self.signal_generator.indicadores_15m.get(symbol, {})
+                            i4h = self.signal_generator.indicadores_4h.get(symbol, {})
+                            atr = i15.get('atr', precio * 0.01)
+                            if not atr or atr <= 0:
+                                atr = precio * 0.01
+                            params, rechazos = self.signal_generator.calcular_parametros_grid_blindado(
+                                price=precio, direction=direction, atr=atr,
+                                i15=i15, i4h=i4h, symbol=symbol, state=state
+                            )
+
+                        if not params:
+                            modo_fallback = True
+                            if precio < 1.0:
+                                rango_pct = 0.30
+                                grid_count = 7
+                            elif precio < 10.0:
+                                rango_pct = 0.20
+                                grid_count = 7
+                            else:
+                                rango_pct = 0.15
+                                grid_count = 7
+
+                            rango_total = precio * rango_pct * 2
+                            lower = max(precio - (rango_total / 2), precio * 0.001)
+                            upper = precio + (rango_total / 2)
+                            step_usdt = rango_total / grid_count
+                            step_pct = (step_usdt / precio) * 100 if precio > 0 else 0
+                            capital = 100.0
+                            leverage = 5
+                            poder_total = capital * leverage
+                            notional_por_orden = poder_total / grid_count
+                            qty_por_orden = notional_por_orden / precio if precio > 0 else 0
+                            fee_rate = 0.0005
+                            breakeven = (2 * fee_rate + 2 * 0.0005) * 100
+
+                            params = {
+                                'direction': direction,
+                                'upper_limit': round(float(upper), 6),
+                                'lower_limit': round(float(lower), 6),
+                                'grid_count': grid_count,
+                                'step_usdt': round(float(step_usdt), 6),
+                                'step_pct': round(float(step_pct), 3),
+                                'breakeven_pct': round(breakeven, 3),
+                                'capital_sugerido': capital,
+                                'apalancamiento_sugerido': leverage,
+                                'notional_por_orden': round(notional_por_orden, 2),
+                                'qty_por_orden': round(qty_por_orden, 4),
+                                'margen_sobre_breakeven': round(step_pct - breakeven, 3),
+                                'rentable': True,
+                                'posicion_en_rango': 0.5,
+                                'recent_high': round(float(upper), 4),
+                                'recent_low': round(float(lower), 4),
+                                'auto_compressed': False,
+                                'posicion_extrema': False,
+                                'atr_seguro': round(rango_total / 4, 6),
+                                'rango_mult': 4.0,
+                            }
+                            print(f"  [FORCE_FIRE TG] {symbol} Fallback: {grid_count} grids | "
+                                  f"[{params['lower_limit']}, {params['upper_limit']}] | "
+                                  f"Step:{step_pct:.2f}% | Qty:{qty_por_orden:.2f}")
+
+                        # Asegurar qty mínima funcional
+                        if 'qty_por_orden' not in params or params['qty_por_orden'] <= 0:
+                            params['qty_por_orden'] = max(1.0, 5.0 / precio) if precio > 0 else 0.1
+
+                        print(f"  [FORCE_FIRE TG] {symbol} {'[FALLBACK]' if modo_fallback else '[BLINDADO]'} "
+                              f"Enviando grid {direction} al executor | {params['grid_count']} niveles | "
+                              f"Rango: {params['lower_limit']} - {params['upper_limit']}")
+
+                        await executor.queue.put({
+                            'tipo': 'CREAR_GRID',
+                            'symbol': symbol,
+                            'direction': direction,
+                            'params': params,
+                            'price': precio
+                        })
+                        await self.enviar_telegram(
+                            f"🚀 <b>FORCE FIRE enviado</b>\n"
+                            f"Symbol: {symbol}\n"
+                            f"Direction: {direction}\n"
+                            f"Price: ${precio:.4f}\n"
+                            f"Grid: {params['grid_count']} niveles | "
+                            f"Rango: {params['lower_limit']} - {params['upper_limit']}\n"
+                            f"{'<i>(Fallback hardcodeado)</i>' if modo_fallback else '<i>(Motor blindado)</i>'}"
+                        )
+
+                    elif cmd == '/force_close' and args:
+                        symbol = args.strip().upper()
+                        executor = getattr(self.signal_generator, 'executor', None) if self.signal_generator else None
+                        if not executor:
+                            await self.enviar_telegram("❌ Executor no disponible")
+                            continue
+
+                        await executor.queue.put({
+                            'tipo': 'ABORTAR_GRID',
+                            'symbol': symbol,
+                            'razon': 'force_close_telegram'
+                        })
+                        await self.enviar_telegram(
+                            f"🛑 <b>FORCE CLOSE enviado</b>\n"
+                            f"Symbol: {symbol}\n"
+                            f"Abortando grid activo..."
+                        )
                     elif cmd.startswith('/'):
                         await self.enviar_telegram(f"❓ Comando <code>{cmd}</code> no reconocido. Usa <code>/help</code>")
 

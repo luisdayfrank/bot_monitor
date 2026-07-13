@@ -328,6 +328,72 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_grid_sim_grid_id ON grid_simulaciones(grid_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_grid_sim_estado ON grid_simulaciones(estado)")
 
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # FASE 0: TABLAS DE EJECUCIÓN REAL (Testnet / Real)
+        # ═══════════════════════════════════════════════════════════════════════════════
+
+        # Grid de ejecución real (testnet o real)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS grid_ejecuciones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                estado TEXT NOT NULL DEFAULT 'ACTIVO',
+                trading_mode TEXT NOT NULL,
+                capital_asignado REAL NOT NULL,
+                apalancamiento_usado INTEGER NOT NULL,
+                precio_entrada REAL NOT NULL,
+                grid_params_json TEXT,
+                pnl_real REAL DEFAULT 0,
+                fees_real REAL DEFAULT 0,
+                razon_cierre TEXT,
+                timestamp_inicio INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                closed_at TIMESTAMP
+            )
+        """)
+
+        # Órdenes individuales en Binance (para recuperación post-crash)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS grid_ejecucion_ordenes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                grid_ejecucion_id INTEGER NOT NULL,
+                binance_order_id TEXT,
+                client_order_id TEXT NOT NULL UNIQUE,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                tipo_orden TEXT NOT NULL,
+                price REAL,
+                quantity REAL,
+                quantity_filled REAL DEFAULT 0,
+                status TEXT DEFAULT 'NEW',
+                FOREIGN KEY (grid_ejecucion_id) REFERENCES grid_ejecuciones(id)
+            )
+        """)
+
+        # Fills reales (parciales o completos)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS grid_ejecucion_fills (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                grid_ejecucion_id INTEGER NOT NULL,
+                orden_id INTEGER NOT NULL,
+                binance_trade_id TEXT,
+                price REAL,
+                qty REAL,
+                commission REAL,
+                commission_asset TEXT,
+                realized_pnl REAL,
+                timestamp TIMESTAMP,
+                FOREIGN KEY (orden_id) REFERENCES grid_ejecucion_ordenes(id)
+            )
+        """)
+
+        # Índices para ejecución real
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_grid_ejec_symbol ON grid_ejecuciones(symbol)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_grid_ejec_estado ON grid_ejecuciones(estado)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_ordenes_client_id ON grid_ejecucion_ordenes(client_order_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_ordenes_grid_id ON grid_ejecucion_ordenes(grid_ejecucion_id)")
+
         await db.commit()
 
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -344,6 +410,9 @@ async def init_db():
                 ('muestras_json', 'TEXT'),
                 ('precio_max', 'REAL'),
                 ('precio_min', 'REAL'),
+            ],
+            'grid_ejecuciones': [            
+                ('timestamp_inicio', 'INTEGER'),
             ],
         }
 
@@ -365,8 +434,19 @@ async def init_db():
 
     print("🗄️ Base de datos inicializada (WAL mode) + Auditoría + Disparos + Near-miss + V5.9.2 Grid Neutral + F1.4 Migración")
 
+# Mapeo seguro de timeframes a tablas (evita SQL injection)
+_TABLAS_VELAS = {
+    '1m': 'velas_1m',
+    '15m': 'velas_15m',
+    '4h': 'velas_4h',
+}
+
 async def insertar_vela(symbol: str, tf: str, vela: dict):
-    tabla = f"velas_{tf}"
+    tabla = _TABLAS_VELAS.get(tf)
+    if not tabla:
+        print(f"  ⚠️ [DB] Timeframe inválido '{tf}' para {symbol}, ignorando vela")
+        return
+
     await _execute_with_retry(f"""
         INSERT OR REPLACE INTO {tabla}
         (symbol, timestamp, open, high, low, close, volume)
@@ -374,8 +454,38 @@ async def insertar_vela(symbol: str, tf: str, vela: dict):
     """, (symbol, vela['timestamp'], vela['open'], vela['high'],
           vela['low'], vela['close'], vela['volume']))
 
+async def insertar_velas_batch(symbol: str, tf: str, velas: list):
+    """Inserta múltiples velas en una sola transacción (batch)."""
+    tabla = _TABLAS_VELAS.get(tf)
+    if not tabla:
+        print(f"  ⚠️ [DB] Timeframe inválido '{tf}' para batch insert")
+        return
+
+    if not velas:
+        return
+
+    db = await _get_db()
+    async with _db_lock:
+        try:
+            await db.executemany(
+                f"""
+                INSERT OR REPLACE INTO {tabla}
+                (symbol, timestamp, open, high, low, close, volume)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [(symbol, v['timestamp'], v['open'], v['high'], v['low'], v['close'], v['volume']) 
+                 for v in velas]
+            )
+            await db.commit()
+            print(f"  💾 [DB] Batch insert: {len(velas)} velas {tf} para {symbol}")
+        except Exception as e:
+            print(f"  ⚠️ [DB] Error en batch insert {tf} {symbol}: {e}")
+
 async def cargar_velas_historicas(symbol: str, tf: str, limit: int):
-    tabla = f"velas_{tf}"
+    tabla = _TABLAS_VELAS.get(tf)
+    if not tabla:
+        print(f"  ⚠️ [DB] Timeframe inválido '{tf}' para {symbol}, no se pueden cargar velas")
+        return []
     db = await _get_db()
     async with _db_lock:
         db.row_factory = aiosqlite.Row
@@ -1042,3 +1152,102 @@ async def actualizar_posiciones_abiertas(grid_id, posiciones_json, posiciones_at
     valores.append(grid_id)
     sql = f"UPDATE grid_simulaciones SET {', '.join(campos)} WHERE grid_id = ?"
     await _execute_with_retry(sql, tuple(valores))
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FASE 0: FUNCIONES DE EJECUCIÓN REAL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def guardar_grid_ejecucion(symbol, direction, trading_mode, capital_asignado,
+                                  apalancamiento_usado, precio_entrada, grid_params_json=None,
+                                  timestamp_inicio=None):
+    """Guarda un grid de ejecución real. Retorna el ID."""
+    db = await _get_db()
+    for attempt in range(5):
+        try:
+            async with _db_lock:
+                await db.execute("""
+                    INSERT INTO grid_ejecuciones
+                    (symbol, direction, estado, trading_mode, capital_asignado,
+                     apalancamiento_usado, precio_entrada, grid_params_json, timestamp_inicio)
+                    VALUES (?, ?, 'ACTIVO', ?, ?, ?, ?, ?, ?)
+                """, (symbol, direction, trading_mode, capital_asignado,
+                      apalancamiento_usado, precio_entrada, grid_params_json,
+                      timestamp_inicio or int(datetime.now(pytz.UTC).timestamp())))
+
+                cursor = await db.execute("SELECT last_insert_rowid()")
+                row = await cursor.fetchone()
+                await db.commit()
+                return row[0] if row else None
+        except Exception as e:
+            if "database is locked" in str(e).lower() and attempt < 4:
+                wait = 0.1 * (2 ** attempt)
+                await asyncio.sleep(wait)
+            else:
+                print(f"  ❌ Error guardando grid ejecución: {e}")
+                return None
+    return None
+
+
+async def guardar_orden_ejecucion(grid_ejecucion_id, binance_order_id, client_order_id,
+                                   symbol, side, tipo_orden, price, quantity):
+    """Guarda una orden de ejecución real."""
+    await _execute_with_retry("""
+        INSERT INTO grid_ejecucion_ordenes
+        (grid_ejecucion_id, binance_order_id, client_order_id, symbol, side, tipo_orden, price, quantity)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (grid_ejecucion_id, binance_order_id, client_order_id, symbol, side, tipo_orden, price, quantity))
+
+
+async def actualizar_orden_fill(orden_id, binance_trade_id, price, qty, commission,
+                                 commission_asset, realized_pnl, timestamp):
+    """Actualiza un fill de una orden."""
+    await _execute_with_retry("""
+        UPDATE grid_ejecucion_ordenes
+        SET quantity_filled = quantity_filled + ?,
+            status = CASE WHEN quantity_filled + ? >= quantity THEN 'FILLED' ELSE 'PARTIALLY_FILLED' END
+        WHERE id = ?
+    """, (qty, qty, orden_id))
+
+    await _execute_with_retry("""
+        INSERT INTO grid_ejecucion_fills
+        (grid_ejecucion_id, orden_id, binance_trade_id, price, qty, commission,
+         commission_asset, realized_pnl, timestamp)
+        VALUES (
+            (SELECT grid_ejecucion_id FROM grid_ejecucion_ordenes WHERE id = ?),
+            ?, ?, ?, ?, ?, ?, ?, ?
+        )
+    """, (orden_id, orden_id, binance_trade_id, price, qty, commission,
+          commission_asset, realized_pnl, timestamp))
+
+
+async def cargar_grid_ejecuciones_activos():
+    """Carga grids de ejecución en estado ACTIVO."""
+    db = await _get_db()
+    async with _db_lock:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT * FROM grid_ejecuciones WHERE estado = 'ACTIVO' ORDER BY created_at ASC
+        """)
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def cargar_ordenes_por_grid(grid_ejecucion_id):
+    """Carga órdenes de un grid de ejecución."""
+    db = await _get_db()
+    async with _db_lock:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT * FROM grid_ejecucion_ordenes WHERE grid_ejecucion_id = ? ORDER BY id ASC
+        """, (grid_ejecucion_id,))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def actualizar_grid_ejecucion_cierre(grid_id, estado, pnl_real, fees_real, razon_cierre):
+    """Cierra un grid de ejecución."""
+    await _execute_with_retry("""
+        UPDATE grid_ejecuciones
+        SET estado = ?, pnl_real = ?, fees_real = ?, razon_cierre = ?, closed_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    """, (estado, pnl_real, fees_real, razon_cierre, grid_id))

@@ -56,6 +56,8 @@ class SignalState:
         self.neutral_grid_dir_consec = 0
         self.neutral_grid_dir_previa = 'NEUTRAL'        
 
+        # FASE 1.2: Debounce de abortos al executor
+        self._aborto_enviado_ts = 0
 
         # FASE 5.5: Metricas diarias acumuladas
         self.metricas_dia: dict = {
@@ -102,7 +104,8 @@ class SignalGenerator:
         self._historial_1m: Dict[str, list] = {s: [] for s in CONFIG.symbols}
 
         self.audit_logger = None
-        self.grid_simulator = None  # V5.9.2: Referencia al simulador de grid neutral
+        # FASE 4: Grid neutral ahora es manejado 100% por el executor
+        # self.grid_simulator eliminado — lógica movida a executor.py como helper sincrono
 
     ARMED_TIMEOUT_MIN = 30
     SCORE_DISPARO_MIN = 70
@@ -310,7 +313,7 @@ class SignalGenerator:
     # ═══════════════════════════════════════════════════════════════════════════════
     # METODOS DE PAUSA / REANUDACION
     # ═══════════════════════════════════════════════════════════════════════════════
-    def pausar_moneda_manual(self, symbol: str, razon: str = "Comando usuario") -> bool:
+    async def pausar_moneda_manual(self, symbol: str, razon: str = "Comando usuario") -> bool:
         if symbol not in self.states:
             return False
         state = self.states[symbol]
@@ -318,6 +321,12 @@ class SignalGenerator:
             return False
 
         estado_anterior = state.estado
+        
+        # FASE 1.3: Abortar grid neutral activo antes de pausar
+        if state.estado == 'NEUTRAL_GRID' and hasattr(self, 'executor') and self.executor:
+            await self._enviar_aborto_seguro(symbol, 'pausa_manual')
+            print(f"  [PAUSA] {symbol} Grid neutral abortado antes de pausar")
+        
         state.moneda_pausada_manual = True
         state.moneda_pausada = True
         state.moneda_pausada_razon = razon
@@ -351,10 +360,10 @@ class SignalGenerator:
         print(f"  [RESUME] {symbol} REANUDADA MANUALMENTE | Monitoreo reiniciado")
         return True
 
-    def pausar_todas_manual(self, razon: str = "Comando usuario") -> list:
+    async def pausar_todas_manual(self, razon: str = "Comando usuario") -> list:
         pausadas = []
         for symbol in CONFIG.symbols:
-            if self.pausar_moneda_manual(symbol, razon):
+            if await self.pausar_moneda_manual(symbol, razon):
                 pausadas.append(symbol)
         return pausadas
 
@@ -377,6 +386,33 @@ class SignalGenerator:
                     'estado_maquina': state.estado
                 }
         return resultado
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 1.2: CENTRALIZADOR DE ABORTOS CON DEBOUNCE
+    # ═══════════════════════════════════════════════════════════════════════════════
+    async def _enviar_aborto_seguro(self, symbol: str, razon: str):
+        """
+        Envía un aborto al executor máximo una vez por minuto.
+        Evita spam de abortos múltiples para el mismo grid.
+        """
+        state = self.states.get(symbol)
+        if not state:
+            return
+        ahora = int(datetime.now(pytz.UTC).timestamp())
+        if getattr(state, '_aborto_enviado_ts', 0) > ahora - 60:
+            print(f"  [ABORTO] {symbol} Aborto ya enviado hace <60s, ignorando: {razon}")
+            return
+        if hasattr(self, 'executor') and self.executor:
+            try:
+                await self.executor.queue.put({
+                    'tipo': 'ABORTAR_GRID',
+                    'symbol': symbol,
+                    'razon': razon
+                })
+                state._aborto_enviado_ts = ahora
+                print(f"  [ABORTO] {symbol} Enviado al executor | Razón: {razon}")
+            except Exception as e:
+                print(f"  ⚠️ [ABORTO] Error enviando aborto {symbol}: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # LOOP PRINCIPAL
@@ -432,12 +468,7 @@ class SignalGenerator:
                         state.direccion_filtro = None
                         print(f"  [NEUTRAL_GRID] {symbol} -> MONITOREO (aborto: {razon})")
                         
-                        if self.grid_simulator:
-                            await self.grid_simulator.queue.put({
-                                'tipo': 'FINALIZAR_GRID',
-                                'symbol': symbol,
-                                'razon': razon
-                            })
+                        await self._enviar_aborto_seguro(symbol, razon)
                         
                         if self.audit_logger:
                             await self.audit_logger.log_evento_grid_simulacion(
@@ -680,8 +711,11 @@ class SignalGenerator:
             score_macro += 15
             umbral_entrada = 65
 
-        # RSI direccional (FASE 1.2)
-        if direction == 'SHORT':
+        # RSI direccional (FASE 1.2) — FASE 2.5: No sumar puntos en NEUTRAL
+        if direction == 'NEUTRAL':
+            # RSI es irrelevante para grid neutral; no suma ni resta
+            pass
+        elif direction == 'SHORT':
             decision, razon = self.evaluar_rsi_oxigeno(rsi, direction, adx, trend_strength)
             if decision == "PERMITIR":
                 score_macro += 20
@@ -875,23 +909,19 @@ class SignalGenerator:
                     print(f"  [NEUTRAL_GRID] {symbol} -> NEUTRAL_GRID | {razon_grid}")
 
                     state.grid_params_neutral = grid_params
-                    if self.grid_simulator:
-                        await self.grid_simulator.queue.put({
-                            'tipo': 'INICIAR_GRID',
-                            'symbol': symbol,
-                            'grid_params': grid_params,
-                            'precio_actual': price,
-                        })
-                        i1m_actual = self.indicadores_1m.get(symbol, {})
-                        if i1m_actual:
-                            await self.grid_simulator.queue.put({
-                                'tipo': 'TICK',
+                    # FASE 4: Grid neutral ejecutado por executor, no por simulador async
+                    if hasattr(self, 'executor') and self.executor:
+                        try:
+                            await self.executor.queue.put({
+                                'tipo': 'CREAR_GRID',
                                 'symbol': symbol,
-                                'high': i1m_actual.get('high', price),
-                                'low': i1m_actual.get('low', price),
-                                'close': i1m_actual.get('close', price),
-                                'timestamp': i1m_actual.get('timestamp', int(datetime.now(pytz.UTC).timestamp()))
+                                'direction': 'NEUTRAL',
+                                'params': grid_params,
+                                'price': price
                             })
+                            print(f"  [FASE 4] {symbol} Grid NEUTRAL enviado al executor")
+                        except Exception as e:
+                            print(f"  ⚠️ [FASE 4] Error enviando grid neutral al executor: {e}")
 
                     if self.audit_logger:
                         await self.audit_logger.log_cambio_estado(
@@ -956,12 +986,7 @@ class SignalGenerator:
                         evento_simulacion={'razon': 'direccion_detectada_2velas', 'nueva_direccion': direction},
                         pnl_acumulado=0.0
                     )
-                if self.grid_simulator:
-                    await self.grid_simulator.queue.put({
-                        'tipo': 'CERRAR_GRID_SUAVE',
-                        'symbol': symbol,
-                        'razon': 'direccion_detectada_2velas'
-                    })
+                await self._enviar_aborto_seguro(symbol, 'direccion_detectada_2velas')
                 print(f"  [NEUTRAL_GRID] {symbol} -> MONITOREO (direccion {direction} confirmada x2)")
             else:
                 print(f"  [NEUTRAL_GRID] {symbol} Dir {direction} ({state.neutral_grid_dir_consec}/2 velas)")
@@ -1203,6 +1228,9 @@ class SignalGenerator:
         entro_neutral_grid = await self._evaluar_transicion_neutral_grid(
             symbol, state, direction, score_macro, umbral_entrada, i15, price, coin_cfg
         )
+        # FASE 3.2: Si entró a NEUTRAL_GRID, no evaluar filtro direccional este ciclo
+        if entro_neutral_grid:
+            return
 
         # BLOQUE 3: APROBACIÓN DEL FILTRO (FASE 4.3: Filtros ponderados opcional)
         if state.estado == 'ARMED':
@@ -1350,10 +1378,8 @@ class SignalGenerator:
         if state.ultimo_disparo_precio > 0 and not state.ultimo_disparo_evaluado:
             price_actual = self.indicadores_1m.get(symbol, {}).get('close', 0)
 
-            # Prioridad 1: PnL real del grid simulator si existe
+            # FASE 4: Eliminado PnL del simulador. Usamos solo estimación por precio spot.
             pnl_grid = 0.0
-            if self.grid_simulator and symbol in self.grid_simulator.simulaciones:
-                pnl_grid = float(self.grid_simulator.simulaciones[symbol].pnl_neto)
 
             if pnl_grid != 0:
                 fue_rentable = pnl_grid > 0
@@ -1389,46 +1415,45 @@ class SignalGenerator:
         # F2.4: Aborto de emergencia por ruptura de límites del grid + 0.5% margen
         if state.estado == 'NEUTRAL_GRID':
             grid_params = getattr(state, 'grid_params_neutral', None)
-            if grid_params:
-                price_1m = self.indicadores_1m.get(symbol, {}).get('close', 0)
-                lower = grid_params.get('lower_limit', 0)
-                upper = grid_params.get('upper_limit', 0)
-                # Validación defensiva: lower debe ser < upper
-                if price_1m > 0 and lower > 0 and upper > 0 and upper > lower:
-                    margen = 0.005
-                    if price_1m < lower * (1 - margen) or price_1m > upper * (1 + margen):
-                        state.estado = 'MONITOREO'
-                        state.neutral_grid_timestamp = 0
-                        state.grid_params_neutral = None
-                        print(f"  [NEUTRAL_GRID] {symbol} -> MONITOREO (aborto emergencia: precio {price_1m:.4f} fuera de grid [{lower:.4f}, {upper:.4f}])")
-                        if self.audit_logger:
-                            await self.audit_logger.log_cambio_estado(
-                                symbol=symbol, de='NEUTRAL_GRID', a='MONITOREO',
-                                direccion='NEUTRAL', score_macro=state.score_macro_actual,
-                                contexto_macro={'razon': 'Aborto emergencia 1m: precio fuera de grid + 0.5%'}
-                            )
-                            state._prev_estado = 'MONITOREO'
-                            await self.audit_logger.log_evento_grid_simulacion(
-                                symbol=symbol, tipo='NEUTRAL_GRID_ABORT', grid_id=0,
-                                evento_simulacion={'razon': 'aborto_emergencia_1m', 'precio': price_1m, 'lower': lower, 'upper': upper},
-                                pnl_acumulado=0.0
-                            )
-                        # Notificar al simulador solo si existe
-                        if self.grid_simulator:
-                            await self.grid_simulator.queue.put({
-                                'tipo': 'FINALIZAR_GRID',
-                                'symbol': symbol,
-                                'razon': 'aborto_emergencia_1m'
-                            })
-                        else:
-                            print(f"  ⚠️ [NEUTRAL_GRID] {symbol} grid_simulator no disponible, aborto solo en estado")
-                        return
-                elif lower > 0 and upper > 0 and upper <= lower:
-                    print(f"  ⚠️ [NEUTRAL_GRID] {symbol} Grid params inválidos: upper({upper}) <= lower({lower}), abortando")
+
+            # --- NUEVO: Validación defensiva ---
+            if not isinstance(grid_params, dict):
+                print(f"  ⚠️ [NEUTRAL_GRID] {symbol} grid_params_neutral no es dict ({type(grid_params)}), skip aborto emergencia")
+                return  # No hay grid que monitorear
+            # -----------------------------------
+
+            price_1m = self.indicadores_1m.get(symbol, {}).get('close', 0)
+            lower = grid_params.get('lower_limit', 0)
+            upper = grid_params.get('upper_limit', 0)
+
+            # Validación defensiva adicional: lower debe ser < upper
+            if lower > 0 and upper > 0 and upper > lower:
+                margen = 0.005
+                if price_1m > 0 and (price_1m < lower * (1 - margen) or price_1m > upper * (1 + margen)):
                     state.estado = 'MONITOREO'
                     state.neutral_grid_timestamp = 0
                     state.grid_params_neutral = None
+                    print(f"  [NEUTRAL_GRID] {symbol} -> MONITOREO (aborto emergencia: precio {price_1m:.4f} fuera de grid [{lower:.4f}, {upper:.4f}])")
+                    if self.audit_logger:
+                        await self.audit_logger.log_cambio_estado(
+                            symbol=symbol, de='NEUTRAL_GRID', a='MONITOREO',
+                            direccion='NEUTRAL', score_macro=state.score_macro_actual,
+                            contexto_macro={'razon': 'Aborto emergencia 1m: precio fuera de grid + 0.5%'}
+                        )
+                        state._prev_estado = 'MONITOREO'
+                        await self.audit_logger.log_evento_grid_simulacion(
+                            symbol=symbol, tipo='NEUTRAL_GRID_ABORT', grid_id=0,
+                            evento_simulacion={'razon': 'aborto_emergencia_1m', 'precio': price_1m, 'lower': lower, 'upper': upper},
+                            pnl_acumulado=0.0
+                        )
+                    await self._enviar_aborto_seguro(symbol, 'aborto_emergencia_1m')
                     return
+            elif lower > 0 and upper > 0 and upper <= lower:
+                print(f"  ⚠️ [NEUTRAL_GRID] {symbol} Grid params inválidos: upper({upper}) <= lower({lower}), abortando")
+                state.estado = 'MONITOREO'
+                state.neutral_grid_timestamp = 0
+                state.grid_params_neutral = None
+                return
             # Si no hay aborto de emergencia, mantener NEUTRAL_GRID sin seguir máquina tradicional
             return
 
@@ -1725,6 +1750,26 @@ class SignalGenerator:
             params = {}
         await self.emitir_alerta(symbol, 'FIRE', direction, score, [], params, price)
 
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # FASE 1: Ejecutar en testnet/real (solo LONG por ahora)
+        # ═══════════════════════════════════════════════════════════════════════════════
+        if (CONFIG.trading_mode in ('TESTNET', 'REAL') and
+            direction in ('LONG', 'SHORT') and
+            hasattr(self, 'executor') and self.executor):
+            try:
+                await self.executor.queue.put({
+                    'tipo': 'CREAR_GRID',
+                    'symbol': symbol,
+                    'direction': direction,
+                    'params': params,
+                    'price': price
+                })
+                print(f"  [FASE 1] {symbol} Grid LONG enviado al executor ({CONFIG.trading_mode})")
+            except Exception as e:
+                print(f"  ⚠️ [FASE 1] Executor error (no crítico): {e}")
+
+        await asyncio.sleep(0.1)
+        state.estado = 'COOLDOWN'
         await asyncio.sleep(0.1)
         state.estado = 'COOLDOWN'
         print(f"  [ESTADO] {symbol} -> COOLDOWN")
@@ -1902,13 +1947,7 @@ class SignalGenerator:
                     symbol=symbol, tipo='NEUTRAL_GRID_ABORT', grid_id=0,
                     evento_simulacion={'razon': 'circuit_breaker'}, pnl_acumulado=0.0
                 )
-            # Notificar al simulador para finalizar grid
-            if self.grid_simulator:
-                await self.grid_simulator.queue.put({
-                    'tipo': 'FINALIZAR_GRID',
-                    'symbol': symbol,
-                    'razon': 'circuit_breaker'
-                })
+            await self._enviar_aborto_seguro(symbol, 'circuit_breaker')
 
         if self.audit_logger:
             await self.audit_logger.log_circuit_breaker(
@@ -1917,6 +1956,8 @@ class SignalGenerator:
                 rechazos=[f"{state.disparos_consecutivos} disparos en perdida"]
             )
 
+        await self._enviar_aborto_seguro(symbol, 'circuit_breaker')
+                
         await self.emitir_alerta(symbol, 'CIRCUIT_BREAKER', state.direccion_filtro or 'NEUTRAL', 0,
                                  [f"{state.disparos_consecutivos} disparos en perdida"], None, 0)
 

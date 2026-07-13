@@ -14,7 +14,8 @@ from notifier_v5 import Notifier
 
 from audit_logger import AuditLogger
 from audit_reporter_v5 import AuditReporter
-from grid_simulator import GridSimulator  # V5.9.2: Motor de simulación grid neutral
+# FASE 4: GridSimulator eliminado como servicio async. 
+# La lógica neutral ahora vive como helper sincrono dentro del executor.
 
 background_tasks = set()
 
@@ -37,6 +38,19 @@ async def lifespan(fastapi_app):
     # V4.2: Guardar referencia para comandos Telegram
     notifier.signal_generator = signals
 
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 1: Crear executor de trading real/testnet
+    # ═══════════════════════════════════════════════════════════════════════════════
+    executor = None
+    if CONFIG.trading_mode in ('TESTNET', 'REAL'):
+        from executor import GridExecutor
+        executor = GridExecutor(precios_vivo, signals.states)
+        signals.executor = executor
+        print(f"  🚀 [FASE 1] Executor {CONFIG.trading_mode} creado | Capital: ${CONFIG.trading_capital_max_usdt}")
+    else:
+        print("  ℹ️ [FASE 1] Modo SIMULACIÓN (executor no activado)")
+
     # F2.8: Crear todas las instancias PRIMERO (antes de inyectar dependencias)
     audit_logger = None
     audit_reporter = None
@@ -51,19 +65,15 @@ async def lifespan(fastapi_app):
     else:
         print("📋 Modo auditoría DESACTIVADO")
 
-    # V5.9.2: Crear simulador de grid neutral
-    grid_simulator = GridSimulator(
-        precios_vivo=precios_vivo,
-        indicadores_1m=signals.indicadores_1m,
-        signal_states=signals.states,
-    )
+    # FASE 4: GridSimulator ya no se instancia aquí. 
+    # El executor crea su propio helper sincrono internamente.
 
     # F2.8: BLOQUE SECUENCIAL de inyección de dependencias (TODAS juntas, antes de lanzar tareas)
     signals.audit_logger = audit_logger
-    signals.grid_simulator = grid_simulator
-    grid_simulator.audit_logger = audit_logger
-    grid_simulator.notifier = notifier
-    grid_simulator.signal_generator = signals
+    # FASE 4: grid_simulator eliminado. El executor maneja grid neutral internamente.
+    signals.executor = executor  # ← FASE 1: Inyectar executor
+    if executor:
+        executor.notifier = notifier  # ← FASE 1: Executor puede notificar
     signals.notifier = notifier  # FASE 3.2: Para alertas pre-disparo Telegram
 
 
@@ -86,14 +96,15 @@ async def lifespan(fastapi_app):
     app.state.indicadores_4h = signals.indicadores_4h
     # V4.2: Exponer signal_generator para endpoints REST
     app.state.signal_generator = signals
-    # V5.9.2: Exponer grid_simulator para endpoint /api/grid-neutral/{symbol}
-    app.state.grid_simulator = grid_simulator
+    # FASE 4: app.state.grid_simulator eliminado. 
+    # El endpoint /api/grid-neutral/{symbol} lee del executor ahora.
     # FASE 5 FIX: Exponer notifier real para endpoints REST
     app.state.notifier = notifier
+    # FASE 1: Exponer executor para endpoints REST de fuerza manual
+    app.state.executor = executor
 
-    # V5.9.2 MEJORA #6: Limpiar grids huérfanos al arranque
-    print("  🧹 V5.9.2: Limpiando grids huérfanos...")
-    await grid_simulator.limpiar_grids_huerfanos()
+    # FASE 4: Limpieza de grids huérfanos movida al executor (si aplica).
+    # El executor maneja su propia recuperación post-crash en _recuperar_grids_activos().
 
     print("✅ Precálculo completado. Arrancando pipeline V5.9.2...")
 
@@ -110,80 +121,9 @@ async def lifespan(fastapi_app):
         notifier=notifier  # FASE 1 FIX: Pasar la instancia real con signal_generator configurado
     ))
 
-    # V5.9.2: Tarea del simulador de grid neutral
-    t_grid_sim = asyncio.create_task(grid_simulator.run())
-
-    # V5.9.2: Ticker que inyecta ticks de precio al simulador cada 1 minuto
-    async def grid_ticker():
-        """Inyecta ticks de precio al simulador usando velas 1m."""
-        while True:
-            await asyncio.sleep(60)  # Cada minuto
-            try:
-                # FIX: Preguntar directamente al simulador qué grids están activos
-                # en lugar de confiar en signals.states (evita desincronización)
-                activos_en_simulador = list(grid_simulator.simulaciones.keys())
-                for symbol in activos_en_simulador:
-                    if symbol not in precios_vivo:
-                        continue
-                    
-                    i1m = signals.indicadores_1m.get(symbol, {})
-                    precio = precios_vivo[symbol]
-                    
-                    # FASE 1.1 FIX: Fallback de high/low desde precio spot
-                    high = i1m.get('high')
-                    low = i1m.get('low')
-                    close = i1m.get('close')
-                    
-                    if close is None:
-                        close = precio
-                    
-                    # Estimar high/low desde close si no hay vela real
-                    if high is None or low is None:
-                        atr_estimado = i1m.get('atr_1m', close * 0.001)
-                        if high is None:
-                            high = close + atr_estimado
-                        if low is None:
-                            low = close - atr_estimado
-                        print(f"  [GRID_TICKER] {symbol} Estimando high/low desde close+ATR | "
-                              f"H:{high:.4f} L:{low:.4f} C:{close:.4f}")
-                    
-                    # Solo saltar si ni siquiera tenemos close
-                    if close is None or close <= 0:
-                        print(f"  [GRID_TICKER] {symbol} Sin precio válido, saltando tick")
-                        continue
-                    
-                    # F3.2: Usar timestamp real de la vela 1m
-                    ts_raw = i1m.get('timestamp')
-                    if ts_raw and ts_raw > 1e12:
-                        ts = int(ts_raw / 1000)
-                    elif ts_raw:
-                        ts = int(ts_raw)
-                    else:
-                        ts = int(datetime.now(pytz.UTC).timestamp())
-                    await grid_simulator.queue.put({
-                        'tipo': 'TICK',
-                        'symbol': symbol,
-                        'high': high,
-                        'low': low,
-                        'close': close,
-                        'timestamp': ts
-                    })
-            except Exception as e:
-                print(f"  ⚠️ [GRID_TICKER] Error: {e}")
-
-    t_grid_ticker = asyncio.create_task(grid_ticker())
-
-    # V5.9.2 MEJORA #6: Heartbeat del simulador cada 15 minutos
-    async def grid_heartbeat():
-        """Verifica salud de grids activos cada 15 minutos."""
-        while True:
-            await asyncio.sleep(CONFIG.grid_neutral_heartbeat_intervalo_min * 60)
-            try:
-                await grid_simulator.heartbeat()
-            except Exception as e:
-                print(f"  ⚠️ [GRID_HEARTBEAT] Error: {e}")
-
-    t_grid_heartbeat = asyncio.create_task(grid_heartbeat())
+    # FASE 4: Eliminadas tareas async de grid_simulator.
+    # El executor maneja grid neutral sincronicamente dentro de su loop de polling.
+    # No hay colas, tickers ni heartbeats separados.
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # F1.3 FIX: Definir callback ANTES de usarlo en las tareas del grid
@@ -196,11 +136,17 @@ async def lifespan(fastapi_app):
         except Exception as e:
             print(f"❌ ERROR CRÍTICO EN TAREA: {e}")
 
-    # Aplicar callback a tareas del grid (F1.3 del Plan 6.1)
-    for t in [t_grid_sim, t_grid_ticker, t_grid_heartbeat]:
-        t.add_done_callback(task_done_callback)
+    # FASE 4: No hay tareas de grid_simulator que monitorear.
 
-    background_tasks.update([t1, t2, t3, t4, t_grid_sim, t_grid_ticker, t_grid_heartbeat])
+    background_tasks.update([t1, t2, t3, t4])
+
+
+    # FASE 1: Tarea del executor de trading real
+    if executor:
+        t_executor = asyncio.create_task(executor.run())
+        background_tasks.add(t_executor)
+        t_executor.add_done_callback(task_done_callback)
+        print(f"  ✅ [FASE 1] Tarea executor añadida al pipeline")
 
     # Aplicar callback a tareas principales
     for t in [t1, t2, t3, t4]:
@@ -356,8 +302,13 @@ async def lifespan(fastapi_app):
 
     print("⏹️ Apagando procesos de forma segura...")
 
-    # V5.9.2: Detener simulador de grid neutral
-    grid_simulator.stop()
+    # FASE 1.4: Apagar executor antes de cerrar DB
+    if executor:
+        print("  🛑 [SHUTDOWN] Solicitando parada del executor...")
+        executor.stop()
+        # Dar tiempo al executor para abortar grids activos en Binance
+        await asyncio.sleep(1)
+        print("  ✅ [SHUTDOWN] Executor detenido")
 
     if CONFIG.modo_auditoria and audit_logger:
         await audit_logger.cerrar_seguimiento_todos()

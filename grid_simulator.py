@@ -1,53 +1,38 @@
+
 """
-grid_simulator.py — V5.9.2 Motor de Simulación Virtual Grid Neutral
+grid_simulator.py — V7 Helper Síncrono de Lógica Pura para Grid Neutral
 
-Simula la ejecución de un grid de órdenes LIMIT en tiempo real usando
-los highs/lows de cada vela 1m como proxy de ejecución.
+Convertido a clase helper (Opción C): sin async, sin colas, sin tareas, sin DB.
+El executor consulta estos métodos directamente dentro de su propio loop de polling.
 
-CARACTERÍSTICAS V5.9.2:
-  • Simulación por cruce de High/Low (no close)
-  • Slippage simulado + fees Binance Futures (0.05%)
-  • Kill switch inteligente: 10 intentos LIMIT → market order 2% → ATRAPADA
-  • Timeout FIFO: posiciones >30min se cierran forzosamente
-  • Gestión de órdenes parcialmente llenadas
-  • Persistencia atómica en SQLite (grid_estados + grid_simulaciones)
-  • Heartbeat cada 15 minutos para detectar grids zombies
+MÉTODOS PÚBLICOS DEL HELPER:
+  • init_sim_state()  → Crea un SimState para que el executor lo guarde.
+  • on_fill()         → Registra un fill real confirmado por Binance.
+  • poll()            → Verifica timeouts y empareja posiciones cada ciclo.
+  • close_sim_state() → Cierra todo y retorna resumen al abortar el grid.
 
-INTEGRACIÓN:
-  - main.py crea una tarea asyncio para run()
-  - signals_v5.py llama a iniciar_grid() cuando entra a NEUTRAL_GRID
-  - signals_v5.py llama a finalizar_grid() cuando aborta NEUTRAL_GRID
-  - collector.py (o main.py) inyecta ticks vía la cola self.queue
+MÉTODOS INTERNOS PRESERVADOS:
+  • _emparejar_posiciones()      → FIFO LONG/SHORT.
+  • _ejecutar_kill_switch()      → (legacy, mantenido intacto, sincronizado)
+  • _calcular_pnl()              → Cálculo de PnL por posición.
+  • get_estado_simulacion()      → (legacy, ajustado para recibir SimState)
 """
 
-import asyncio
 import json
-import random
 from datetime import datetime
 from typing import Dict, List, Optional
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal
 from config import CONFIG
-from database_v5 import (
-    guardar_grid_estado_atomico,
-    actualizar_grid_estado,
-    actualizar_grid_simulacion,
-    actualizar_posiciones_abiertas,
-    cargar_grid_activo,
-    cargar_simulacion_activa,
-    forzar_aborto_grid_huerfano,
-    cargar_todos_grids_activos,
-)
 
 
 class SimPosicion:
     """Representa una posición simulada abierta en el grid."""
 
-    _contador = 0
-
     def __init__(self, tipo, nivel_precio, precio_ejecucion, qty, slippage_aplicado,
-                 fee_pagada, notional, timestamp_apertura, filled_qty=None, original_qty=None):
-        SimPosicion._contador += 1
-        self.id = f"pos_{SimPosicion._contador:03d}"
+                 fee_pagada, notional, timestamp_apertura, filled_qty=None, original_qty=None,
+                 sim_id: str = "sim"):
+        # Usar timestamp + sim_id para ID único y trackeable por simulación
+        self.id = f"{sim_id}_pos_{timestamp_apertura}_{int(nivel_precio * 10000)}"
         self.tipo = tipo  # 'LONG' | 'SHORT'
         self.nivel_precio = nivel_precio
         self.precio_ejecucion = precio_ejecucion
@@ -153,588 +138,24 @@ class SimState:
 
 class GridSimulator:
     """
-    Motor de simulación virtual para grids neutral.
+    Helper de lógica pura para grids neutral.
 
     Flujo:
-      1. signals_v5 detecta NEUTRAL_GRID → llama iniciar_grid()
-      2. main.py inyecta ticks de precio (high, low, close) vía la cola
-      3. El simulador detecta cruces de niveles y simula ejecuciones
-      4. Cuando el grid finaliza (aborto o timeout) → llama finalizar_grid()
+      1. Executor crea SimState vía init_sim_state() y lo guarda en su estado.
+      2. Executor llama on_fill() cuando Binance confirma un fill real.
+      3. Executor llama poll() cada ciclo de polling para emparejar y detectar timeouts.
+      4. Executor llama close_sim_state() al abortar el grid.
     """
 
-    def __init__(self, precios_vivo: dict, indicadores_1m: dict, signal_states: dict):
-        self.precios_vivo = precios_vivo
-        self.indicadores_1m = indicadores_1m
-        self.signal_states = signal_states
-        self.queue: asyncio.Queue = asyncio.Queue()
-        self.simulaciones: Dict[str, SimState] = {}  # symbol -> SimState
-        self._shutdown = asyncio.Event()
-        self._db_lock = asyncio.Lock()
-        self.audit_logger = None
-        self.notifier = None
-        self.signal_generator = None
+    def __init__(self):
+        # Helper puro: sin estado propio, sin async, sin DB
+        pass
 
     # ═══════════════════════════════════════════════════════════════════════════════
-    # LOOP PRINCIPAL
+    # MÉTODOS PRESERVADOS INTACTOS
     # ═══════════════════════════════════════════════════════════════════════════════
 
-    async def run(self):
-        """Loop principal: procesa ticks de la cola."""
-        print("  [GRID_SIM] Motor de simulación V5.9.2 iniciado")
-
-        while not self._shutdown.is_set():
-            try:
-                msg = await asyncio.wait_for(self.queue.get(), timeout=5.0)
-                await self._procesar_mensaje(msg)
-            except asyncio.TimeoutError:
-                continue
-            except Exception as e:
-                print(f"  ❌ [GRID_SIM] Error en loop principal: {e}")
-
-    def stop(self):
-        self._shutdown.set()
-
-    async def _procesar_mensaje(self, msg):
-        """Procesa un mensaje de la cola."""
-        tipo = msg.get('tipo')
-
-        if tipo == 'TICK':
-            # Tick de precio: {tipo: 'TICK', symbol: 'BTCUSDT', high: H, low: L, close: C, timestamp: ts}
-            symbol = msg.get('symbol')
-            if symbol in self.simulaciones and self.simulaciones[symbol].activa:
-                await self.simular_tick(
-                    symbol=symbol,
-                    high=msg.get('high'),
-                    low=msg.get('low'),
-                    close=msg.get('close'),
-                    timestamp=msg.get('timestamp')
-                )
-
-        elif tipo == 'INICIAR_GRID':
-            # Solicitud de iniciar grid: {tipo: 'INICIAR_GRID', symbol: 'BTCUSDT', grid_params: {...}, precio_actual: P}
-            await self.iniciar_grid(
-                symbol=msg.get('symbol'),
-                grid_params=msg.get('grid_params'),
-                precio_actual=msg.get('precio_actual')
-            )
-
-        elif tipo == 'FINALIZAR_GRID':
-            # Solicitud de finalizar grid: {tipo: 'FINALIZAR_GRID', symbol: 'BTCUSDT', razon: 'aborto'}
-            await self.finalizar_grid(
-                symbol=msg.get('symbol'),
-                razon=msg.get('razon', 'FINALIZADO')
-            )
-
-        elif tipo == 'CERRAR_GRID_SUAVE':
-            # Cierre suave: no abrir nuevas posiciones, pero dejar que las existentes se emparejen
-            await self.cerrar_grid_suave(
-                symbol=msg.get('symbol'),
-                razon=msg.get('razon', 'direccion_detectada')
-            )
-
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # INICIAR / FINALIZAR GRID
-    # ═══════════════════════════════════════════════════════════════════════════════
-
-    async def iniciar_grid(self, symbol: str, grid_params: dict, precio_actual: float):
-        """Inicia una nueva simulación de grid neutral."""
-        if symbol in self.simulaciones and self.simulaciones[symbol].activa:
-            print(f"  [GRID_SIM] {symbol} Ya hay grid activo, ignorando nuevo inicio")
-            return
-
-        try:
-            # Extraer parámetros del grid
-            lower = Decimal(str(grid_params.get('lower_limit', precio_actual * 0.98)))
-            upper = Decimal(str(grid_params.get('upper_limit', precio_actual * 1.02)))
-            grid_count = int(grid_params.get('grid_count', 20))
-            qty = Decimal(str(grid_params.get('qty_por_orden', 0.1)))
-
-            # Generar niveles del grid (distribución uniforme)
-            step = (upper - lower) / Decimal(str(grid_count))
-            niveles = [lower + step * i for i in range(grid_count + 1)]
-
-            # V7: Separar niveles por dirección relativa al precio actual
-            # Niveles por debajo = BUY (compras barato)
-            # Niveles por encima = SELL (vendes caro)
-            # El nivel más cercano al precio se ignora (no hay orden en el centro)
-            niveles_buy = [n for n in niveles if n < Decimal(str(precio_actual)) * Decimal('0.9995')]
-            niveles_sell = [n for n in niveles if n > Decimal(str(precio_actual)) * Decimal('1.0005')]
-
-            # Calcular qty_por_orden basada en capital / num_grids / precio
-            capital = Decimal(str(grid_params.get('capital', CONFIG.grid_default_capital)))
-            leverage = Decimal(str(grid_params.get('apalancamiento_sugerido', CONFIG.grid_default_leverage)))
-            notional_total = capital * leverage
-            notional_por_orden = notional_total / Decimal(str(grid_count))
-            qty_por_orden = (notional_por_orden / Decimal(str(precio_actual))).quantize(
-                Decimal('0.0001'), rounding=ROUND_DOWN
-            )
-
-            posiciones_json = json.dumps({
-                "niveles": [float(n) for n in niveles],
-                "qty_por_orden": float(qty_por_orden),
-                "capital": float(capital),
-                "leverage": float(leverage),
-                "fee_rate": CONFIG.grid_neutral_sim_fee_rate,
-                "slippage_base": CONFIG.grid_neutral_sim_slippage_base,
-            })
-
-            # Transacción atómica: grid_estado + grid_simulacion
-            ts = int(datetime.utcnow().timestamp())
-            resultado = await guardar_grid_estado_atomico(
-                symbol=symbol,
-                timestamp_inicio=ts,
-                precio_inicio=precio_actual,
-                grid_params_json=json.dumps(grid_params),
-                posiciones_abiertas_json=posiciones_json,
-            )
-
-            if not resultado:
-                print(f"  ❌ [GRID_SIM] {symbol} Fallo transacción atómica al iniciar grid")
-                return
-
-            grid_id = resultado['grid_id']
-            sim_id = resultado['sim_id']
-
-            # Crear estado en memoria
-            sim = SimState(
-                grid_id=grid_id,
-                sim_id=sim_id,
-                symbol=symbol,
-                niveles=niveles,
-                qty_por_orden=qty_por_orden,
-                fee_rate=Decimal(str(CONFIG.grid_neutral_sim_fee_rate)),
-                slippage_base=Decimal(str(CONFIG.grid_neutral_sim_slippage_base)),
-                precio_inicio=Decimal(str(precio_actual)),
-                timestamp_inicio=ts,
-            )
-            self.simulaciones[symbol] = sim
-            # V7: Asignar niveles separados al estado
-            sim.niveles_buy = niveles_buy
-            sim.niveles_sell = niveles_sell
-            sim.precio_referencia = Decimal(str(precio_actual))
-
-            # V7: Inicializar órdenes LIMIT pendientes
-            for n in sim.niveles_buy:
-                sim.ordenes_pendientes[str(float(n))] = 'BUY'
-            for n in sim.niveles_sell:
-                sim.ordenes_pendientes[str(float(n))] = 'SELL'
-
-            print(f"  [GRID_SIM] {symbol} Niveles BUY: {len(niveles_buy)} | Niveles SELL: {len(niveles_sell)}")
-
-            print(f"  [GRID_SIM] {symbol} Grid iniciado | ID:{grid_id} | Niveles:{len(niveles)} | "
-                  f"Qty/orden:{float(qty_por_orden):.4f} | Precio:${precio_actual:.4f}")
-
-            # Auditoría
-            if self.audit_logger:
-                await self.audit_logger.log_evento_grid_simulacion(
-                    symbol=symbol,
-                    tipo='GRID_INICIADO',
-                    grid_id=grid_id,
-                    evento_simulacion={
-                        'niveles': len(niveles),
-                        'qty_por_orden': float(qty_por_orden),
-                        'precio_inicio': precio_actual,
-                        'lower_limit': float(grid_params['lower_limit']) if grid_params and 'lower_limit' in grid_params else None,
-                        'upper_limit': float(grid_params['upper_limit']) if grid_params and 'upper_limit' in grid_params else None,
-                        'grid_count': int(grid_params['grid_count']) if grid_params and 'grid_count' in grid_params else None,
-                        'step_pct': float(grid_params['step_pct']) if grid_params and 'step_pct' in grid_params else None,
-                        'capital': float(grid_params['capital_sugerido']) if grid_params and 'capital_sugerido' in grid_params else None,
-                    },
-                    pnl_acumulado=0.0,
-                    grid_params=grid_params,  # <-- ESTO ES LO IMPORTANTE
-                    score_macro=0             # o el score que tenía antes de entrar
-                )
-
-        except Exception as e:
-            print(f"  ❌ [GRID_SIM] {symbol} Error iniciando grid: {e}")
-
-    async def finalizar_grid(self, symbol: str, razon: str = 'FINALIZADO'):
-        """Finaliza una simulación de grid (aborto o completado)."""
-        if symbol not in self.simulaciones:
-            return
-
-        sim = self.simulaciones[symbol]
-        if not sim.activa:
-            return
-
-        sim.activa = False
-        ts = int(datetime.utcnow().timestamp())
-
-        try:
-            # Cerrar posiciones abiertas: solo kill switch si están fuera de rango
-            posiciones_abiertas = sim.posiciones_abiertas_list()
-            if posiciones_abiertas:
-                print(f"  [GRID_SIM] {symbol} Cerrando {len(posiciones_abiertas)} posiciones pendientes ({razon})")
-                precio_actual = Decimal(str(self.precios_vivo.get(symbol, float(sim.precio_inicio))))
-                for pos in posiciones_abiertas:
-                    # Solo matar con kill switch si la posición está claramente fuera de rango (>1% del nivel)
-                    margen_cierre = Decimal('0.01')  # 1%
-                    if pos.tipo == 'LONG':
-                        precio_limite = Decimal(str(pos.nivel_precio)) * (Decimal('1') - margen_cierre)
-                        if precio_actual < precio_limite:
-                            # LONG fuera de rango: kill switch
-                            await self._ejecutar_kill_switch(sim, pos, precio_actual, razon_cierre=razon)
-                        else:
-                            # LONG dentro de rango: dejar que se empareje naturalmente
-                            pos.estado = 'PENDIENTE_CIERRE'
-                            print(f"  [GRID_SIM] {symbol} Posición LONG {pos.id} marcada PENDIENTE_CIERRE (precio dentro de rango)")
-                    elif pos.tipo == 'SHORT':
-                        precio_limite = Decimal(str(pos.nivel_precio)) * (Decimal('1') + margen_cierre)
-                        if precio_actual > precio_limite:
-                            # SHORT fuera de rango: kill switch
-                            await self._ejecutar_kill_switch(sim, pos, precio_actual, razon_cierre=razon)
-                        else:
-                            # SHORT dentro de rango: dejar que se empareje naturalmente
-                            pos.estado = 'PENDIENTE_CIERRE'
-                            print(f"  [GRID_SIM] {symbol} Posición SHORT {pos.id} marcada PENDIENTE_CIERRE (precio dentro de rango)")
-
-            # FIX 0.2 CORREGIDO: Liquidar posiciones PENDIENTE_CIERRE a precio de mercado
-            # MOVIDO FUERA del if para que siempre se ejecute, incluso si no hay abiertas pero sí pendientes
-            posiciones_pendientes = [p for p in sim.posiciones if p.estado == 'PENDIENTE_CIERRE']
-            if posiciones_pendientes:
-                precio_actual = Decimal(str(self.precios_vivo.get(symbol, float(sim.precio_inicio))))
-                print(f"  [GRID_SIM] {symbol} Liquidando {len(posiciones_pendientes)} posiciones pendientes a ${float(precio_actual):.4f}")
-                for pos in posiciones_pendientes:
-                    pnl = self._calcular_pnl(pos, float(precio_actual))
-                    pos.estado = 'CERRADA_FORZADA'
-                    pos.pnl_cierre = pnl
-                    sim.pnl_bruto += Decimal(str(pnl))
-                    # FIX CRÍTICO: Sincronizar pnl_neto después de cada liquidación
-                    sim.pnl_neto = sim.pnl_bruto - sim.fees_totales
-                    print(f"  [GRID_SIM] {symbol} Posición {pos.id} {pos.tipo} liquidada @ ${float(precio_actual):.4f} | PnL:{pnl:+.4f}")
-
-            # Calcular métricas finales
-            pnl_neto_final = float(sim.pnl_neto)
-            fees_total = float(sim.fees_totales)
-
-            # Persistir estado final
-            pos_abiertas_json = json.dumps([p.to_dict() for p in sim.posiciones if p.estado != 'ATRAPADA'])
-            pos_atrapadas_json = json.dumps([p.to_dict() for p in sim.posiciones_atrapadas])
-
-            await actualizar_grid_estado(
-                grid_id=sim.grid_id,
-                estado='ABORTADO' if razon != 'COMPLETADO' else 'COMPLETADO',
-                timestamp_fin=ts
-            )
-            await actualizar_grid_simulacion(
-                grid_id=sim.grid_id,
-                estado='ABORTADO' if razon != 'COMPLETADO' else 'COMPLETADO',
-                timestamp_fin=ts,
-                precio_fin=float(self.precios_vivo.get(symbol, 0)),
-                pnl_bruto=float(sim.pnl_bruto),
-                pnl_neto=pnl_neto_final,
-                fees_totales=fees_total,
-                slippage_total=float(sim.slippage_total),
-                trades_completados=sim.trades_completados,
-                trades_kill_switch=sim.trades_kill_switch,
-                posiciones_abiertas_json=pos_abiertas_json,
-                posiciones_atrapadas_json=pos_atrapadas_json,
-            )
-
-            # V5.7.4: Resumen transparente de PnL
-            pnl_bruto_real = float(sim.pnl_bruto)
-            pnl_atrapadas_total = sum(
-                getattr(p, 'pnl_cierre', 0) or 0 
-                for p in sim.posiciones_atrapadas
-            )
-            pnl_real_estimado = pnl_bruto_real - fees_total
-            pos_abiertas_restantes = len([p for p in sim.posiciones if p.estado in ('ABIERTA', 'PENDIENTE_CIERRE')])
-            
-            print(f"  [GRID_SIM] {symbol} ════════════════════════════════════════")
-            print(f"  [GRID_SIM] {symbol} Grid finalizado ({razon})")
-            print(f"  [GRID_SIM] {symbol} • PnL Bruto (emparejados): {pnl_bruto_real - pnl_atrapadas_total:+.4f}")
-            if pnl_atrapadas_total != 0:
-                print(f"  [GRID_SIM] {symbol} • PnL Atrapadas estimado: {pnl_atrapadas_total:+.4f}")
-            print(f"  [GRID_SIM] {symbol} • PnL Bruto TOTAL: {pnl_bruto_real:+.4f}")
-            print(f"  [GRID_SIM] {symbol} • Fees: {fees_total:.4f}")
-            print(f"  [GRID_SIM] {symbol} • PnL Neto REPORTADO: {pnl_neto_final:+.4f}")
-            print(f"  [GRID_SIM] {symbol} • PnL Neto REAL (bruto - fees): {pnl_real_estimado:+.4f}")
-            print(f"  [GRID_SIM] {symbol} • Trades emparejados: {sim.trades_completados}")
-            print(f"  [GRID_SIM] {symbol} • Kill Switches: {sim.trades_kill_switch}")
-            print(f"  [GRID_SIM] {symbol} • Posiciones atrapadas: {len(sim.posiciones_atrapadas)}")
-            print(f"  [GRID_SIM] {symbol} • Posiciones sin cerrar: {pos_abiertas_restantes}")
-            print(f"  [GRID_SIM] {symbol} ════════════════════════════════════════")
-            
-            # Notificar al signal_generator que el grid terminó
-            if self.signal_generator and symbol in self.signal_generator.states:
-                state = self.signal_generator.states[symbol]
-                if state.estado == 'NEUTRAL_GRID':
-                    state.estado = 'MONITOREO'
-                    state.neutral_grid_timestamp = 0
-                    state.grid_params_neutral = None
-                    print(f"  [GRID_SIM] {symbol} Estado sincronizado a MONITOREO")
-
-            # Notificación
-            if self.notifier:
-                await self.notifier.enviar_telegram(
-                    f"<b>🏁 GRID NEUTRAL FINALIZADO — {symbol}</b>\n"
-                    f"Razón: <i>{razon}</i>\n"
-                    f"PnL Neto: <code>{pnl_neto_final:+.4f} USDT</code>\n"
-                    f"Fees: <code>{fees_total:.4f} USDT</code>\n"
-                    f"Trades: {sim.trades_completados} | Kill Switches: {sim.trades_kill_switch}\n"
-                    f"Posiciones atrapadas: {len(sim.posiciones_atrapadas)}"
-                )
-
-            del self.simulaciones[symbol]
-
-        except Exception as e:
-            print(f"  ❌ [GRID_SIM] {symbol} Error finalizando grid: {e}")
-
-    async def cerrar_grid_suave(self, symbol: str, razon: str = 'direccion_detectada'):
-        """
-        Cierre suave: no abrir nuevas posiciones, pero dejar que las existentes se emparejen.
-        Se usa cuando se detecta dirección pero aún hay posiciones pendientes.
-        """
-        if symbol not in self.simulaciones:
-            return
-
-        sim = self.simulaciones[symbol]
-        if not sim.activa:
-            return
-
-        print(f"  [GRID_SIM] {symbol} Cierre suave iniciado ({razon})")
-
-        # Marcar como inactivo para no abrir nuevas posiciones
-        sim.activa = False
-
-        # Las posiciones existentes seguirán emparejándose por _emparejar_posiciones
-        # en los ticks siguientes. No forzar cierre aquí.
-
-        # Persistir estado
-        await self._persistir_estado(sim)
-
-        # Notificar al audit logger
-        if self.audit_logger:
-            await self.audit_logger.log_evento_grid_simulacion(
-                symbol=symbol,
-                tipo='NEUTRAL_GRID_ABORT',
-                grid_id=sim.grid_id,
-                evento_simulacion={'razon': razon, 'tipo_cierre': 'suave'},
-                pnl_acumulado=float(sim.pnl_neto)
-            )
-
-        # Notificar al signal_generator
-        if self.signal_generator and symbol in self.signal_generator.states:
-            state = self.signal_generator.states[symbol]
-            if state.estado == 'NEUTRAL_GRID':
-                state.estado = 'MONITOREO'
-                state.neutral_grid_timestamp = 0
-                state.grid_params_neutral = None
-                print(f"  [GRID_SIM] {symbol} Estado sincronizado a MONITOREO (cierre suave)")
-
-        print(f"  [GRID_SIM] {symbol} Grid inactivo, esperando emparejamiento natural")
-
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # SIMULAR TICK (CORE)
-    # ═══════════════════════════════════════════════════════════════════════════════
-
-    async def simular_tick(self, symbol: str, high: float, low: float, close: float, timestamp: int):
-        """
-        Procesa un tick de precio (una vela 1m completa).
-        Detecta cruces de niveles del grid y simula ejecuciones.
-        """
-        if symbol not in self.simulaciones:
-            return
-
-        sim = self.simulaciones[symbol]
-        if not sim.activa:
-            # Grid inactivo: solo emparejar posiciones pendientes, no abrir nuevas
-            posiciones_pendientes = [p for p in sim.posiciones if p.estado == 'PENDIENTE_CIERRE']
-            if not posiciones_pendientes:
-                # Si no hay posiciones pendientes y el grid está inactivo, limpiar
-                if not sim.posiciones_abiertas_list():
-                    print(f"  [GRID_SIM] {symbol} Grid inactivo sin posiciones → eliminando de memoria")
-                    del self.simulaciones[symbol]
-                return
-            # Continuar para emparejar posiciones pendientes
-
-        sim.ultimo_tick_ts = timestamp
-
-        high_d = Decimal(str(high))
-        low_d = Decimal(str(low))
-        close_d = Decimal(str(close))
-
-        # 1. Verificar timeout de posiciones abiertas (FIFO) — MEJORA #1
-        await self._verificar_timeout_posiciones(sim, timestamp)
-
-        # 2. Detectar cruces de niveles (BUY y SELL)
-        await self._detectar_cruces(sim, high_d, low_d, close_d, timestamp)
-
-        # 3. Persistir estado periódicamente (cada 60 segundos)
-        if timestamp % 60 < 5:
-            await self._persistir_estado(sim)
-
-    async def _detectar_cruces(self, sim: SimState, high: Decimal, low: Decimal, close: Decimal, timestamp: int):
-        """
-        Detecta si el precio cruzó niveles del grid en la dirección correcta.
-        
-        Grid neutral real:
-        - Niveles BUY (por debajo de precio_inicio): ejecutan cuando precio BAJA y toca el nivel
-        - Niveles SELL (por encima de precio_inicio): ejecutan cuando precio SUBE y toca el nivel
-        - Cuando BUY se ejecuta en N, se coloca SELL LIMIT en N+1 (take-profit)
-        - Cuando SELL se ejecuta en N, se coloca BUY LIMIT en N-1 (take-profit)
-        """
-        posiciones_abiertas = sim.posiciones_abiertas_list()
-
-        # V7: Precio anterior para determinar dirección del cruce
-        precio_anterior = Decimal(str(sim.precio_referencia))
-        if len(sim.posiciones) > 0:
-            # Usar el último precio conocido como referencia
-            ultimo_precio = self.precios_vivo.get(sim.symbol)
-            if ultimo_precio:
-                precio_anterior = Decimal(str(ultimo_precio))
-
-        # --- DETECTAR COMPRAS (BUY): precio baja y toca un nivel BUY ---
-        for nivel in sim.niveles_buy:
-            # BUY se ejecuta si: precio anterior >= nivel AND close <= nivel
-            # (el precio cruzó el nivel hacia abajo)
-            if precio_anterior >= nivel and close <= nivel:
-                # Verificar si ya hay posición abierta en este nivel
-                ya_abierta = any(
-                    abs(p.nivel_precio - float(nivel)) < 0.0001 and p.estado == 'ABIERTA' and p.tipo == 'LONG'
-                    for p in posiciones_abiertas
-                )
-                if not ya_abierta:
-                    # Verificar si hay una orden pendiente en este nivel
-                    nivel_str = str(float(nivel))
-                    if nivel_str in sim.ordenes_pendientes and sim.ordenes_pendientes[nivel_str] == 'BUY':
-                        await self._ejecutar_buy(sim, nivel, close, timestamp)
-                        # Colocar take-profit: SELL en el siguiente nivel superior
-                        siguiente_nivel = self._siguiente_nivel_superior(sim, nivel)
-                        if siguiente_nivel:
-                            sim.ordenes_pendientes[str(float(siguiente_nivel))] = 'SELL'
-                            print(f"  [GRID_SIM] {sim.symbol} Take-profit SELL colocado @ ${float(siguiente_nivel):.4f}")
-
-        # --- DETECTAR VENTAS (SELL): precio sube y toca un nivel SELL ---
-        for nivel in sim.niveles_sell:
-            # SELL se ejecuta si: precio anterior <= nivel AND close >= nivel
-            # (el precio cruzó el nivel hacia arriba)
-            if precio_anterior <= nivel and close >= nivel:
-                ya_abierta = any(
-                    abs(p.nivel_precio - float(nivel)) < 0.0001 and p.estado == 'ABIERTA' and p.tipo == 'SHORT'
-                    for p in posiciones_abiertas
-                )
-                if not ya_abierta:
-                    nivel_str = str(float(nivel))
-                    if nivel_str in sim.ordenes_pendientes and sim.ordenes_pendientes[nivel_str] == 'SELL':
-                        await self._ejecutar_sell(sim, nivel, close, timestamp)
-                        # Colocar take-profit: BUY en el siguiente nivel inferior
-                        siguiente_nivel = self._siguiente_nivel_inferior(sim, nivel)
-                        if siguiente_nivel:
-                            sim.ordenes_pendientes[str(float(siguiente_nivel))] = 'BUY'
-                            print(f"  [GRID_SIM] {sim.symbol} Take-profit BUY colocado @ ${float(siguiente_nivel):.4f}")
-
-        # V7: Actualizar precio de referencia para el próximo tick
-        sim.precio_referencia = close
-
-        # --- EMPAREJAR POSICIONES (take-profit ejecutado) ---
-        await self._emparejar_posiciones(sim, timestamp)
-
-    def _siguiente_nivel_superior(self, sim: SimState, nivel: Decimal) -> Optional[Decimal]:
-        """Devuelve el siguiente nivel superior al dado (para take-profit SELL)."""
-        niveles_superiores = [n for n in sim.niveles if n > nivel]
-        return min(niveles_superiores) if niveles_superiores else None
-
-    def _siguiente_nivel_inferior(self, sim: SimState, nivel: Decimal) -> Optional[Decimal]:
-        """Devuelve el siguiente nivel inferior al dado (para take-profit BUY)."""
-        niveles_inferiores = [n for n in sim.niveles if n < nivel]
-        return max(niveles_inferiores) if niveles_inferiores else None
-        
-    async def _ejecutar_buy(self, sim: SimState, nivel: Decimal, precio_actual: Decimal, timestamp: int, qty: Decimal = None):
-        """Simula una orden BUY LIMIT ejecutada."""
-        qty = qty or sim.qty_por_orden
-        # LIMIT se ejecuta al nivel exacto (sin slippage)
-        slippage = Decimal('0')
-        precio_ejecucion = nivel
-        notional = qty * precio_ejecucion
-        fee = notional * sim.fee_rate
-
-        pos = SimPosicion(
-            tipo='LONG',
-            nivel_precio=float(nivel),
-            precio_ejecucion=float(precio_ejecucion),
-            qty=float(qty),
-            slippage_aplicado=float(slippage),
-            fee_pagada=float(fee),
-            notional=float(notional),
-            timestamp_apertura=timestamp,
-            filled_qty=float(qty),
-            original_qty=float(qty),
-        )
-        sim.posiciones.append(pos)
-        sim.fees_totales += fee
-        sim.slippage_total += slippage
-
-        n_abiertas = sim.contar_posiciones_abiertas()
-        sim.max_posiciones_simultaneas = max(sim.max_posiciones_simultaneas, n_abiertas)
-
-        # Log condensado
-        print(f"  [GRID_SIM] {sim.symbol} BUY ejecutado @ ${float(nivel):.4f} | "
-              f"Posiciones abiertas:{n_abiertas} | PnL acumulado:{float(sim.pnl_neto):+.4f}")
-
-        # Auditoría dual
-        if self.audit_logger:
-            await self.audit_logger.log_evento_grid_simulacion(
-                symbol=sim.symbol,
-                tipo='GRID_BUY_SIM',
-                grid_id=sim.grid_id,
-                evento_simulacion={
-                    'nivel': float(nivel),
-                    'precio_ejecucion': float(precio_ejecucion),
-                    'slippage': float(slippage),
-                    'fee': float(fee),
-                    'qty': float(qty),
-                },
-                pnl_acumulado=float(sim.pnl_neto)
-            )
-
-    async def _ejecutar_sell(self, sim: SimState, nivel: Decimal, precio_actual: Decimal, timestamp: int, qty: Decimal = None):
-        """Simula una orden SELL LIMIT ejecutada."""
-        qty = qty or sim.qty_por_orden
-        # LIMIT se ejecuta al nivel exacto (sin slippage)
-        slippage = Decimal('0')
-        precio_ejecucion = nivel
-        notional = qty * precio_ejecucion
-        fee = notional * sim.fee_rate
-
-        pos = SimPosicion(
-            tipo='SHORT',
-            nivel_precio=float(nivel),
-            precio_ejecucion=float(precio_ejecucion),
-            qty=float(qty),
-            slippage_aplicado=float(slippage),
-            fee_pagada=float(fee),
-            notional=float(notional),
-            timestamp_apertura=timestamp,
-            filled_qty=float(qty),
-            original_qty=float(qty),
-        )
-        sim.posiciones.append(pos)
-        sim.fees_totales += fee
-        sim.slippage_total += slippage
-
-        n_abiertas = sim.contar_posiciones_abiertas()
-        sim.max_posiciones_simultaneas = max(sim.max_posiciones_simultaneas, n_abiertas)
-
-        print(f"  [GRID_SIM] {sim.symbol} SELL ejecutado @ ${float(nivel):.4f} | "
-              f"Posiciones abiertas:{n_abiertas} | PnL acumulado:{float(sim.pnl_neto):+.4f}")
-
-        if self.audit_logger:
-            await self.audit_logger.log_evento_grid_simulacion(
-                symbol=sim.symbol,
-                tipo='GRID_SELL_SIM',
-                grid_id=sim.grid_id,
-                evento_simulacion={
-                    'nivel': float(nivel),
-                    'precio_ejecucion': float(precio_ejecucion),
-                    'slippage': float(slippage),
-                    'fee': float(fee),
-                    'qty': float(qty),
-                },
-                pnl_acumulado=float(sim.pnl_neto)
-            )
-
-    async def _emparejar_posiciones(self, sim: SimState, timestamp: int):
+    def _emparejar_posiciones(self, sim: SimState, timestamp: int):
         """
         FASE 2.1: Emparejamiento FIFO de posiciones LONG y SHORT.
         El LONG más antiguo se empareja primero con el SHORT más antiguo
@@ -779,99 +200,36 @@ class GridSimulator:
                           f"Diff: {diferencia_niveles:.4f} | PnL: {pnl_neto:+.4f}")
                     break  # Solo emparejar una vez por LONG
 
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # KILL SWITCH INTELIGENTE (MEJORA #2)
-    # ═══════════════════════════════════════════════════════════════════════════════
-
-    async def _ejecutar_kill_switch(self, sim: SimState, posicion: SimPosicion,
-                                     precio_actual: Decimal, razon_cierre: str = 'max_posiciones'):
+    def _ejecutar_kill_switch(self, sim: SimState, posicion: SimPosicion,
+                               precio_actual: Decimal, razon_cierre: str = 'max_posiciones'):
         """
-        Kill switch inteligente con escalada de slippage.
-        Fase 1: 10 intentos con LIMIT a 0.1% slippage
-        Fase 2: Market order con 2% slippage (último recurso)
-        Fase 3: Posición ATRAPADA si >2%
+        FASE 2.4: El helper solo RECOMIENDA el kill switch.
+        NO cierra la posición ni actualiza PnL. Eso lo hace el executor
+        tras confirmar el fill real de Binance vía close_position_by_id().
         """
-        symbol = sim.symbol
-        intentos = 0
-        max_intentos = CONFIG.grid_neutral_kill_switch_max_intentos
-        slippage_max = Decimal(str(CONFIG.grid_neutral_kill_switch_slippage_max))  # 0.5%
-        slippage_absoluto = Decimal(str(CONFIG.grid_neutral_kill_switch_slippage_absoluto))  # 2%
-
-        print(f"  [KILL_SWITCH] {symbol} {posicion.tipo} ${posicion.precio_ejecucion:.4f} "
+        print(f"  [KILL_SWITCH] {sim.symbol} {posicion.tipo} ${posicion.precio_ejecucion:.4f} "
               f"Razón:{razon_cierre}")
 
-        # Fase 1: Intentar LIMIT con slippage normal (0.5%)
-        slippage_intento = slippage_max  # 0.5% directamente
-
-        if posicion.tipo == 'LONG':
-            precio_limite = Decimal(str(posicion.precio_ejecucion)) * (Decimal('1') + slippage_intento)
-        else:
-            precio_limite = Decimal(str(posicion.precio_ejecucion)) * (Decimal('1') - slippage_intento)
-
-        # Simular: ¿se llenó? (asumimos que sí si el precio actual está dentro del rango)
-        precio_diff = abs(float(precio_actual) - float(precio_limite)) / float(precio_limite)
-        if precio_diff <= float(slippage_absoluto):
-            # Éxito con LIMIT
-            fee = float(precio_limite) * posicion.filled_qty * float(sim.fee_rate)
-            pnl = self._calcular_pnl(posicion, float(precio_limite))
-
-            posicion.estado = 'CERRADA'
-            posicion.pnl_cierre = pnl
-            sim.pnl_bruto += Decimal(str(pnl))
-            sim.fees_totales += Decimal(str(fee))
-            sim.pnl_neto = sim.pnl_bruto - sim.fees_totales
-            sim.slippage_total += slippage_intento
-            sim.trades_kill_switch += 1
-
-            print(f"  [KILL_SWITCH] {symbol} CERRADO con LIMIT @ ${float(precio_limite):.4f} "
-                  f"slippage:{float(slippage_intento):.4f} PnL:{pnl:+.4f}")
-            return True
-
-        # Si LIMIT no se llena, pasar directamente a MARKET order
-        print(f"  [KILL_SWITCH] {symbol} LIMIT no llenado, pasando a MARKET order")
-
-        # V5.9.2 MEJORA #2: Último recurso — market order con 2% slippage
-        slippage_ultimo = abs(float(precio_actual) - posicion.precio_ejecucion) / posicion.precio_ejecucion
-
-        if slippage_ultimo <= float(slippage_absoluto):
-            # Último recurso: market order
-            fee = float(precio_actual) * posicion.filled_qty * float(sim.fee_rate)
-            pnl = self._calcular_pnl(posicion, float(precio_actual))
-
-            posicion.estado = 'CERRADA'
-            posicion.pnl_cierre = pnl
-            sim.pnl_bruto += Decimal(str(pnl))
-            sim.fees_totales += Decimal(str(fee))
-            sim.pnl_neto = sim.pnl_bruto - sim.fees_totales
-            sim.slippage_total += Decimal(str(slippage_ultimo))
-            sim.trades_kill_switch += 1
-
-            print(f"  [KILL_SWITCH ULTIMO RECURSO] {symbol} Market order | "
-                  f"Slippage:{slippage_ultimo:.4f} (dentro de 2%) | PnL:{pnl:+.4f}")
-
-            if self.notifier:
-                await self.notifier.enviar_telegram(
-                    f"⚠️ <b>KILL SWITCH ÚLTIMO RECURSO — {symbol}</b>\n"
-                    f"Posición {posicion.tipo} cerrada con market order\n"
-                    f"Slippage: {slippage_ultimo:.4f} (límite: 2%)\n"
-                    f"PnL: {pnl:+.4f} USDT"
-                )
-            return True
-
-        # INCLUSO EL ÚLTIMO RECURSO FALLÓ — posición ATRAPADA
-        # FIX 0.3: Contabilizar la pérdida estimada aunque esté atrapada
-        precio_actual_float = float(precio_actual)
-        pnl_atrapada = self._calcular_pnl(posicion, precio_actual_float)
-        posicion.estado = 'ATRAPADA'
-        posicion.pnl_cierre = pnl_atrapada
-        sim.posiciones_atrapadas.append(posicion)
-        sim.pnl_bruto += Decimal(str(pnl_atrapada))  # ← SUMAR LA PÉRDIDA
-        
-        # No sumar fees extra (ya se pagaron en apertura)
-        sim.pnl_neto = sim.pnl_bruto - sim.fees_totales
-
-        print(f"  [KILL_SWITCH CRÍTICO] {symbol} Posición ATRAPADA | "
-              f"PnL estimado:{pnl_atrapada:+.4f} | Slippage:{slippage_ultimo:.4f} > 2%")
+        # Solo marcar como PENDIENTE_CIERRE para que poll() no la vuelva a recomendar
+        posicion.estado = 'PENDIENTE_CIERRE'
+        return True
+    def close_position_by_id(self, sim: SimState, pos_id: str, precio_cierre: float, fee_cierre: float = 0.0):
+        """
+        Cierra una posición específica por ID usando el precio real de ejecución.
+        El executor llama esto después de confirmar un fill de MARKET order.
+        """
+        for pos in sim.posiciones:
+            if pos.id == pos_id and pos.estado in ('ABIERTA', 'PENDIENTE_CIERRE'):
+                pnl = self._calcular_pnl(pos, precio_cierre)
+                pos.estado = 'CERRADA'
+                pos.pnl_cierre = pnl
+                sim.pnl_bruto += Decimal(str(pnl))
+                sim.fees_totales += Decimal(str(fee_cierre))
+                sim.pnl_neto = sim.pnl_bruto - sim.fees_totales
+                sim.trades_kill_switch += 1
+                print(f"  [GRID_SIM] {sim.symbol} Pos {pos_id} cerrada real @ ${precio_cierre:.4f} | PnL:{pnl:+.4f}")
+                return True
+        print(f"  [GRID_SIM] {sim.symbol} Pos {pos_id} no encontrada para cierre real")
         return False
 
     def _calcular_pnl(self, posicion: SimPosicion, precio_cierre: float) -> float:
@@ -881,218 +239,12 @@ class GridSimulator:
         else:
             return (posicion.precio_ejecucion - precio_cierre) * posicion.filled_qty
 
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # TIMEOUT FIFO (MEJORA #1)
-    # ═══════════════════════════════════════════════════════════════════════════════
-
-    async def _verificar_timeout_posiciones(self, sim: SimState, timestamp: int):
-        """
-        Cierra posiciones abiertas que superan el timeout configurado (30min por defecto).
-        Aplica kill switch para forzar el cierre.
-        """
-        timeout_seg = CONFIG.grid_neutral_posicion_timeout_min * 60
-        posiciones_vencidas = []
-
-        for pos in sim.posiciones:
-            if pos.estado == 'ABIERTA':
-                tiempo_abierta = timestamp - pos.timestamp_apertura
-                if tiempo_abierta > timeout_seg:
-                    posiciones_vencidas.append(pos)
-
-        if not posiciones_vencidas:
-            return
-
-        precio_actual = Decimal(str(self.precios_vivo.get(sim.symbol, 0)))
-        if precio_actual <= 0:
-            return
-
-        print(f"  [GRID_SIM] {sim.symbol} {len(posiciones_vencidas)} posiciones vencidas "
-              f"(>{CONFIG.grid_neutral_posicion_timeout_min}min) → Kill switch")
-
-        for pos in posiciones_vencidas:
-            await self._ejecutar_kill_switch(
-                sim, pos, precio_actual, razon_cierre='timeout_posicion'
-            )
-
-            # Auditoría
-            if self.audit_logger:
-                await self.audit_logger.log_evento_grid_simulacion(
-                    symbol=sim.symbol,
-                    tipo='POSICION_TIMEOUT',
-                    grid_id=sim.grid_id,
-                    evento_simulacion={
-                        'posicion_id': pos.id,
-                        'tipo': pos.tipo,
-                        'tiempo_abierta_min': (timestamp - pos.timestamp_apertura) / 60,
-                        'estado_final': pos.estado,
-                    },
-                    pnl_acumulado=float(sim.pnl_neto)
-                )
-
-        if posiciones_vencidas:
-            await self._persistir_estado(sim)
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # GESTIÓN PARCIALES (MEJORA #4)
-    # ═══════════════════════════════════════════════════════════════════════════════
-
-    async def _registrar_orden_parcial(self, sim: SimState, nivel: Decimal,
-                                        filled_pct: float, remaining_qty: Decimal):
-        """
-        Registra una orden parcialmente llena.
-        La cantidad restante queda como 'orden fantasma' para el siguiente cruce.
-        """
-        if not CONFIG.grid_neutral_gestion_parcial:
-            return
-
-        nivel_str = str(float(nivel))
-        if remaining_qty > Decimal('0'):
-            sim.ordenes_fantasma[nivel_str] = remaining_qty
-            print(f"  [GRID_SIM] {sim.symbol} Orden parcial {filled_pct:.0%} llenada @ ${float(nivel):.4f} | "
-                  f"Restante:{float(remaining_qty):.4f}")
-
-    # NOTA: Esta función debe llamarse desde _ejecutar_buy y _ejecutar_sell
-    # cuando se detecta un fill parcial. Actualmente se asume fill 100%.
-    # Para activar: añadir lógica de fill parcial en _detectar_cruces.
-
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # PERSISTENCIA
-    # ═══════════════════════════════════════════════════════════════════════════════
-
-    async def _persistir_estado(self, sim: SimState):
-        """Persiste el estado actual de la simulación en SQLite."""
-        try:
-            pos_abiertas_json = json.dumps([p.to_dict() for p in sim.posiciones_abiertas_list()])
-            pos_atrapadas_json = json.dumps([p.to_dict() for p in sim.posiciones_atrapadas])
-
-            await actualizar_grid_simulacion(
-                grid_id=sim.grid_id,
-                pnl_bruto=float(sim.pnl_bruto),
-                pnl_neto=float(sim.pnl_neto),
-                fees_totales=float(sim.fees_totales),
-                slippage_total=float(sim.slippage_total),
-                trades_completados=sim.trades_completados,
-                trades_kill_switch=sim.trades_kill_switch,
-                posiciones_abiertas_json=pos_abiertas_json,
-                posiciones_atrapadas_json=pos_atrapadas_json,
-            )
-        except Exception as e:
-            print(f"  ⚠️ [GRID_SIM] {sim.symbol} Error persistiendo estado: {e}")
-
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # HEARTBEAT (MEJORA #6)
-    # ═══════════════════════════════════════════════════════════════════════════════
-
-    async def heartbeat(self):
-        """
-        Verifica la salud de grids activos cada 15 minutos.
-        Detecta:
-          - Grids sin ticks recibidos (>5 min)
-          - Posiciones abiertas sin movimiento (>30 min)
-          - Inconsistencias entre estado en memoria y DB
-        """
-        ahora = int(datetime.utcnow().timestamp())
-        timeout_seg = CONFIG.grid_neutral_posicion_timeout_min * 60
-
-        for symbol, sim in list(self.simulaciones.items()):
-            if not sim.activa:
-                continue
-
-            # Verificar si hay ticks recientes
-            segundos_sin_tick = ahora - sim.ultimo_tick_ts
-            timeout_sin_ticks = CONFIG.grid_neutral_sin_ticks_timeout_min * 60
-            
-            # FASE 1.2 FIX: Advertencia antes de aborto (60% del timeout = 6 min)
-            warning_threshold = timeout_sin_ticks * 0.6
-            
-            if segundos_sin_tick > warning_threshold and segundos_sin_tick <= timeout_sin_ticks:
-                # Solo loguear advertencia, NO abortar todavía
-                # El heartbeat corre cada 15 min, así que logueamos siempre que esté en zona de advertencia
-                print(f"  [HEARTBEAT SIM] {symbol} ⚠️ ADVERTENCIA: Sin ticks "
-                      f"por {segundos_sin_tick:.0f}s (aborto en {timeout_sin_ticks - segundos_sin_tick:.0f}s)")
-                # NO usar continue aquí — dejar que verifique posiciones vencidas abajo
-            
-            elif segundos_sin_tick > timeout_sin_ticks:
-                print(f"  [HEARTBEAT SIM] {symbol} Grid {sim.grid_id} SIN TICKS "
-                      f"por {segundos_sin_tick:.0f}s → ABORTADO")
-                if self.audit_logger:
-                    await self.audit_logger.log_evento_grid_simulacion(
-                        symbol=symbol, tipo='NEUTRAL_GRID_ABORT', grid_id=sim.grid_id,
-                        evento_simulacion={'razon': 'sin_ticks_5min', 'segundos_sin_tick': segundos_sin_tick},
-                        pnl_acumulado=float(sim.pnl_neto)
-                    )
-                await self.finalizar_grid(symbol, razon='sin_ticks_5min')
-                continue
-
-            # Verificar posiciones atascadas
-            pos_abiertas = sim.posiciones_abiertas_list()
-            cerradas_en_heartbeat = 0
-            for pos in pos_abiertas:
-                tiempo_abierta = ahora - pos.timestamp_apertura
-                if tiempo_abierta > timeout_seg:
-                    print(f"  [HEARTBEAT SIM] {symbol} Posición {pos.id} VENCIDA "
-                          f"({tiempo_abierta/60:.0f}min) → Forzar cierre")
-                    precio_actual = Decimal(str(self.precios_vivo.get(symbol, 0)))
-                    if precio_actual > 0:
-                        await self._ejecutar_kill_switch(sim, pos, precio_actual,
-                                                          razon_cierre='heartbeat_timeout')
-                        cerradas_en_heartbeat += 1
-            
-            if cerradas_en_heartbeat > 0:
-                await self._persistir_estado(sim)
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # CLEANER DE HUÉRFANOS (MEJORA #6)
-    # ═══════════════════════════════════════════════════════════════════════════════
-
-    async def limpiar_grids_huerfanos(self):
-        """
-        Al arranque del bot: detecta grids en estado ACTIVO pero sin simulación
-        activa durante > grid_neutral_huerfano_timeout_horas (4h por defecto).
-        Los marca como ABORTADO para evitar estados zombies.
-        """
-        timeout_seg = CONFIG.grid_neutral_huerfano_timeout_horas * 3600
-        ahora = int(datetime.utcnow().timestamp())
-
-        try:
-            from database_v5 import cargar_grids_huerfanos
-            huerfanos = await cargar_grids_huerfanos(timeout_seg)
-
-            limpiados = 0
-            for grid in huerfanos:
-                grid_id = grid['id']
-                symbol = grid['symbol']
-                ts_inicio = grid['timestamp_inicio']
-                tiempo_activo = ahora - ts_inicio
-
-                # Buscar simulación asociada
-                from database_v5 import cargar_simulacion_activa
-                sim = await cargar_simulacion_activa(grid_id)
-                sim_id = sim['id'] if sim else None
-
-                await forzar_aborto_grid_huerfano(grid_id, sim_id)
-
-                print(f"  [CLEANER] Grid {grid_id} {symbol} marcado ABORTADO "
-                      f"(huérfano {tiempo_activo/3600:.1f}h)")
-                limpiados += 1
-
-            if limpiados > 0:
-                print(f"  [CLEANER] {limpiados} grids huérfanos limpiados")
-
-        except Exception as e:
-            print(f"  ⚠️ [CLEANER] Error limpiando grids huérfanos: {e}")
-
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # ESTADÍSTICAS / ESTADO
-    # ═══════════════════════════════════════════════════════════════════════════════
-
-    def get_estado_simulacion(self, symbol: str) -> Optional[dict]:
+    def get_estado_simulacion(self, sim_state: SimState) -> Optional[dict]:
         """Retorna el estado actual de una simulación para el dashboard."""
-        if symbol not in self.simulaciones:
+        if not sim_state or not sim_state.activa:
             return None
 
-        sim = self.simulaciones[symbol]
-        if not sim.activa:
-            return None
-
+        sim = sim_state
         pos_abiertas = sim.posiciones_abiertas_list()
         pos_vencidas = sum(
             1 for p in pos_abiertas
@@ -1117,4 +269,132 @@ class GridSimulator:
             'max_posiciones_simultaneas': sim.max_posiciones_simultaneas,
             'ultimo_tick_segundos_ago': int(datetime.utcnow().timestamp()) - sim.ultimo_tick_ts,
             'timestamp_inicio': sim.timestamp_inicio,
+        }
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # MÉTODOS HELPER PARA EL EXECUTOR (Opción C)
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    def init_sim_state(self, grid_id, sim_id, symbol, niveles, qty_por_orden,
+                       fee_rate, slippage_base, precio_inicio, timestamp_inicio):
+        """Crea un SimState para que el executor lo guarde en su GridExecutionState."""
+        niveles_d = [Decimal(str(n)) for n in niveles]
+        return SimState(
+            grid_id=grid_id,
+            sim_id=sim_id,
+            symbol=symbol,
+            niveles=niveles_d,
+            qty_por_orden=Decimal(str(qty_por_orden)),
+            fee_rate=Decimal(str(fee_rate)),
+            slippage_base=Decimal(str(slippage_base)),
+            precio_inicio=Decimal(str(precio_inicio)),
+            timestamp_inicio=timestamp_inicio,
+        )
+
+    def on_fill(self, sim_state: SimState, side: str, price: float, qty: float, timestamp: int):
+        """
+        El executor llama esto cuando Binance confirma un fill real.
+        Registra la posición en la lógica del simulador para emparejamiento.
+        """
+        if not sim_state.activa:
+            return
+
+        precio_d = Decimal(str(price))
+        qty_d = Decimal(str(qty))
+        notional = qty_d * precio_d
+        fee = notional * sim_state.fee_rate
+
+        pos = SimPosicion(
+            tipo='LONG' if side == 'BUY' else 'SHORT',
+            nivel_precio=float(price),
+            precio_ejecucion=float(price),
+            qty=float(qty),
+            slippage_aplicado=0.0,  # En real, el fill ya tiene slippage implícito
+            fee_pagada=float(fee),
+            notional=float(notional),
+            timestamp_apertura=timestamp,
+            filled_qty=float(qty),
+            original_qty=float(qty),
+            sim_id=sim_state.sim_id  # <-- NUEVO: ID único por simulación
+        )
+        sim_state.posiciones.append(pos)
+        sim_state.fees_totales += fee
+
+        n_abiertas = sim_state.contar_posiciones_abiertas()
+        sim_state.max_posiciones_simultaneas = max(sim_state.max_posiciones_simultaneas, n_abiertas)
+
+        # Actualizar precio de referencia para emparejamiento
+        sim_state.precio_referencia = precio_d
+
+        # Auto-emparejar inmediatamente si hay par posible
+        self._emparejar_posiciones(sim_state, timestamp)
+
+        print(f"  [SIM-HELPER] {sim_state.symbol} {side} registrado @ ${price:.4f} | "
+              f"Posiciones: {n_abiertas}")
+
+    def poll(self, sim_state: SimState, precio_actual: float, timestamp: int):
+        """
+        El executor llama esto cada ciclo de polling (10s).
+        Verifica timeouts, empareja posiciones, y retorna acciones a ejecutar.
+        """
+        if not sim_state.activa:
+            return []
+
+        acciones = []
+
+        # 1. Emparejar posiciones FIFO (si hay LONG + SHORT abiertas)
+        self._emparejar_posiciones(sim_state, timestamp)
+
+        # 2. Verificar timeouts de posiciones abiertas
+        posiciones_vencidas = []
+        timeout_seg = CONFIG.grid_neutral_posicion_timeout_min * 60
+
+        for pos in sim_state.posiciones:
+            if pos.estado == 'ABIERTA':
+                tiempo_abierta = timestamp - pos.timestamp_apertura
+                if tiempo_abierta > timeout_seg:
+                    posiciones_vencidas.append(pos)
+
+        for pos in posiciones_vencidas:
+            # En vez de kill switch interno, generamos una acción para el executor
+            acciones.append({
+                'tipo': 'KILL_SWITCH',
+                'pos_id': pos.id,
+                'pos_tipo': pos.tipo,
+                'precio_entrada': pos.precio_ejecucion,
+                'qty': pos.filled_qty,
+                'razon': 'timeout_posicion'
+            })
+            pos.estado = 'PENDIENTE_CIERRE'  # Evitar duplicados
+
+        # 3. Calcular PnL acumulado en RAM
+        sim_state.pnl_neto = sim_state.pnl_bruto - sim_state.fees_totales
+
+        return acciones
+
+    def close_sim_state(self, sim_state: SimState, precio_final: float):
+        """El executor llama esto al abortar el grid. Cierra todo y retorna resumen."""
+        if not sim_state.activa:
+            return {}
+
+        sim_state.activa = False
+        precio_d = Decimal(str(precio_final))
+
+        # Liquidar posiciones pendientes o abiertas
+        for pos in sim_state.posiciones:
+            if pos.estado in ('ABIERTA', 'PENDIENTE_CIERRE'):
+                pnl = self._calcular_pnl(pos, precio_final)
+                pos.estado = 'CERRADA_FORZADA'
+                pos.pnl_cierre = pnl
+                sim_state.pnl_bruto += Decimal(str(pnl))
+
+        sim_state.pnl_neto = sim_state.pnl_bruto - sim_state.fees_totales
+
+        return {
+            'pnl_bruto': float(sim_state.pnl_bruto),
+            'pnl_neto': float(sim_state.pnl_neto),
+            'fees_totales': float(sim_state.fees_totales),
+            'trades_completados': sim_state.trades_completados,
+            'trades_kill_switch': sim_state.trades_kill_switch,
+            'posiciones_atrapadas': len(sim_state.posiciones_atrapadas),
         }

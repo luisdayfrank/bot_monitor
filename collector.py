@@ -9,7 +9,7 @@ import pandas as pd
 from binance.client import Client
 
 from config import CONFIG
-from database_v5 import insertar_vela, actualizar_precio_vivo, actualizar_precios_vivo_batch
+from database_v5 import insertar_vela, insertar_velas_batch, actualizar_precio_vivo, actualizar_precios_vivo_batch
 
 
 def extraer_precio_combinado(data: dict) -> tuple[Optional[float], Optional[str]]:
@@ -168,7 +168,9 @@ class DataCollector:
                     }
                     velas.append(vela)
                     self._buffers_1m_raw[symbol].append(vela)
-                    await insertar_vela(symbol, '1m', vela)
+
+                # Batch insert: todas las velas en una sola transacción
+                await insertar_velas_batch(symbol, '1m', velas)
 
                 # FASE 2: Deduplicación con (timestamp, close)
                 if velas:
@@ -198,7 +200,9 @@ class DataCollector:
                     }
                     velas.append(vela)
                     self._buffers_15m_raw[symbol].append(vela)
-                    await insertar_vela(symbol, '15m', vela)
+
+                # Batch insert: todas las velas en una sola transacción
+                await insertar_velas_batch(symbol, '15m', velas)
 
                 if velas:
                     last = velas[-1]
@@ -227,7 +231,9 @@ class DataCollector:
                     }
                     velas.append(vela)
                     self._buffers_4h_raw[symbol].append(vela)
-                    await insertar_vela(symbol, '4h', vela)
+
+                # Batch insert: todas las velas en una sola transacción
+                await insertar_velas_batch(symbol, '4h', velas)
 
                 if velas:
                     last = velas[-1]

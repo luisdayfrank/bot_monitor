@@ -110,7 +110,7 @@ class Config(BaseModel):
     volume_min_ratio: float = 1.0
 
     # Histéresis y cooldown
-    hysteresis_velas: int = 3
+    hysteresis_velas: int = 1
     cooldown_15m_velas: int = 1
 
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -194,7 +194,7 @@ class Config(BaseModel):
     # Ventana de velas 15m para calcular percentiles del ATR
     atr_percentil_ventana: int = 100
     # Score mínimo en consolidación (ATR bajo = más selectivo)
-    score_min_consolidacion: int = 75
+    score_min_consolidacion: int = 55
     # Score mínimo en expansión (ATR alto = más permisivo)
     score_min_expansion: int = 60
 
@@ -352,6 +352,27 @@ class Config(BaseModel):
     }
     grid_neutral_sim_fee_rate: float = 0.0005  # 0.05% fee Binance Futures
     grid_neutral_sim_slippage_base: float = 0.0005  # 0.05% slippage base simulado
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 0: CONFIGURACIÓN DEL EXECUTOR (Testnet / Real)
+    # ═══════════════════════════════════════════════════════════════════════════════
+    trading_mode: str = "TESTNET"  # TESTNET | REAL
+
+    # Capital y riesgo
+    trading_capital_max_usdt: float = 100.0
+    trading_apalancamiento_min: int = 5
+    trading_apalancamiento_max: int = 15
+    trading_notional_min_usdt: float = 5.0
+    trading_notional_margen_seguridad: float = 1.2  # 20% sobre el mínimo
+
+    # Rate limiting
+    trading_batch_max_ordenes: int = 5
+    trading_rate_limit_rps: int = 5  # Max 5 requests/segundo (conservador)
+    trading_polling_interval_seg: int = 10
+
+    # Keys testnet (separadas de las reales para seguridad)
+    binance_testnet_api_key: str = os.getenv("BINANCE_TESTNET_API_KEY", "sX7kym5t0AE11IRWWg0Ks84z2K34RH5yirclh5MoyWcPgQVbnW670vTJfDJ1W01m")
+    binance_testnet_secret: str = os.getenv("BINANCE_TESTNET_SECRET", "9OflvUojY6Pyht86VezoIF6F2WnHPr4RtWp0wO1BmwZOFyHysKr8TkTZofMIf03t")
 
 
 CONFIG = Config()
