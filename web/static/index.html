@@ -385,80 +385,147 @@
             </div>
 
             <!-- VISTA ESTADÍSTICAS -->
-            <div id="stats-view" class="hidden absolute inset-0 overflow-y-auto p-4 md:p-8 bg-[#0b0e14]">
-                <h2 class="text-2xl font-bold text-white mb-2">Rendimiento del Bot</h2>
-                <p class="text-xs text-gray-500 mb-6">Datos extraídos directamente de la base de datos SQLite</p>
+                        <div id="stats-view" class="hidden absolute inset-0 overflow-y-auto p-4 md:p-8 bg-[#0b0e14]">
+                <div class="flex items-center justify-between mb-2">
+                    <div>
+                        <h2 class="text-2xl font-bold text-white">Rendimiento del Bot</h2>
+                        <p class="text-xs text-gray-500 mb-6">Datos extraídos directamente de la base de datos SQLite — V6.2</p>
+                    </div>
+                    <div id="stats-last-update" class="text-[10px] text-gray-600 font-mono">--</div>
+                </div>
 
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
-                    <div class="bg-gray-800/40 p-5 rounded-xl border border-gray-700/50 hover:border-red-500/30 transition">
+                <!-- FILA 1: Métricas principales -->
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
+                    <div class="bg-gray-800/40 p-4 rounded-xl border border-gray-700/50 hover:border-red-500/30 transition">
                         <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
                             <span class="w-2 h-2 rounded-full bg-red-500"></span>
-                            Disparos Hoy (FIRE)
+                            🔥 Fires Hoy
                         </div>
                         <div class="text-3xl font-mono text-white" id="stat-fires">--</div>
-                        <div class="text-xs text-gray-600 mt-1">Desde la tabla auditoria_eventos</div>
+                        <div class="text-xs text-gray-600 mt-1">Disparos ejecutados</div>
                     </div>
-                    <div class="bg-gray-800/40 p-5 rounded-xl border border-gray-700/50 hover:border-yellow-500/30 transition">
+                    <div class="bg-gray-800/40 p-4 rounded-xl border border-gray-700/50 hover:border-orange-500/30 transition">
                         <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
-                            <span class="w-2 h-2 rounded-full bg-yellow-500"></span>
-                            Near-Misses Hoy
+                            <span class="w-2 h-2 rounded-full bg-orange-500"></span>
+                            ❌ Rechazados Hoy
                         </div>
-                        <div class="text-3xl font-mono text-yellow-400" id="stat-nearmiss">--</div>
-                        <div class="text-xs text-gray-600 mt-1">Seguimientos iniciados hoy (incluye activos)</div>
+                        <div class="text-3xl font-mono text-orange-400" id="stat-rechazados">--</div>
+                        <div class="text-xs text-gray-600 mt-1">Por filtros macro / gatillo 1m</div>
                     </div>
-                    <div class="bg-gray-800/40 p-5 rounded-xl border border-gray-700/50 hover:border-green-500/30 transition">
-                        <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
-                            <span class="w-2 h-2 rounded-full bg-green-500"></span>
-                            Win Rate Rechazos
-                        </div>
-                        <div class="text-3xl font-mono text-green-400" id="stat-winrate">--%</div>
-                        <div class="text-xs text-gray-500 mt-1">Tasa de acierto de seguimientos finalizados hoy</div>
-                    </div>
-                    <div class="bg-gray-800/40 p-5 rounded-xl border border-gray-700/50 hover:border-blue-500/30 transition">
+                    <div class="bg-gray-800/40 p-4 rounded-xl border border-gray-700/50 hover:border-blue-500/30 transition">
                         <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
                             <span class="w-2 h-2 rounded-full bg-blue-500"></span>
-                            Finalizados Hoy
+                            ✅ NM Finalizados
                         </div>
                         <div class="text-3xl font-mono text-blue-400" id="stat-finalizados">--</div>
-                        <div class="text-xs text-gray-600 mt-1">Seguimientos que completaron sus 2h</div>
+                        <div class="text-xs text-gray-600 mt-1">Con veredicto (de <span id="stat-nm-total" class="text-gray-400">--</span> totales)</div>
                     </div>
-                    <!-- NUEVO: Grids Neutral -->
-                    <div class="bg-gray-800/40 p-5 rounded-xl border border-gray-700/50 hover:border-purple-500/30 transition">
+                    <div class="bg-gray-800/40 p-4 rounded-xl border border-gray-700/50 hover:border-green-500/30 transition">
+                        <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
+                            <span class="w-2 h-2 rounded-full bg-green-500"></span>
+                            🎯 Win Rate NM
+                        </div>
+                        <div class="text-3xl font-mono" id="stat-winrate">--</div>
+                        <div class="text-xs text-gray-500 mt-1">Sobre finalizados (no en curso)</div>
+                    </div>
+                </div>
+
+                <!-- FILA 2: Grids Reales + PnL + Executor -->
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
+                    <div class="bg-gray-800/40 p-4 rounded-xl border border-gray-700/50 hover:border-purple-500/30 transition">
                         <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
                             <span class="w-2 h-2 rounded-full bg-purple-500"></span>
-                            Grids Neutral Hoy
+                            💠 Grids Reales Activos
                         </div>
-                        <div class="text-3xl font-mono text-purple-400" id="stat-grids">--</div>
-                        <div class="text-xs text-gray-600 mt-1">Activos ahora: <span id="stat-grids-active" class="text-purple-300 font-mono">--</span></div>
+                        <div class="text-3xl font-mono text-purple-400" id="stat-grids-activos">--</div>
+                        <div class="text-xs text-gray-600 mt-1">En executor ahora</div>
                     </div>
-                    <!-- NUEVO: PnL Grid -->
-                    <div class="bg-gray-800/40 p-5 rounded-xl border border-gray-700/50 hover:border-pink-500/30 transition">
+                    <div class="bg-gray-800/40 p-4 rounded-xl border border-gray-700/50 hover:border-pink-500/30 transition">
                         <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
                             <span class="w-2 h-2 rounded-full bg-pink-500"></span>
-                            PnL Grid Hoy
+                            💰 PnL Real Hoy
                         </div>
-                        <div class="text-3xl font-mono" id="stat-pnl-grid">--</div>
-                        <div class="text-xs text-gray-600 mt-1">Acumulado neto de simulaciones</div>
+                        <div class="text-3xl font-mono" id="stat-pnl-real">--</div>
+                        <div class="text-xs text-gray-600 mt-1">Cerrados + activos (executor)</div>
+                    </div>
+                    <div class="bg-gray-800/40 p-4 rounded-xl border border-gray-700/50 hover:border-gray-500/30 transition">
+                        <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
+                            <span class="w-2 h-2 rounded-full bg-gray-500"></span>
+                            🧾 Fees Reales Hoy
+                        </div>
+                        <div class="text-3xl font-mono text-gray-400" id="stat-fees-real">--</div>
+                        <div class="text-xs text-gray-600 mt-1">Comisiones pagadas a Binance</div>
+                    </div>
+                    <div class="bg-gray-800/40 p-4 rounded-xl border border-gray-700/50 hover:border-yellow-500/30 transition">
+                        <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
+                            <span class="w-2 h-2 rounded-full bg-yellow-500"></span>
+                            ⚡ Circuit Breakers
+                        </div>
+                        <div class="text-3xl font-mono text-yellow-400" id="stat-cb">--</div>
+                        <div class="text-xs text-gray-600 mt-1">Activaciones hoy</div>
                     </div>
                 </div>
 
-                <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50 mb-6">
-                    <h3 class="text-sm font-bold text-gray-300 mb-2">ℹ️ Sobre estas métricas (V6.1)</h3>
-                    <ul class="text-xs text-gray-500 space-y-1 list-disc list-inside">
-                        <li><b>Disparos Hoy:</b> Eventos FIRE registrados hoy (hora local).</li>
-                        <li><b>Near-Misses Hoy:</b> Seguimientos iniciados hoy (incluye los que aún están en curso de sus 2h).</li>
-                        <li><b>Finalizados Hoy:</b> Seguimientos que completaron sus 2h de tracking y tienen veredicto.</li>
-                        <li><b>Win Rate:</b> <span class="text-cyan-400">Aciertos ÷ Finalizados</span> (NO incluye seguimientos en curso). Un seguimiento "acierta" cuando el bot rechazó correctamente (precio se movió en contra).</li>
-                    </ul>
+                <!-- Alerta último evento -->
+                <div id="stats-ultimo-evento" class="bg-gray-800/30 p-3 rounded-xl border border-gray-700/50 mb-6 hidden">
+                    <div class="text-xs text-gray-400"></div>
                 </div>
 
+                <!-- NM en curso (banner informativo) -->
+                <div class="bg-blue-900/20 border border-blue-800/50 p-3 rounded-xl mb-6 flex items-center justify-between">
+                    <div class="flex items-center gap-2">
+                        <span class="text-blue-400 text-lg">⏳</span>
+                        <span class="text-sm text-blue-300">Near-Misses en seguimiento (2h): <span id="stat-nm-curso" class="font-mono font-bold">--</span></span>
+                    </div>
+                    <span class="text-[10px] text-blue-500">Sin veredicto aún — no afectan Win Rate</span>
+                </div>
+
+                <!-- SECCIÓN: Ranking por Moneda -->
+                <div class="mb-6">
+                    <h3 class="text-lg font-bold text-white mb-3 flex items-center gap-2">
+                        <span>🏆</span> Ranking por Moneda
+                    </h3>
+                    <div class="overflow-x-auto rounded-xl border border-gray-700/50 max-h-[400px] overflow-y-auto">
+                        <table class="analysis-table" id="ranking-table">
+                            <thead><tr>
+                                <th>Moneda</th><th>Estado</th><th>Fires</th><th>Rechazos</th>
+                                <th>NM Fin</th><th>Win Rate</th><th>PnL Real</th>
+                            </tr></thead>
+                            <tbody><tr><td colspan="7" class="text-center text-gray-500 py-8">Cargando...</td></tr></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- SECCIÓN: Funnel + Rechazos (2 columnas) -->
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+                    <!-- Funnel -->
+                    <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                        <h3 class="text-sm font-bold text-gray-300 mb-3 flex items-center gap-2">
+                            <span>🔄</span> Funnel de Conversión
+                        </h3>
+                        <div id="funnel-container" class="space-y-2">
+                            <div class="text-xs text-gray-500 text-center py-4">Cargando...</div>
+                        </div>
+                    </div>
+                    <!-- Rechazos por Causa -->
+                    <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                        <h3 class="text-sm font-bold text-gray-300 mb-3 flex items-center gap-2">
+                            <span>🚫</span> Rechazos por Causa
+                        </h3>
+                        <div id="rechazos-container" class="space-y-1">
+                            <div class="text-xs text-gray-500 text-center py-4">Cargando...</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Grid Neutral (moneda seleccionada) -->
                 <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50 mt-6 mb-6">
                     <h3 class="text-sm font-bold text-gray-300 mb-3 flex items-center gap-2">
-                        <span>🌐</span> Grid Neutral (V5.9.2)
+                        <span>🌐</span> Grid Neutral — <span id="grid-neutral-symbol" class="text-purple-400">Selecciona moneda</span>
                         <span id="grid-badge" class="hidden px-2 py-0.5 rounded-full text-xs font-bold bg-purple-600 text-white">ACTIVO</span>
                     </h3>
                     <div id="grid-info" class="text-xs text-gray-500">Selecciona una moneda para ver estado del grid neutral</div>
-                    <div id="grid-stats" class="hidden grid grid-cols-2 gap-3 mt-3">
+                    <div id="grid-stats" class="hidden grid grid-cols-2 md:grid-cols-3 gap-3 mt-3">
                         <div class="bg-gray-900/50 p-3 rounded-lg">
                             <div class="text-xs text-gray-500">Posiciones Abiertas</div>
                             <div class="text-lg font-mono text-purple-400" id="grid-pos-open">--</div>
@@ -486,13 +553,27 @@
                     </div>
                 </div>
 
+                <!-- Leyenda métricas -->
+                <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50 mb-6">
+                    <h3 class="text-sm font-bold text-gray-300 mb-2">ℹ️ Sobre estas métricas (V6.2)</h3>
+                    <ul class="text-xs text-gray-500 space-y-1 list-disc list-inside">
+                        <li><b>🔥 Fires:</b> Grids reales creados en el executor (TESTNET/REAL).</li>
+                        <li><b>❌ Rechazados:</b> Oportunidades que no pasaron filtro macro o gatillo 1m.</li>
+                        <li><b>✅ NM Finalizados:</b> Near-misses que completaron sus 2h de seguimiento.</li>
+                        <li><b>⏳ NM En Curso:</b> Aún sin veredicto — <span class="text-blue-400">NO cuentan para Win Rate</span>.</li>
+                        <li><b>🎯 Win Rate:</b> Aciertos ÷ Finalizados (solo los que ya tienen veredicto).</li>
+                        <li><b>💰 PnL Real:</b> Desde <code>grid_ejecuciones</code> (executor), no simulaciones legacy.</li>
+                        <li><b>🧾 Fees:</b> Comisiones reales pagadas a Binance (incluidas en PnL neto).</li>
+                    </ul>
+                </div>
+
                 <button onclick="fetchStats()" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm transition flex items-center gap-2">
                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
                     Actualizar Datos
                 </button>
             </div>
 
-            <!-- VISTA ANÁLISIS -->
+<!-- VISTA ANÁLISIS -->
             <div id="analysis-view" class="hidden absolute inset-0 overflow-hidden flex flex-col bg-[#0b0e14]">
 
                 <!-- Sub-nav de análisis -->
@@ -1106,72 +1187,173 @@
         // ============================================
         // V6.1: ESTADÍSTICAS DESDE DB
         // ============================================
+                function renderRanking(data) {
+            const tbody = document.querySelector('#ranking-table tbody');
+            if (!data || data.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-gray-500 py-8">Sin datos</td></tr>';
+                return;
+            }
+            tbody.innerHTML = data.map(row => {
+                const wr = row.win_rate !== null ? row.win_rate + '%' : '—';
+                const wrColor = row.win_rate === null ? 'text-gray-500' : (row.win_rate >= 60 ? 'text-green-400' : (row.win_rate >= 40 ? 'text-yellow-400' : 'text-red-400'));
+                const pnlColor = row.pnl_real >= 0 ? 'text-green-400' : 'text-red-400';
+                const pnlStr = (row.pnl_real >= 0 ? '+' : '') + row.pnl_real.toFixed(2);
+                const estadoBadge = row.pausada_manual ? '<span class="px-1.5 py-0.5 rounded bg-orange-900 text-orange-300 text-[10px]">PAUSADA</span>' : 
+                                   (row.estado === 'NEUTRAL_GRID' ? '<span class="px-1.5 py-0.5 rounded bg-purple-900 text-purple-300 text-[10px]">N-GRID</span>' : 
+                                   '<span class="px-1.5 py-0.5 rounded bg-gray-700 text-gray-300 text-[10px]">' + row.estado + '</span>');
+                return `<tr>
+                    <td class="font-bold">${row.symbol}</td>
+                    <td>${estadoBadge}</td>
+                    <td class="font-mono">${row.fires}</td>
+                    <td class="font-mono text-orange-400">${row.rechazos}</td>
+                    <td class="font-mono">${row.nm_finalizados}</td>
+                    <td class="font-mono ${wrColor}">${wr}</td>
+                    <td class="font-mono ${pnlColor}">${pnlStr}</td>
+                </tr>`;
+            }).join('');
+        }
+
+        function renderFunnel(d) {
+            const container = document.getElementById('funnel-container');
+            const f = d.funnel;
+            const c = d.conversiones;
+            const maxVal = Math.max(f.monitoreo_filtro_ok, 1);
+
+            const bar = (label, value, color, pct) => {
+                const width = Math.max(5, (value / maxVal) * 100);
+                return `<div class="flex items-center gap-2 text-xs">
+                    <div class="w-24 text-gray-400 text-right shrink-0">${label}</div>
+                    <div class="flex-1 bg-gray-900 rounded overflow-hidden h-6 relative">
+                        <div class="h-full ${color} flex items-center px-2" style="width:${width}%">
+                            <span class="font-mono font-bold text-white">${value}</span>
+                        </div>
+                    </div>
+                    ${pct !== null ? `<span class="w-12 text-gray-500 font-mono">${pct}%</span>` : '<span class="w-12"></span>'}
+                </div>`;
+            };
+
+            container.innerHTML = `
+                ${bar('Filtro OK', f.monitoreo_filtro_ok, 'bg-blue-600', null)}
+                ${bar('→ ARMED', f.armed, 'bg-yellow-600', c.monitoreo_to_armed_pct)}
+                ${bar('→ FIRE', f.fires, 'bg-red-600', c.armed_to_fire_pct)}
+                ${bar('N-GRID', f.neutral_grids, 'bg-purple-600', null)}
+                ${bar('Rechazados', f.rechazados, 'bg-orange-700', null)}
+                <div class="mt-2 pt-2 border-t border-gray-700 text-[10px] text-gray-500">
+                    ARMED→FIRE: <span class="text-white font-bold">${c.armed_to_fire_pct}%</span> | 
+                    FIRE vs NEUTRAL: <span class="text-white font-bold">${c.fire_vs_neutral_pct}%</span>
+                </div>
+            `;
+        }
+
+        function renderRechazos(d) {
+            const container = document.getElementById('rechazos-container');
+            if (!d.causas || d.causas.length === 0) {
+                container.innerHTML = '<div class="text-xs text-gray-500 text-center py-4">Sin rechazos hoy</div>';
+                return;
+            }
+            const total = d.total_rechazos;
+            container.innerHTML = d.causas.map(c => {
+                const width = (c.count / total) * 100;
+                const color = c.causa === 'ADX' ? 'bg-red-500' : 
+                             (c.causa === 'VOLUMEN' ? 'bg-orange-500' : 
+                             (c.causa === 'RSI' ? 'bg-yellow-500' : 
+                             (c.causa === 'MFM' ? 'bg-blue-500' : 'bg-gray-500')));
+                return `<div class="flex items-center gap-2 text-xs mb-1">
+                    <div class="w-20 text-gray-400 text-right shrink-0">${c.causa}</div>
+                    <div class="flex-1 bg-gray-900 rounded overflow-hidden h-4 relative">
+                        <div class="h-full ${color}" style="width:${width}%"></div>
+                    </div>
+                    <div class="w-16 text-right font-mono text-gray-300">${c.count} <span class="text-gray-600">(${c.pct}%)</span></div>
+                </div>`;
+            }).join('');
+        }
+
         async function fetchStats() {
             try {
+                // 1. Summary
                 const res = await fetch('/api/stats/summary');
                 const data = await res.json();
+
                 if (data.estado === 'success') {
                     document.getElementById('stat-fires').innerText = data.fires_hoy;
-                    document.getElementById('stat-nearmiss').innerText = data.total_near_miss;
-
-                    // NUEVO: Métricas de Grid Neutral
-                    document.getElementById('stat-grids').innerText = data.grids_total_hoy !== undefined ? data.grids_total_hoy : '--';
-                    const gridsActiveEl = document.getElementById('stat-grids-active');
-                    if (gridsActiveEl) gridsActiveEl.innerText = data.grids_activos_hoy !== undefined ? data.grids_activos_hoy : '--';
-
-                    const pnlGridEl = document.getElementById('stat-pnl-grid');
-                    if (pnlGridEl) {
-                        const pnl = data.pnl_grids_hoy || 0;
-                        pnlGridEl.innerText = (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + ' USDT';
-                        pnlGridEl.className = 'text-3xl font-mono ' + (pnl >= 0 ? 'text-green-400' : 'text-red-400');
-                    }
-
-                    const elFinalizados = document.getElementById('stat-finalizados');
-                    if (elFinalizados) elFinalizados.innerText = data.finalizados_hoy || 0;
+                    document.getElementById('stat-rechazados').innerText = data.rechazados_hoy;
+                    document.getElementById('stat-finalizados').innerText = data.finalizados_hoy;
+                    document.getElementById('stat-nm-total').innerText = data.total_near_miss;
+                    document.getElementById('stat-nm-curso').innerText = data.seguimientos_activos;
 
                     const winRateEl = document.getElementById('stat-winrate');
                     if (data.win_rate_estado === "CALCULABLE" && data.win_rate_rechazos !== null) {
                         winRateEl.innerText = data.win_rate_rechazos + '%';
-                        winRateEl.className = 'text-3xl font-mono text-green-400';
+                        const wr = data.win_rate_rechazos;
+                        if (wr >= 60) winRateEl.className = 'text-3xl font-mono text-green-400';
+                        else if (wr >= 40) winRateEl.className = 'text-3xl font-mono text-yellow-400';
+                        else winRateEl.className = 'text-3xl font-mono text-red-400';
                     } else {
                         winRateEl.innerText = 'PENDIENTE';
-                        winRateEl.className = 'text-3xl font-mono text-yellow-400';
+                        winRateEl.className = 'text-3xl font-mono text-gray-500';
                     }
+
+                    document.getElementById('stat-grids-activos').innerText = data.grids_reales_activos !== undefined ? data.grids_reales_activos : '--';
+
+                    const pnlRealEl = document.getElementById('stat-pnl-real');
+                    const pnlReal = (data.pnl_real_hoy || 0) + (data.pnl_real_activo || 0);
+                    pnlRealEl.innerText = (pnlReal >= 0 ? '+' : '') + pnlReal.toFixed(2) + ' USDT';
+                    pnlRealEl.className = 'text-3xl font-mono ' + (pnlReal >= 0 ? 'text-green-400' : 'text-red-400');
+
+                    document.getElementById('stat-fees-real').innerText = (data.fees_real_hoy || 0).toFixed(2) + ' USDT';
+                    document.getElementById('stat-cb').innerText = data.cb_hoy !== undefined ? data.cb_hoy : '--';
+
+                    const ultEvEl = document.getElementById('stats-ultimo-evento');
+                    if (data.ultimo_evento) {
+                        ultEvEl.classList.remove('hidden');
+                        let icon = data.ultimo_evento.tipo === 'FIRE' ? '🔥' : '⚡';
+                        let color = data.ultimo_evento.tipo === 'FIRE' ? 'text-red-400' : 'text-yellow-400';
+                        ultEvEl.innerHTML = `<span class="font-bold ${color}">${icon} Último evento:</span> ${data.ultimo_evento.tipo} en <b>${data.ultimo_evento.symbol}</b> hace ${data.ultimo_evento.minutos_ago} minutos`;
+                    } else {
+                        ultEvEl.classList.add('hidden');
+                    }
+
+                    document.getElementById('stats-last-update').innerText = 'Actualizado: ' + new Date().toLocaleTimeString();
                 } else {
-                    // ERROR: Limpiar TODOS los campos incluyendo los nuevos
                     document.getElementById('stat-fires').innerText = 'ERR';
-                    document.getElementById('stat-nearmiss').innerText = 'ERR';
-                    document.getElementById('stat-grids').innerText = 'ERR';
-                    const gridsActiveEl = document.getElementById('stat-grids-active');
-                    if (gridsActiveEl) gridsActiveEl.innerText = 'ERR';
-                    const pnlGridEl = document.getElementById('stat-pnl-grid');
-                    if (pnlGridEl) { pnlGridEl.innerText = 'ERR'; pnlGridEl.className = 'text-3xl font-mono text-red-400'; }
-                    const elFinalizados = document.getElementById('stat-finalizados');
-                    if (elFinalizados) elFinalizados.innerText = 'ERR';
-                    const winRateEl = document.getElementById('stat-winrate');
-                    winRateEl.innerText = 'ERR';
-                    winRateEl.className = 'text-3xl font-mono text-red-400';
+                    document.getElementById('stat-rechazados').innerText = 'ERR';
+                    document.getElementById('stat-finalizados').innerText = 'ERR';
+                    document.getElementById('stat-nm-total').innerText = 'ERR';
+                    document.getElementById('stat-nm-curso').innerText = 'ERR';
+                    document.getElementById('stat-winrate').innerText = 'ERR';
+                    document.getElementById('stat-grids-activos').innerText = 'ERR';
+                    document.getElementById('stat-pnl-real').innerText = 'ERR';
+                    document.getElementById('stat-fees-real').innerText = 'ERR';
+                    document.getElementById('stat-cb').innerText = 'ERR';
                 }
             } catch (e) {
-                console.error("[STATS] Error cargando estadísticas:", e);
-                // CATCH: Limpiar TODOS los campos incluyendo los nuevos
-                document.getElementById('stat-fires').innerText = 'ERR';
-                document.getElementById('stat-nearmiss').innerText = 'ERR';
-                document.getElementById('stat-grids').innerText = 'ERR';
-                const gridsActiveEl = document.getElementById('stat-grids-active');
-                if (gridsActiveEl) gridsActiveEl.innerText = 'ERR';
-                const pnlGridEl = document.getElementById('stat-pnl-grid');
-                if (pnlGridEl) { pnlGridEl.innerText = 'ERR'; pnlGridEl.className = 'text-3xl font-mono text-red-400'; }
-                const elFinalizados = document.getElementById('stat-finalizados');
-                if (elFinalizados) elFinalizados.innerText = 'ERR';
-                document.getElementById('stat-winrate').innerText = 'ERR';
+                console.error("[STATS] Error cargando summary:", e);
             }
+
+            try {
+                const res2 = await fetch('/api/stats/per-coin');
+                const d2 = await res2.json();
+                if (d2.estado === 'success') renderRanking(d2.data);
+            } catch (e) { console.error("[STATS] Error per-coin:", e); }
+
+            try {
+                const res3 = await fetch('/api/stats/funnel');
+                const d3 = await res3.json();
+                if (d3.estado === 'success') renderFunnel(d3);
+            } catch (e) { console.error("[STATS] Error funnel:", e); }
+
+            try {
+                const res4 = await fetch('/api/stats/rechazos');
+                const d4 = await res4.json();
+                if (d4.estado === 'success') renderRechazos(d4);
+            } catch (e) { console.error("[STATS] Error rechazos:", e); }
+
             if (activeSymbol) {
                 await fetchGridNeutral(activeSymbol);
             }
         }
 
-        async function fetchGridNeutral(symbol) {
+async function fetchGridNeutral(symbol) {
             try {
                 const res = await fetch(`/api/grid-neutral/${symbol}`);
                 const data = await res.json();
