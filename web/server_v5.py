@@ -284,7 +284,7 @@ async def get_indicadores(symbol: str, request: Request):
         },
         "estado": {
             "estado": estado.estado if estado else "UNKNOWN",
-            "direccion_filtro": estado.direccion_filtro if estado else None,
+            "direccion": estado.direccion_filtro if estado else None,
             "score": estado.ultimo_score if estado else 0,
             "filtro_aprobado": estado.filtro_macro_aprobado if estado else False,
             "velas_confirmacion": estado.velas_confirmacion if estado else 0,
@@ -381,58 +381,36 @@ async def get_snapshot(request: Request):
 async def get_stats_summary(request: Request):
     """Obtiene un resumen de rendimiento usando la base de datos de auditoría.
 
-    V5.7 FIX: Win Rate calculado SOLO sobre seguimientos FINALIZADOS del día,
-    no sobre el total histórico. Esto evita que seguimientos en curso (2h)
-    distorsionen la métrica mostrando 0% win rate falsamente.
+    V6.2: Métricas separadas para near-misses en curso vs finalizados.
+    PnL REAL desde grid_ejecuciones (no simulaciones legacy).
+    Agregadas métricas de executor y circuit breaker.
     """
     try:
         db = await _get_db()
         hoy_local = now_local().strftime("%Y-%m-%d")
+        ts_inicio_dia = datetime.datetime.now(pytz.UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
-        # 1. Conteo de alertas FIRE de hoy (usando columna fecha en hora local)
+        # ─── 1. Fires hoy ───
         cursor = await db.execute(
             "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'FIRE' AND fecha = ?",
             (hoy_local,)
         )
         fires_hoy = (await cursor.fetchone())[0]
 
-        # F4.2: Usar UTC directamente para evitar desfase zona horaria
-        ts_inicio_dia = datetime.datetime.now(pytz.UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-
-        # 2. Conteo de Near Misses INICIADOS HOY (no toda la historia)
+        # ─── 2. Near Misses: totales, en curso, finalizados ───
         cursor = await db.execute(
             "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ?",
             (ts_inicio_dia,)
         )
         total_near_miss = (await cursor.fetchone())[0]
 
-        # Grids neutral hoy
-        cursor = await db.execute(
-            "SELECT count(*) FROM grid_estados WHERE date(datetime(timestamp_inicio, 'unixepoch')) = ?",
-            (hoy_local,)
-        )
-        grids_total_hoy = (await cursor.fetchone())[0]
-
-        cursor = await db.execute(
-            "SELECT count(*) FROM grid_estados WHERE estado = 'ACTIVO' AND date(datetime(timestamp_inicio, 'unixepoch')) = ?",
-            (hoy_local,)
-        )
-        grids_activos_hoy = (await cursor.fetchone())[0]
-
-        cursor = await db.execute(
-            "SELECT COALESCE(SUM(pnl_neto), 0) FROM grid_simulaciones WHERE date(datetime(timestamp_inicio, 'unixepoch')) = ?",
-            (hoy_local,)
-        )
-        pnl_grids_hoy = (await cursor.fetchone())[0] or 0
-
-        # 3. V5.7 FIX: Win Rate SOLO sobre seguimientos FINALIZADOS del día
-        # Los seguimientos en curso (timestamp_fin IS NULL) NO se cuentan
-        # como fracasos, evitando distorsión del 0% win rate
         cursor = await db.execute(
             "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND timestamp_fin IS NOT NULL",
             (ts_inicio_dia,)
         )
         finalizados_hoy = (await cursor.fetchone())[0]
+
+        seguimientos_activos = total_near_miss - finalizados_hoy
 
         aciertos = 0
         if finalizados_hoy > 0:
@@ -442,42 +420,291 @@ async def get_stats_summary(request: Request):
             )
             aciertos = (await cursor.fetchone())[0]
 
-        # Win Rate REAL: Aciertos / Seguimientos Terminados (no total)
-        win_rate = (aciertos / finalizados_hoy * 100) if finalizados_hoy > 0 else 0.0
-
-        # Métricas adicionales para transparencia
-        seguimientos_activos = total_near_miss - finalizados_hoy
-
-        # FIX 0.3: Win Rate solo calculable cuando hay seguimientos finalizados.
-        # Si no hay finalizados, mostrar "PENDIENTE" en lugar de 0.0 para evitar
-        # interpretacion erronea ("el bot acierta 0%" cuando en realidad es
-        # "aun no hay datos suficientes").
+        # Win Rate REAL: solo sobre finalizados
         if finalizados_hoy > 0:
-            win_rate_val = round(win_rate, 2)
+            win_rate_val = round((aciertos / finalizados_hoy * 100), 2)
             win_rate_estado = "CALCULABLE"
         else:
             win_rate_val = None
             win_rate_estado = "PENDIENTE"
 
+        # ─── 3. Grids REALES (executor) ───
+        # Total grids creados hoy
+        cursor = await db.execute(
+            "SELECT count(*) FROM grid_ejecuciones WHERE date(datetime(timestamp_inicio, 'unixepoch')) = ?",
+            (hoy_local,)
+        )
+        grids_total_hoy = (await cursor.fetchone())[0]
+
+        # Grids reales activos ahora
+        cursor = await db.execute(
+            "SELECT count(*) FROM grid_ejecuciones WHERE estado = 'ACTIVO'",
+            ()
+        )
+        grids_reales_activos = (await cursor.fetchone())[0]
+
+        # PnL REAL acumulado hoy (solo grids cerrados para no distorsionar)
+        cursor = await db.execute(
+            "SELECT COALESCE(SUM(pnl_real), 0), COALESCE(SUM(fees_real), 0) FROM grid_ejecuciones WHERE estado = 'CERRADO' AND date(datetime(timestamp_inicio, 'unixepoch')) = ?",
+            (hoy_local,)
+        )
+        row = await cursor.fetchone()
+        pnl_real_hoy = float(row[0]) if row and row[0] is not None else 0.0
+        fees_real_hoy = float(row[1]) if row and row[1] is not None else 0.0
+
+        # PnL de grids activos (sin cerrar) — estimación
+        cursor = await db.execute(
+            "SELECT COALESCE(SUM(pnl_real), 0) FROM grid_ejecuciones WHERE estado = 'ACTIVO'",
+            ()
+        )
+        row_activo = await cursor.fetchone()
+        pnl_real_activo = float(row_activo[0]) if row_activo and row_activo[0] is not None else 0.0
+
+        # ─── 4. Circuit Breakers hoy ───
+        cursor = await db.execute(
+            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'CIRCUIT_BREAKER' AND fecha = ?",
+            (hoy_local,)
+        )
+        cb_hoy = (await cursor.fetchone())[0]
+
+        # ─── 5. Último evento importante ───
+        cursor = await db.execute(
+            "SELECT tipo, symbol, timestamp_utc FROM auditoria_eventos WHERE fecha = ? AND tipo IN ('FIRE', 'CIRCUIT_BREAKER') ORDER BY timestamp_utc DESC LIMIT 1",
+            (hoy_local,)
+        )
+        ultimo_evento = await cursor.fetchone()
+        ultimo_evento_info = None
+        if ultimo_evento:
+            tipo_ev, sym_ev, ts_ev = ultimo_evento
+            mins_ago = int((datetime.datetime.now(pytz.UTC).timestamp() - ts_ev) / 60) if ts_ev else None
+            ultimo_evento_info = {"tipo": tipo_ev, "symbol": sym_ev, "minutos_ago": mins_ago}
+
+        # ─── 6. Rechazados hoy ───
+        cursor = await db.execute(
+            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'RECHAZADO' AND fecha = ?",
+            (hoy_local,)
+        )
+        rechazados_hoy = (await cursor.fetchone())[0]
+
         return {
+            "estado": "success",
             "fires_hoy": fires_hoy,
+            "rechazados_hoy": rechazados_hoy,
             "total_near_miss": total_near_miss,
             "finalizados_hoy": finalizados_hoy,
             "seguimientos_activos": seguimientos_activos,
             "aciertos_bot": aciertos,
             "win_rate_rechazos": win_rate_val,
             "win_rate_estado": win_rate_estado,
+            # Grids reales (executor)
             "grids_total_hoy": grids_total_hoy,
-            "grids_activos_hoy": grids_activos_hoy,
-            "pnl_grids_hoy": round(pnl_grids_hoy, 4),
-            "mensaje": f"{seguimientos_activos} seguimiento(s) en curso (2h). "
-                       f"Win Rate calculable cuando finalicen.",
-            "estado": "success"
+            "grids_reales_activos": grids_reales_activos,
+            "pnl_real_hoy": round(pnl_real_hoy, 4),
+            "fees_real_hoy": round(fees_real_hoy, 4),
+            "pnl_real_activo": round(pnl_real_activo, 4),
+            # Circuit breaker
+            "cb_hoy": cb_hoy,
+            # Último evento
+            "ultimo_evento": ultimo_evento_info,
+            "mensaje": f"{seguimientos_activos} seguimiento(s) en curso (2h). Win Rate calculable sobre {finalizados_hoy} finalizados.",
         }
-    
+
     except Exception as e:
         logger.error(f"Error obteniendo stats: {e}")
         return {"error": str(e), "estado": "failed"}
+
+
+@app.get("/api/stats/per-coin")
+async def get_stats_per_coin(request: Request):
+    """Ranking de rendimiento por moneda."""
+    try:
+        db = await _get_db()
+        hoy_local = now_local().strftime("%Y-%m-%d")
+        ts_inicio_dia = datetime.datetime.now(pytz.UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+        result = []
+        # Obtener lista de monedas activas del registro
+        registry = _load_registry()
+        symbols = [s for s, d in registry.items() if d.get("active", 0) == 1]
+
+        for sym in symbols:
+            # Fires
+            cursor = await db.execute(
+                "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'FIRE' AND fecha = ? AND symbol = ?",
+                (hoy_local, sym)
+            )
+            fires = (await cursor.fetchone())[0]
+
+            # Rechazados
+            cursor = await db.execute(
+                "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'RECHAZADO' AND fecha = ? AND symbol = ?",
+                (hoy_local, sym)
+            )
+            rechazos = (await cursor.fetchone())[0]
+
+            # Near-misses finalizados y aciertos
+            cursor = await db.execute(
+                "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND timestamp_fin IS NOT NULL AND symbol = ?",
+                (ts_inicio_dia, sym)
+            )
+            nm_finalizados = (await cursor.fetchone())[0]
+
+            aciertos = 0
+            if nm_finalizados > 0:
+                cursor = await db.execute(
+                    "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND timestamp_fin IS NOT NULL AND acerto_bot = 1 AND symbol = ?",
+                    (ts_inicio_dia, sym)
+                )
+                aciertos = (await cursor.fetchone())[0]
+
+            # PnL real grids
+            cursor = await db.execute(
+                "SELECT COALESCE(SUM(pnl_real), 0) FROM grid_ejecuciones WHERE symbol = ? AND date(datetime(timestamp_inicio, 'unixepoch')) = ?",
+                (sym, hoy_local)
+            )
+            pnl = float((await cursor.fetchone())[0] or 0)
+
+            # Estado actual
+            estados = getattr(request.app.state, 'signal_states', {})
+            st = estados.get(sym)
+            estado_actual = st.estado if st else "UNKNOWN"
+            pausada = getattr(st, 'moneda_pausada_manual', False) if st else False
+
+            result.append({
+                "symbol": sym,
+                "fires": fires,
+                "rechazos": rechazos,
+                "nm_finalizados": nm_finalizados,
+                "nm_aciertos": aciertos,
+                "win_rate": round((aciertos / nm_finalizados * 100), 1) if nm_finalizados > 0 else None,
+                "pnl_real": round(pnl, 4),
+                "estado": estado_actual,
+                "pausada_manual": pausada,
+            })
+
+        # Ordenar por PnL descendente
+        result.sort(key=lambda x: x["pnl_real"], reverse=True)
+        return {"estado": "success", "data": result}
+
+    except Exception as e:
+        logger.error(f"Error per-coin stats: {e}")
+        return {"estado": "failed", "error": str(e)}
+
+
+@app.get("/api/stats/funnel")
+async def get_stats_funnel(request: Request):
+    """Funnel de conversión: MONITOREO -> ARMED -> FIRE."""
+    try:
+        db = await _get_db()
+        hoy_local = now_local().strftime("%Y-%m-%d")
+
+        # Contar FIREs hoy
+        cursor = await db.execute(
+            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'FIRE' AND fecha = ?",
+            (hoy_local,)
+        )
+        fires = (await cursor.fetchone())[0]
+
+        # Contar ARMEDs hoy (cambios de estado a ARMED)
+        cursor = await db.execute(
+            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'CAMBIO_ESTADO' AND fecha = ? AND estado_maquina LIKE '%ARMED%'",
+            (hoy_local,)
+        )
+        armed = (await cursor.fetchone())[0]
+
+        # Contar rechazados hoy (intentos que no pasaron filtro)
+        cursor = await db.execute(
+            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'RECHAZADO' AND fecha = ?",
+            (hoy_local,)
+        )
+        rechazados = (await cursor.fetchone())[0]
+
+        # Contar NEUTRAL_GRID iniciados hoy
+        cursor = await db.execute(
+            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'NEUTRAL_GRID_INICIADO' AND fecha = ?",
+            (hoy_local,)
+        )
+        neutral_grids = (await cursor.fetchone())[0]
+
+        # Estimación de MONITOREO con filtro aprobado
+        monitoreo_filtro_ok = armed + rechazados
+
+        return {
+            "estado": "success",
+            "funnel": {
+                "monitoreo_filtro_ok": monitoreo_filtro_ok,
+                "armed": armed,
+                "fires": fires,
+                "neutral_grids": neutral_grids,
+                "rechazados": rechazados,
+            },
+            "conversiones": {
+                "monitoreo_to_armed_pct": round((armed / monitoreo_filtro_ok * 100), 1) if monitoreo_filtro_ok > 0 else 0,
+                "armed_to_fire_pct": round((fires / armed * 100), 1) if armed > 0 else 0,
+                "fire_vs_neutral_pct": round((fires / (fires + neutral_grids) * 100), 1) if (fires + neutral_grids) > 0 else 0,
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"Error funnel stats: {e}")
+        return {"estado": "failed", "error": str(e)}
+
+
+@app.get("/api/stats/rechazos")
+async def get_stats_rechazos(request: Request):
+    """Rechazos por causa principal. Parsea el mensaje del primer rechazo."""
+    try:
+        db = await _get_db()
+        hoy_local = now_local().strftime("%Y-%m-%d")
+
+        cursor = await db.execute(
+            "SELECT mensaje FROM auditoria_eventos WHERE tipo = 'RECHAZADO' AND fecha = ?",
+            (hoy_local,)
+        )
+        rows = await cursor.fetchall()
+
+        causas = {}
+        total = 0
+        for row in rows:
+            msg = row[0] or ""
+            causa = "OTRO"
+            if msg:
+                if "ADX" in msg.upper():
+                    causa = "ADX"
+                elif "VOLUMEN" in msg.upper() or "VOLUME" in msg.upper():
+                    causa = "VOLUMEN"
+                elif "RSI" in msg.upper():
+                    causa = "RSI"
+                elif "MFM" in msg.upper():
+                    causa = "MFM"
+                elif "MACD" in msg.upper():
+                    causa = "MACD"
+                elif "ATR" in msg.upper():
+                    causa = "ATR"
+                elif "DIRECCION" in msg.upper() or "NEUTRAL" in msg.upper():
+                    causa = "DIRECCION_NEUTRAL"
+                elif "CAPITAL" in msg.upper() or "NOTIONAL" in msg.upper():
+                    causa = "CAPITAL"
+                else:
+                    parts = msg.split(':')
+                    if len(parts) > 1:
+                        causa = parts[0].strip().upper()[:20]
+                    else:
+                        causa = msg.split()[0].upper()[:20] if msg.split() else "OTRO"
+            causas[causa] = causas.get(causa, 0) + 1
+            total += 1
+
+        lista_causas = [{"causa": k, "count": v, "pct": round(v/total*100, 1)} for k, v in sorted(causas.items(), key=lambda x: x[1], reverse=True)]
+
+        return {
+            "estado": "success",
+            "total_rechazos": total,
+            "causas": lista_causas,
+        }
+
+    except Exception as e:
+        logger.error(f"Error rechazos stats: {e}")
+        return {"estado": "failed", "error": str(e)}
 
 
 # -------------------------------------------------------------------------------
@@ -574,24 +801,45 @@ async def get_paused(request: Request):
 
 @app.get("/api/grid-neutral/{symbol}")
 async def get_grid_neutral(symbol: str, request: Request):
-    """Retorna el estado de la simulación grid neutral para un símbolo."""
-    grid_simulator = getattr(request.app.state, 'grid_simulator', None)
+    """Retorna el estado del grid neutral desde el executor (FASE 4: helper sincrono)."""
+    executor = getattr(request.app.state, 'executor', None)
 
-    if not grid_simulator:
+    if not executor:
         return {
             "symbol": symbol,
             "grid_activo": False,
-            "mensaje": "Grid simulator no disponible",
+            "mensaje": "Executor no disponible (modo SIMULACION?)",
+            "timestamp": int(time.time() * 1000)
+        }
+
+    # Buscar grid activo en el executor
+    grid_state = executor._grids.get(symbol)
+    if not grid_state or getattr(grid_state, 'grid_mode', 'DIRECTIONAL') != 'NEUTRAL':
+        return {
+            "symbol": symbol,
+            "grid_activo": False,
+            "mensaje": "Sin grid neutral activo",
+            "timestamp": int(time.time() * 1000)
+        }
+
+    # El helper sincrono necesita el SimState, no el symbol
+    sim_state = getattr(grid_state, 'sim_state', None)
+    if not sim_state:
+        return {
+            "symbol": symbol,
+            "grid_activo": False,
+            "mensaje": "Grid sin estado de simulacion interno",
             "timestamp": int(time.time() * 1000)
         }
 
     try:
-        estado = grid_simulator.get_estado_simulacion(symbol)
+        # Llamada sincrona al helper que vive dentro del executor
+        estado = executor.grid_sim.get_estado_simulacion(sim_state)
     except Exception as e:
         return {
             "symbol": symbol,
             "grid_activo": False,
-            "mensaje": "Error interno del simulador",
+            "mensaje": "Error leyendo estado del helper",
             "error": str(e),
             "timestamp": int(time.time() * 1000)
         }
@@ -620,7 +868,7 @@ async def get_grid_neutral(symbol: str, request: Request):
         "fees_totales": estado.get('fees_totales'),
         "slippage_total": estado.get('slippage_total'),
         "max_posiciones_simultaneas": estado.get('max_posiciones_simultaneas'),
-        "ultimo_tick_minutos": estado.get('ultimo_tick_segundos_ago', 0) // 60,
+        "ultimo_tick_minutos": int(estado.get('ultimo_tick_segundos_ago') or 0) // 60,
         "timestamp": int(time.time() * 1000)
     }
 
@@ -744,6 +992,162 @@ async def toggle_all_coins(request: Request):
     except Exception as e:
         return {"error": str(e), "success": False}
 
+@app.post("/api/force-fire/{symbol}")
+async def force_fire(symbol: str, request: Request):
+    """
+    Fuerza un disparo directo al executor, saltando ARMED y gatillos.
+    Recibe {'direction': 'LONG'|'SHORT'} en el body. Default: LONG.
+    SOLO TESTNET.
+    """
+    executor = getattr(request.app.state, 'executor', None)
+    if not executor:
+        return {"success": False, "error": "Executor no disponible (modo SIMULACION?)"}
+
+    precios = getattr(request.app.state, 'precios_vivo', {})
+    price = precios.get(symbol, 0)
+    if not price:
+        return {"success": False, "error": f"Sin precio vivo para {symbol}"}
+
+    # Leer dirección del body
+    try:
+        body = await request.json()
+        direction = str(body.get('direction', 'LONG')).upper()
+    except Exception:
+        direction = 'LONG'
+
+    if direction not in ('LONG', 'SHORT'):
+        return {"success": False, "error": "direction debe ser LONG o SHORT"}
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # REUTILIZAR MOTOR DE GRIDS BLINDADO (signals_v5.py) — con fallback forzado
+    # ═══════════════════════════════════════════════════════════════════════
+    signal_generator = getattr(request.app.state, 'signal_generator', None)
+    params = None
+    rechazos = []
+    modo_fallback = False
+
+    if signal_generator:
+        state = signal_generator.states.get(symbol)
+        i15 = signal_generator.indicadores_15m.get(symbol, {})
+        i4h = signal_generator.indicadores_4h.get(symbol, {})
+
+        atr = i15.get('atr', price * 0.01)
+        if not atr or atr <= 0:
+            atr = price * 0.01
+
+        params, rechazos = signal_generator.calcular_parametros_grid_blindado(
+            price=price, direction=direction, atr=atr,
+            i15=i15, i4h=i4h, symbol=symbol, state=state
+        )
+
+    if not params:
+        # ═══════════════════════════════════════════════════════════════════
+        # FALLBACK FORZADO (DEBUG/TESTNET): Ignorar rechazos del motor
+        # ═══════════════════════════════════════════════════════════════════
+        print(f"  [FORCE_FIRE] {symbol} Motor blindado rechazó: {rechazos}. Usando fallback forzado.")
+        modo_fallback = True
+
+        # Heurística por precio: monedas baratas necesitan rangos más amplios
+        # para evitar colapso por tick_size y generar niveles distintos.
+        if price < 1.0:
+            rango_pct = 0.30   # ±30% = 60% total
+            grid_count = 7
+        elif price < 10.0:
+            rango_pct = 0.20   # ±20% = 40% total
+            grid_count = 7
+        else:
+            rango_pct = 0.15   # ±15% = 30% total
+            grid_count = 7
+
+        rango_total = price * rango_pct * 2
+        lower = max(price - (rango_total / 2), price * 0.001)
+        upper = price + (rango_total / 2)
+
+        step_usdt = rango_total / grid_count
+        step_pct = (step_usdt / price) * 100 if price > 0 else 0
+
+        capital = 100.0
+        leverage = 5
+        poder_total = capital * leverage
+        notional_por_orden = poder_total / grid_count
+        qty_por_orden = notional_por_orden / price if price > 0 else 0
+
+        fee_rate = 0.0005
+        breakeven = (2 * fee_rate + 2 * 0.0005) * 100  # 0.20%
+
+        params = {
+            'direction': direction,
+            'upper_limit': round(float(upper), 6),
+            'lower_limit': round(float(lower), 6),
+            'grid_count': grid_count,
+            'step_usdt': round(float(step_usdt), 6),
+            'step_pct': round(float(step_pct), 3),
+            'breakeven_pct': round(breakeven, 3),
+            'capital_sugerido': capital,
+            'apalancamiento_sugerido': leverage,
+            'notional_por_orden': round(notional_por_orden, 2),
+            'qty_por_orden': round(qty_por_orden, 4),
+            'margen_sobre_breakeven': round(step_pct - breakeven, 3),
+            'rentable': True,  # Forzado para testnet
+            'posicion_en_rango': 0.5,
+            'recent_high': round(float(upper), 4),
+            'recent_low': round(float(lower), 4),
+            'auto_compressed': False,
+            'posicion_extrema': False,
+            'atr_seguro': round(rango_total / 4, 6),
+            'rango_mult': 4.0,
+        }
+        print(f"  [FORCE_FIRE] {symbol} Fallback: {grid_count} grids | "
+              f"[{params['lower_limit']}, {params['upper_limit']}] | "
+              f"Step:{step_pct:.2f}% | Qty:{qty_por_orden:.2f}")
+
+    # Asegurar qty mínima funcional
+    if 'qty_por_orden' not in params or params['qty_por_orden'] <= 0:
+        params['qty_por_orden'] = max(1.0, 5.0 / price) if price > 0 else 0.1
+
+    # Log de confirmación
+    print(f"  [FORCE_FIRE] {symbol} {'[FALLBACK]' if modo_fallback else '[BLINDADO]'} "
+          f"Enviando grid {direction} al executor | {params['grid_count']} niveles | "
+          f"Rango: {params['lower_limit']} - {params['upper_limit']}")
+    await executor.queue.put({
+        'tipo': 'CREAR_GRID',
+        'symbol': symbol,
+        'direction': direction,
+        'params': params,
+        'price': price
+    })
+
+    icon = "🟢" if direction == 'LONG' else "🔴"
+    return {
+        "success": True,
+        "symbol": symbol,
+        "price": price,
+        "direction": direction,
+        "message": f"{icon} Grid {direction} forzado en {symbol} @ ${price}"
+    }
+
+
+
+@app.post("/api/force-close/{symbol}")
+async def force_close(symbol: str, request: Request):
+    """
+    Fuerza el cierre (aborto) de un grid activo en el executor.
+    """
+    executor = getattr(request.app.state, 'executor', None)
+    if not executor:
+        return {"success": False, "error": "Executor no disponible (modo SIMULACION?)"}
+
+    await executor.queue.put({
+        'tipo': 'ABORTAR_GRID',
+        'symbol': symbol,
+        'razon': 'force_close_manual'
+    })
+
+    return {
+        "success": True,
+        "symbol": symbol,
+        "message": f"🛑 Aborto forzado solicitado para {symbol}"
+    }
 
 async def orquestador_eventos(queue_eventos: asyncio.Queue, precios_vivo: dict,
                                indicadores_1m: dict, indicadores_15m: dict,
@@ -915,11 +1319,15 @@ async def get_stats_extended(request: Request):
         grids_total = (await cursor.fetchone())[0]
 
         # PnL acumulado grids hoy
-        cursor = await db.execute("SELECT COALESCE(SUM(pnl_neto), 0), COALESCE(SUM(fees_totales), 0), COALESCE(SUM(trades_kill_switch), 0) FROM grid_simulaciones WHERE date(datetime(timestamp_inicio, 'unixepoch')) = ?", (hoy_local,))
+        # FASE 1.6: Leer desde grid_ejecuciones (tabla real del executor), no grid_simulaciones (legacy)
+        cursor = await db.execute(
+            "SELECT COALESCE(SUM(pnl_real), 0), COALESCE(SUM(fees_real), 0) FROM grid_ejecuciones WHERE date(datetime(timestamp_inicio, 'unixepoch')) = ?",
+            (hoy_local,)
+        )
         row = await cursor.fetchone()
         pnl_total = row[0] or 0
         fees_total = row[1] or 0
-        ks_total = row[2] or 0
+        ks_total = 0  # TODO: agregar campo trades_kill_switch a grid_ejecuciones si se necesita
 
         # Score promedio FIRE hoy
         cursor = await db.execute("SELECT AVG(score) FROM auditoria_eventos WHERE tipo = 'FIRE' AND fecha = ?", (hoy_local,))
