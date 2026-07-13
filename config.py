@@ -110,7 +110,7 @@ class Config(BaseModel):
     volume_min_ratio: float = 1.0
 
     # Histéresis y cooldown
-    hysteresis_velas: int = 1
+    hysteresis_velas: int = 3
     cooldown_15m_velas: int = 1
 
     # ═══════════════════════════════════════════════════════════════════════════════

@@ -1778,6 +1778,12 @@ class SignalGenerator:
     # CALCULO DE PARAMETROS DEL GRID
     # ═══════════════════════════════════════════════════════════════════════════════
     def calcular_parametros_grid_blindado(self, price, direction, atr, i15, i4h, symbol, state) -> tuple:
+        # FIX V7.1: En testnet, relajar motor para neutrales
+        if direction == 'NEUTRAL' and CONFIG.trading_mode == 'TESTNET':
+            min_dist_pct_override = 0.10  # 0.10% en testnet, suficiente para fees
+        else:
+            min_dist_pct_override = None
+
         rechazos = []
         recent_high = i15.get('recent_high', price * 1.02) if i15 else price * 1.02
         recent_low = i15.get('recent_low', price * 0.98) if i15 else price * 0.98
@@ -1836,9 +1842,13 @@ class SignalGenerator:
 
         # FASE 2.5: Validar distancia mínima entre grids (breakeven real)
         min_dist_pct = 2 * CONFIG.grid_fee_rate * 100 + CONFIG.grid_slippage * 100 + 0.1
-        if step_pct < min_dist_pct:
-            rechazos.append(f"step_pct {step_pct:.3f}% < min {min_dist_pct:.3f}%")
-            return None, rechazos
+        effective_min_dist = min_dist_pct_override if min_dist_pct_override else min_dist_pct
+        if step_pct < effective_min_dist:
+            if not (direction == 'NEUTRAL' and CONFIG.trading_mode == 'TESTNET'):
+                rechazos.append(f"step_pct {step_pct:.3f}% < min {effective_min_dist:.3f}%")
+                return None, rechazos
+            else:
+                print(f"  [GRID] {symbol} TESTNET BYPASS: step_pct {step_pct:.3f}% < {effective_min_dist:.3f}%, forzando creación")
 
         comisiones_ciclo = 2 * CONFIG.grid_fee_rate          # 0.10% (2 órdenes × 0.05%)
         slippage_total = 2 * CONFIG.grid_slippage              # 0.10% (2 órdenes × 0.05%)
@@ -1899,7 +1909,6 @@ class SignalGenerator:
             'atr_seguro': round(float(atr_seguro), 6),
             'rango_mult': round(float(mult), 2),
         }, rechazos
-
     # ═══════════════════════════════════════════════════════════════════════════════
     # CIRCUIT BREAKER Y METODOS AUXILIARES
     # ═══════════════════════════════════════════════════════════════════════════════

@@ -1,5 +1,5 @@
 """
-executor.py — FASE 3.2
+executor.py — FASE 3.2 + FIXES V7.1
 Motor de ejecución real de grids en Binance Futures (Testnet / Real).
 Flujo: recibe mensajes por cola, coloca órdenes LIMIT, trackea fills, maneja aborto.
 Integración: GridSimulator helper para grids NEUTRALES.
@@ -154,6 +154,23 @@ class GridExecutor:
             'stepSize': 0.001, 'tickSize': 0.01, 'minNotional': 5.0,
             'minPrice': 0.0, 'maxPrice': 999999.0
         })
+
+    def _validar_y_redondear_precio(self, precio: float, symbol: str) -> Optional[float]:
+        """Valida y redondea un precio según tick_size, minPrice y maxPrice de Binance."""
+        info = self._get_symbol_info(symbol)
+        tick_size = Decimal(str(info['tickSize']))
+        min_price = info.get('minPrice', 0.0)
+        max_price = info.get('maxPrice', 999999.0)
+        
+        precio_d = Decimal(str(precio))
+        # Redondear al tick_size (hacia abajo para no exceder)
+        ticks = int(precio_d / tick_size)
+        precio_redondeado = float(ticks * tick_size)
+        
+        if precio_redondeado <= 0 or precio_redondeado < min_price or precio_redondeado > max_price:
+            print(f"  ❌ [EXECUTOR] {symbol} Precio inválido: {precio_redondeado} (tick:{tick_size}, min:{min_price}, max:{max_price})")
+            return None
+        return precio_redondeado
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # RATE LIMITER
@@ -377,6 +394,20 @@ class GridExecutor:
             if i + batch_size < len(ordenes):
                 await asyncio.sleep(0.1)
 
+        # Verificar si hubo rechazos en el batch
+        rechazos_batch = [r for r in resultados if r.get('code')]
+        if rechazos_batch:
+            print(f"  ❌ [EXECUTOR] {symbol} Batch con rechazos: {len(rechazos_batch)} órdenes. ABORTANDO grid.")
+            # Cancelar órdenes que sí pasaron para no dejar grid roto
+            for oid in order_ids_guardados:
+                try:
+                    await self._api_call(asyncio.to_thread(
+                        self.client.futures_cancel_order, symbol=symbol, orderId=oid
+                    ))
+                except Exception:
+                    pass
+            return []  # Lista vacía = fallo total
+
         return order_ids_guardados
 
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -388,6 +419,9 @@ class GridExecutor:
         Crea un grid LONG o SHORT real en Binance Futures.
         direction: 'LONG' o 'SHORT'
         """
+        print(f"  [EXECUTOR] >>> SOLICITUD RECIBIDA: {symbol} {direction} @ ${price:.4f}")
+        print(f"  [EXECUTOR] Params: grids={params.get('grid_count')}, range=[{params.get('lower_limit')}, {params.get('upper_limit')}], step_pct={params.get('step_pct')}%")
+        
         if symbol in self._grids and self._grids[symbol].activa:
             print(f"  ⚠️ [EXECUTOR] {symbol} Ya hay grid activo, rechazando nuevo")
             return
@@ -452,13 +486,17 @@ class GridExecutor:
                 if nivel <= price * 1.001:
                     continue
 
+            precio_validado = self._validar_y_redondear_precio(nivel, symbol)
+            if precio_validado is None:
+                continue  # Saltar este nivel, no abortar todo el grid
+            
             client_order_id = f"CM{grid_id}_{idx}_{timestamp}"
             ordenes.append({
                 'symbol': symbol,
                 'side': side,
                 'type': 'LIMIT',
                 'quantity': str(qty),
-                'price': str(round(nivel)),
+                'price': str(precio_validado),
                 'timeInForce': 'GTC',
                 'newClientOrderId': client_order_id
             })
@@ -466,7 +504,12 @@ class GridExecutor:
         # 7. Enviar en batches
         order_ids_guardados = await self._enviar_ordenes_batch(symbol, ordenes, grid_id)
 
-        # 8. Crear estado en RAM
+        # 8. Verificar que se guardaron órdenes
+        if not order_ids_guardados:
+            print(f"  ❌ [EXECUTOR] {symbol} Grid {direction} FALLÓ: 0 órdenes guardadas")
+            return
+
+        # 9. Crear estado en RAM
         state = GridExecutionState(
             grid_id=grid_id, symbol=symbol, direction=direction,
             capital=CONFIG.trading_capital_max_usdt, leverage=leverage,
@@ -585,20 +628,44 @@ class GridExecutor:
         ordenes = []
         timestamp = int(time.time() * 1000)
         for idx, nivel in enumerate(niveles_buy):
+            precio_validado = self._validar_y_redondear_precio(nivel, symbol)
+            if precio_validado is None:
+                continue  # Saltar este nivel, no abortar todo el grid
+            
             ordenes.append({
                 'symbol': symbol, 'side': 'BUY', 'type': 'LIMIT',
-                'quantity': str(qty), 'price': str(round(nivel)),
+                'quantity': str(qty), 'price': str(precio_validado),
                 'timeInForce': 'GTC', 'newClientOrderId': f"CM{grid_id}_BUY_{idx}_{timestamp}"
             })
         for idx, nivel in enumerate(niveles_sell):
+            precio_validado = self._validar_y_redondear_precio(nivel, symbol)
+            if precio_validado is None:
+                continue  # Saltar este nivel, no abortar todo el grid
+            
             ordenes.append({
                 'symbol': symbol, 'side': 'SELL', 'type': 'LIMIT',
-                'quantity': str(qty), 'price': str(round(nivel)),
+                'quantity': str(qty), 'price': str(precio_validado),
                 'timeInForce': 'GTC', 'newClientOrderId': f"CM{grid_id}_SELL_{idx}_{timestamp}"
             })
 
         # 11. Enviar batches (igual que directional)
         order_ids_guardados = await self._enviar_ordenes_batch(symbol, ordenes, grid_id)
+
+        # FIX V7.1: Verificar integridad del grid
+        if len(order_ids_guardados) < len(ordenes):
+            print(f"  ❌ [EXECUTOR] {symbol} Grid NEUTRAL INCOMPLETO: {len(order_ids_guardados)}/{len(ordenes)} órdenes. Abortando.")
+            # Cancelar las que quedaron
+            for oid in order_ids_guardados:
+                try:
+                    await self._api_call(asyncio.to_thread(self.client.futures_cancel_order, symbol=symbol, orderId=oid))
+                except Exception:
+                    pass
+            # Marcar DB como abortado
+            await actualizar_grid_ejecucion_cierre(
+                grid_id=grid_id, estado='ABORTADO', pnl_real=0, fees_real=0,
+                razon_cierre='grid_incompleto_batch_rechazado'
+            )
+            return
 
         self._grids[symbol] = state
         print(f"  ✅ [EXECUTOR] {symbol} Grid NEUTRAL creado | BUY:{len(niveles_buy)} SELL:{len(niveles_sell)} | Órdenes:{len(order_ids_guardados)}")
@@ -962,14 +1029,17 @@ class GridExecutor:
         if state.grid_mode == 'NEUTRAL' and state.sim_state and self.grid_sim:
             precio_actual = self.precios_vivo.get(symbol, 0)
             resumen = self.grid_sim.close_sim_state(state.sim_state, precio_actual)
-            print(f"  [EXECUTOR] Resumen grid neutral: PnL={resumen.get('pnl_neto', 0):+.4f}")
+            pnl_real = float(state.pnl_real)
+            pnl_helper = resumen.get('pnl_neto', 0)
+            print(f"  [EXECUTOR] Resumen grid neutral: PnL Real={pnl_real:+.4f} | Helper={pnl_helper:+.4f}")
 
             if self.notifier:
                 try:
                     await self.notifier.enviar_telegram(
                         f"🏁 <b>Grid Neutral Cerrado — {symbol}</b>\n"
                         f"Razón: {razon}\n"
-                        f"PnL Neto: {resumen.get('pnl_neto', 0):+.4f} USDT\n"
+                        f"📊 <b>Real (Binance):</b> {pnl_real:+.4f} USDT\n"
+                        f"🤖 <b>Helper (sim):</b> {pnl_helper:+.4f} USDT\n"
                         f"Trades: {resumen.get('trades_completados', 0)} | KS: {resumen.get('trades_kill_switch', 0)}"
                     )
                 except Exception as e:
