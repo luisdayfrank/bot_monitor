@@ -9,7 +9,7 @@ import pytz
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from database_v5 import guardar_alerta, _get_db, now_local, get_tz
+from database_v5 import guardar_alerta, _get_db, now_local, get_tz, calcular_pnl_acumulado, obtener_pnl_por_tipo
 from notifier_v5 import Notifier
 from config import CONFIG
 
@@ -809,14 +809,14 @@ async def get_paused(request: Request):
 
 @app.get("/api/grid-neutral/{symbol}")
 async def get_grid_neutral(symbol: str, request: Request):
-    """Retorna el estado del grid neutral desde el executor (FASE 4: helper sincrono)."""
+    """Retorna el estado del grid neutral desde el executor (FASE 4: autónomo)."""
     executor = getattr(request.app.state, 'executor', None)
 
     if not executor:
         return {
             "symbol": symbol,
             "grid_activo": False,
-            "mensaje": "Executor no disponible (modo SIMULACION?)",
+            "mensaje": "Executor no disponible",
             "timestamp": int(time.time() * 1000)
         }
 
@@ -830,24 +830,14 @@ async def get_grid_neutral(symbol: str, request: Request):
             "timestamp": int(time.time() * 1000)
         }
 
-    # El helper sincrono necesita el SimState, no el symbol
-    sim_state = getattr(grid_state, 'sim_state', None)
-    if not sim_state:
-        return {
-            "symbol": symbol,
-            "grid_activo": False,
-            "mensaje": "Grid sin estado de simulacion interno",
-            "timestamp": int(time.time() * 1000)
-        }
-
+    # FASE 4: Usar get_estado_grid del executor (autónomo, sin helper externo)
     try:
-        # Llamada sincrona al helper que vive dentro del executor
-        estado = executor.grid_sim.get_estado_simulacion(sim_state)
+        estado = executor.get_estado_grid(grid_state)
     except Exception as e:
         return {
             "symbol": symbol,
             "grid_activo": False,
-            "mensaje": "Error leyendo estado del helper",
+            "mensaje": "Error leyendo estado del executor",
             "error": str(e),
             "timestamp": int(time.time() * 1000)
         }
@@ -864,8 +854,9 @@ async def get_grid_neutral(symbol: str, request: Request):
         "symbol": symbol,
         "grid_activo": True,
         "grid_id": estado.get('grid_id'),
-        "sim_id": estado.get('sim_id'),
         "niveles": estado.get('niveles'),
+        "niveles_buy": estado.get('niveles_buy'),
+        "niveles_sell": estado.get('niveles_sell'),
         "posiciones_abiertas": estado.get('posiciones_abiertas'),
         "posiciones_atrapadas": estado.get('posiciones_atrapadas'),
         "posiciones_vencidas": estado.get('posiciones_vencidas'),
@@ -874,16 +865,59 @@ async def get_grid_neutral(symbol: str, request: Request):
         "pnl_neto": estado.get('pnl_neto'),
         "pnl_bruto": estado.get('pnl_bruto'),
         "fees_totales": estado.get('fees_totales'),
-        "slippage_total": estado.get('slippage_total'),
         "max_posiciones_simultaneas": estado.get('max_posiciones_simultaneas'),
-        "ultimo_tick_minutos": int(estado.get('ultimo_tick_segundos_ago') or 0) // 60,
+        "posicion_neta": estado.get('posicion_neta'),
+        "ordenes_tp_pendientes": estado.get('ordenes_tp_pendientes'),
+        "ultimo_tick_minutos": estado.get('ultimo_tick_segundos_ago', 0) // 60,
         "timestamp": int(time.time() * 1000)
     }
+
 
 
 # -------------------------------------------------------------------------------
 # ENDPOINTS PARA COIN REGISTRY (Toggle desde dashboard)
 # -------------------------------------------------------------------------------
+
+
+# -------------------------------------------------------------------------------
+# CR2: ENDPOINT PnL EN TIEMPO REAL
+# -------------------------------------------------------------------------------
+
+@app.get("/api/grid/{symbol}/pnl")
+async def get_grid_pnl(symbol: str, request: Request):
+    """Retorna PnL en tiempo real de un grid activo (CR2)."""
+    executor = getattr(request.app.state, 'executor', None)
+    if not executor or symbol not in executor._grids:
+        raise HTTPException(status_code=404, detail="Grid no activo")
+
+    state = executor._grids[symbol]
+
+    # PnL desde RAM (rápido)
+    pnl_ram = float(state.pnl_real)
+    fees_ram = float(state.fees_real)
+
+    # PnL desde DB (preciso, fuente de verdad)
+    pnl_db = await calcular_pnl_acumulado(state.grid_id)
+
+    # Desglose por tipo de evento
+    desglose = await obtener_pnl_por_tipo(state.grid_id)
+
+    return {
+        'symbol': symbol,
+        'grid_id': state.grid_id,
+        'pnl_ram': pnl_ram,
+        'pnl_db': pnl_db['pnl_real'],
+        'fees_ram': fees_ram,
+        'fees_db': pnl_db['fees_real'],
+        'discrepancia': abs(pnl_ram - pnl_db['pnl_real']),
+        'total_trades': pnl_db['total_trades'],
+        'trades_ganadores': pnl_db['trades_ganadores'],
+        'trades_perdedores': pnl_db['trades_perdedores'],
+        'desglose': desglose,
+        'posicion_neta': float(state.posicion_neta),
+        'posiciones_abiertas': state.grid_state.contar_posiciones_abiertas() if state.grid_state else 0,
+        'timestamp': int(time.time() * 1000)
+    }
 
 @app.get("/api/coin-registry")
 async def get_coin_registry():
