@@ -388,7 +388,36 @@ async def init_db():
             )
         """)
 
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # CR16: TABLA PARA TRACKING PROACTIVO DE FILLS
+        # ═══════════════════════════════════════════════════════════════════════════════
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS fills_tracking (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                grid_ejecucion_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                binance_trade_id TEXT NOT NULL UNIQUE,
+                binance_order_id TEXT NOT NULL,
+                side TEXT NOT NULL,
+                price REAL NOT NULL,
+                qty REAL NOT NULL,
+                commission REAL NOT NULL,
+                commission_asset TEXT,
+                realized_pnl REAL,
+                timestamp_ms INTEGER NOT NULL,
+                procesado INTEGER DEFAULT 0,  -- 0=no, 1=sí
+                posicion_id TEXT,  -- Link a PosicionReal
+                fecha_procesamiento TIMESTAMP,
+                FOREIGN KEY (grid_ejecucion_id) REFERENCES grid_ejecuciones(id)
+            )
+        """)
+
+
         # Índices para ejecución real
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_fills_grid ON fills_tracking(grid_ejecucion_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_fills_order ON fills_tracking(binance_order_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_fills_procesado ON fills_tracking(procesado)")
+
         await db.execute("CREATE INDEX IF NOT EXISTS idx_grid_ejec_symbol ON grid_ejecuciones(symbol)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_grid_ejec_estado ON grid_ejecuciones(estado)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_ordenes_client_id ON grid_ejecucion_ordenes(client_order_id)")
@@ -1251,3 +1280,58 @@ async def actualizar_grid_ejecucion_cierre(grid_id, estado, pnl_real, fees_real,
         SET estado = ?, pnl_real = ?, fees_real = ?, razon_cierre = ?, closed_at = CURRENT_TIMESTAMP
         WHERE id = ?
     """, (estado, pnl_real, fees_real, razon_cierre, grid_id))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CR16: FUNCIONES DE ACCESO A FILLS (TRACKING PROACTIVO)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def guardar_fill_tracking(grid_ejecucion_id, symbol,
+                                 binance_trade_id, binance_order_id,
+                                 side, price, qty,
+                                 commission, commission_asset,
+                                 realized_pnl, timestamp_ms):
+    """Guarda un fill detectado para procesamiento posterior."""
+    await _execute_with_retry("""
+        INSERT OR IGNORE INTO fills_tracking
+        (grid_ejecucion_id, symbol, binance_trade_id, binance_order_id,
+         side, price, qty, commission, commission_asset, realized_pnl,
+         timestamp_ms, procesado)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+    """, (grid_ejecucion_id, symbol, binance_trade_id, binance_order_id,
+          side, price, qty, commission, commission_asset, realized_pnl,
+          timestamp_ms))
+
+
+async def cargar_fills_sin_procesar(grid_ejecucion_id):
+    """Carga fills no procesados de un grid."""
+    db = await _get_db()
+    async with _db_lock:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT * FROM fills_tracking
+            WHERE grid_ejecucion_id = ? AND procesado = 0
+            ORDER BY timestamp_ms ASC
+        """, (grid_ejecucion_id,))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def marcar_fill_procesado(fill_id, posicion_id):
+    """Marca un fill como procesado y vinculado a una posición."""
+    await _execute_with_retry("""
+        UPDATE fills_tracking
+        SET procesado = 1, posicion_id = ?, fecha_procesamiento = CURRENT_TIMESTAMP
+        WHERE id = ?
+    """, (posicion_id, fill_id))
+
+
+async def obtener_ultimo_trade_timestamp(symbol):
+    """Obtiene el timestamp del último trade procesado para un símbolo."""
+    db = await _get_db()
+    async with _db_lock:
+        cursor = await db.execute("""
+            SELECT MAX(timestamp_ms) FROM fills_tracking WHERE symbol = ?
+        """, (symbol,))
+        row = await cursor.fetchone()
+        return row[0] if row and row[0] else 0

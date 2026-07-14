@@ -14,8 +14,8 @@ from notifier_v5 import Notifier
 
 from audit_logger import AuditLogger
 from audit_reporter_v5 import AuditReporter
-# FASE 4: GridSimulator eliminado como servicio async. 
-# La lógica neutral ahora vive como helper sincrono dentro del executor.
+# FASE 4 PLAN 6.3: El executor es autónomo. No hay servicio externo de grid.
+# La lógica operativa vive en los métodos internos del executor.
 
 background_tasks = set()
 
@@ -65,12 +65,12 @@ async def lifespan(fastapi_app):
     else:
         print("📋 Modo auditoría DESACTIVADO")
 
-    # FASE 4: GridSimulator ya no se instancia aquí. 
-    # El executor crea su propio helper sincrono internamente.
+    # FASE 4 PLAN 6.3: El executor maneja todo internamente.
+    # No hay instancia de GridSimulator en el pipeline.
 
     # F2.8: BLOQUE SECUENCIAL de inyección de dependencias (TODAS juntas, antes de lanzar tareas)
     signals.audit_logger = audit_logger
-    # FASE 4: grid_simulator eliminado. El executor maneja grid neutral internamente.
+    # FASE 4 PLAN 6.3: Executor autónomo. Grid neutral gestionado internamente.
     signals.executor = executor  # ← FASE 1: Inyectar executor
     if executor:
         executor.notifier = notifier  # ← FASE 1: Executor puede notificar
@@ -96,15 +96,13 @@ async def lifespan(fastapi_app):
     app.state.indicadores_4h = signals.indicadores_4h
     # V4.2: Exponer signal_generator para endpoints REST
     app.state.signal_generator = signals
-    # FASE 4: app.state.grid_simulator eliminado. 
-    # El endpoint /api/grid-neutral/{symbol} lee del executor ahora.
+    # FASE 4 PLAN 6.3: El endpoint /api/grid-neutral/{symbol} lee del executor directamente.
     # FASE 5 FIX: Exponer notifier real para endpoints REST
     app.state.notifier = notifier
     # FASE 1: Exponer executor para endpoints REST de fuerza manual
     app.state.executor = executor
 
-    # FASE 4: Limpieza de grids huérfanos movida al executor (si aplica).
-    # El executor maneja su propia recuperación post-crash en _recuperar_grids_activos().
+    # FASE 4 PLAN 6.3: Recuperación post-crash gestionada internamente por el executor.
 
     print("✅ Precálculo completado. Arrancando pipeline V5.9.2...")
 
@@ -136,7 +134,7 @@ async def lifespan(fastapi_app):
         except Exception as e:
             print(f"❌ ERROR CRÍTICO EN TAREA: {e}")
 
-    # FASE 4: No hay tareas de grid_simulator que monitorear.
+    # FASE 4 PLAN 6.3: No hay tareas externas de grid que monitorear.
 
     background_tasks.update([t1, t2, t3, t4])
 
