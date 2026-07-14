@@ -6,6 +6,7 @@ Arquitectura: 100% autónomo — lógica operativa interna (PosicionReal + GridS
 GridSimulator eliminado completamente. No quedan dependencias externas.
 CR3 FIX: Cierre atómico con máquina de estados y verificación de estado real en Binance.
 CR2 FIX: Arquitectura de PnL completa — cada trade persiste realizedPnl en DB.
+V7.1: Grid atómico — locks, anti-duplicación, validación defensiva de niveles, sanidad periódica.
 """
 
 import asyncio
@@ -13,7 +14,7 @@ import json
 import time
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
@@ -36,6 +37,7 @@ from database_v5 import (
     calcular_pnl_acumulado,
     obtener_pnl_por_tipo,
     cargar_grid_ejecuciones_activos,
+    cargar_ordenes_por_grid,
 )
 
 
@@ -287,6 +289,7 @@ class GridExecutor:
     Executor de grids reales en Binance Futures.
     Recibe mensajes por cola asyncio y ejecuta operaciones reales.
     FASE 3: Lógica de grid neutral 100% autónoma — sin llamadas al helper.
+    V7.1: Grid atómico con locks, rollback y validación defensiva.
     """
 
     def __init__(self, precios_vivo: dict, signal_states: dict):
@@ -315,6 +318,10 @@ class GridExecutor:
         self._exchange_info: Dict[str, dict] = {}
         self._grids: Dict[str, GridExecutionState] = {}  # symbol -> state
         self._symbol_leverage: Dict[str, int] = {}  # Leverage fijado por símbolo
+        # V7.1 FASE 1: Lock atómico por símbolo para prevenir condiciones de carrera
+        self._grid_creation_locks: Dict[str, asyncio.Lock] = {}
+        # V7.1 FASE 4: Debounce interno para evitar spam de CREAR_GRID
+        self._grid_pending_creation: Dict[str, float] = {}
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # LOOP PRINCIPAL
@@ -540,97 +547,157 @@ class GridExecutor:
 
         return niveles_filtrados
 
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # V7.1 FASE 1: VERIFICACIÓN PRE-CREACIÓN DE GRIDS HUÉRFANOS EN BINANCE
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    async def _verificar_grid_existente_en_binance(self, symbol: str) -> bool:
+        """
+        V7.1 FASE 1: Consulta si hay órdenes abiertas con prefix 'CM' en Binance.
+        Retorna True si detecta un grid huérfano (órdenes abiertas con nuestro prefix).
+        """
+        try:
+            open_orders = await self._api_call(asyncio.to_thread(
+                self.client.futures_get_open_orders, symbol=symbol
+            ))
+            huérfanas = [o for o in open_orders if o.get('clientOrderId', '').startswith('CM')]
+            if huérfanas:
+                print(f"  🚨 [V7.1] {symbol} Detectadas {len(huérfanas)} órdenes huérfanas con prefix CM")
+                return True
+            return False
+        except Exception as e:
+            print(f"  ⚠️ [V7.1] {symbol} Error verificando órdenes huérfanas: {e}")
+            return False
+
+    async def _cancelar_ordenes_huérfanas(self, symbol: str, huérfanas: List[dict]):
+        """V7.1 FASE 1: Cancela órdenes huérfanas detectadas antes de crear nuevo grid."""
+        print(f"  [V7.1] {symbol} Cancelando {len(huérfanas)} órdenes huérfanas...")
+        for o in huérfanas:
+            try:
+                await self._api_call(asyncio.to_thread(
+                    self.client.futures_cancel_order,
+                    symbol=symbol,
+                    orderId=o['orderId']
+                ))
+                print(f"  [V7.1] {symbol} Orden huérfana {o['orderId']} cancelada")
+            except Exception as e:
+                print(f"  ⚠️ [V7.1] {symbol} No se pudo cancelar orden {o['orderId']}: {e}")
+        await asyncio.sleep(0.5)  # Esperar propagación
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # V7.1 FASE 3: VALIDACIÓN DEFENSIVA DE INTEGRIDAD DE NIVELES
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    def _validar_integridad_niveles(self, niveles: List[float], symbol: str, grid_count_esperado: int) -> bool:
+        """
+        V7.1 FASE 3: Rechaza grids donde el rango es tan pequeño que los niveles colapsan.
+        Reglas:
+        - Si len(niveles) < grid_count_esperado * 0.6 → rechazar
+        - Si max - min < tick_size * 3 → rechazar
+        - Si hay niveles con distancia < tick_size * 1.5 → rechazar
+        """
+        if len(niveles) < 3:
+            return False
+
+        info = self._get_symbol_info(symbol)
+        tick_size = Decimal(str(info['tickSize']))
+
+        # Regla 1: Más del 40% de niveles colapsaron
+        if len(niveles) < grid_count_esperado * 0.6:
+            print(f"  ❌ [V7.1] {symbol} Niveles colapsados: {len(niveles)}/{grid_count_esperado} "
+                  f"únicos (< 60% esperado)")
+            return False
+
+        # Regla 2: Rango total menor a 3 ticks
+        rango = Decimal(str(max(niveles))) - Decimal(str(min(niveles)))
+        if rango < tick_size * 3:
+            print(f"  ❌ [V7.1] {symbol} Rango insuficiente: {float(rango):.4f} < {float(tick_size * 3):.4f} (3 ticks)")
+            return False
+
+        # Regla 3: Distancia mínima entre niveles consecutivos
+        niveles_ordenados = sorted(niveles)
+        for i in range(1, len(niveles_ordenados)):
+            dist = Decimal(str(niveles_ordenados[i])) - Decimal(str(niveles_ordenados[i-1]))
+            if dist < tick_size * Decimal('1.5') and dist > 0:
+                print(f"  ❌ [V7.1] {symbol} Niveles demasiado cercanos: "
+                      f"{niveles_ordenados[i-1]} ↔ {niveles_ordenados[i]} "
+                      f"(dist {float(dist):.4f} < {float(tick_size * Decimal('1.5')):.4f})")
+                return False
+
+        return True
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # V7.1 FASE 2: ENVÍO ATÓMICO DE ÓRDENES (TODO-O-NADA CON ROLLBACK)
+    # ═══════════════════════════════════════════════════════════════════════════════
+
     async def _enviar_ordenes_batch(self, symbol: str, ordenes: List[dict], grid_id: int):
-        """Envía órdenes en batches, con fallback individual."""
-        batch_size = CONFIG.trading_batch_max_ordenes
+        """
+        V7.1 FASE 2: Envía órdenes una por una. Si una falla, cancela las anteriores y retorna [].
+        Garantiza 0 órdenes huérfanas en caso de fallo parcial.
+        """
+        if not ordenes:
+            return []
+
+        enviadas = []  # Lista de dicts {'orderId': str, 'clientOrderId': str}
         order_ids_guardados = []
 
-        for i in range(0, len(ordenes), batch_size):
-            batch = ordenes[i:i+batch_size]
+        for idx, ord in enumerate(ordenes):
             try:
-                if hasattr(self.client, 'futures_place_batch_order'):
-                    resultados = await self._api_call(asyncio.to_thread(
-                        self.client.futures_place_batch_order,
-                        batchOrders=batch
-                    ))
-                else:
-                    resultados = []
-                    for ord in batch:
-                        try:
-                            res = await self._api_call(asyncio.to_thread(
-                                self.client.futures_create_order,
-                                symbol=ord['symbol'],
-                                side=ord['side'],
-                                type=ord['type'],
-                                quantity=ord['quantity'],
-                                price=ord['price'],
-                                timeInForce=ord['timeInForce'],
-                                newClientOrderId=ord['newClientOrderId']
-                            ))
-                            resultados.append(res)
-                        except Exception as e2:
-                            print(f"  ❌ [EXECUTOR] Fallback individual falló: {e2}")
+                res = await self._api_call(asyncio.to_thread(
+                    self.client.futures_create_order,
+                    symbol=ord['symbol'],
+                    side=ord['side'],
+                    type=ord['type'],
+                    quantity=ord['quantity'],
+                    price=ord['price'],
+                    timeInForce=ord['timeInForce'],
+                    newClientOrderId=ord['newClientOrderId']
+                ))
 
-                for j, res in enumerate(resultados):
-                    if 'orderId' in res:
-                        await guardar_orden_ejecucion(
-                            grid_ejecucion_id=grid_id,
-                            binance_order_id=str(res['orderId']),
-                            client_order_id=batch[j]['newClientOrderId'],
-                            symbol=symbol,
-                            side=batch[j]['side'],
-                            tipo_orden='ENTRY',
-                            price=batch[j]['price'],
-                            quantity=batch[j]['quantity']
-                        )
-                        order_ids_guardados.append(res['orderId'])
-                    else:
-                        print(f"  ⚠️ [EXECUTOR] Orden rechazada en batch: {res}")
+                if 'orderId' not in res:
+                    print(f"  ❌ [V7.1] {symbol} Orden {idx} sin orderId en respuesta: {res}")
+                    raise Exception(f"Respuesta sin orderId: {res}")
+
+                await guardar_orden_ejecucion(
+                    grid_ejecucion_id=grid_id,
+                    binance_order_id=str(res['orderId']),
+                    client_order_id=ord['newClientOrderId'],
+                    symbol=symbol,
+                    side=ord['side'],
+                    tipo_orden='ENTRY',
+                    price=ord['price'],
+                    quantity=ord['quantity']
+                )
+                enviadas.append({'orderId': str(res['orderId']), 'clientOrderId': ord['newClientOrderId']})
+                order_ids_guardados.append(res['orderId'])
+
+                # Rate limit micro-pausa entre órdenes
+                if idx < len(ordenes) - 1:
+                    await asyncio.sleep(0.05)
+
             except Exception as e:
-                print(f"  ❌ [EXECUTOR] Error en batch completo: {e}")
-                for ord in batch:
+                print(f"  ❌ [V7.1] {symbol} Orden {idx} ({ord['newClientOrderId']}) falló: {e}. "
+                      f"Cancelando {len(enviadas)} órdenes previas...")
+
+                # ROLLBACK: Cancelar todas las órdenes ya enviadas de este grid
+                rollback_fallos = 0
+                for env in enviadas:
                     try:
-                        res = await self._api_call(asyncio.to_thread(
-                            self.client.futures_create_order,
-                            symbol=ord['symbol'],
-                            side=ord['side'],
-                            type=ord['type'],
-                            quantity=ord['quantity'],
-                            price=ord['price'],
-                            timeInForce=ord['timeInForce'],
-                            newClientOrderId=ord['newClientOrderId']
-                        ))
-                        await guardar_orden_ejecucion(
-                            grid_ejecucion_id=grid_id,
-                            binance_order_id=str(res['orderId']),
-                            client_order_id=ord['newClientOrderId'],
+                        await self._api_call(asyncio.to_thread(
+                            self.client.futures_cancel_order,
                             symbol=symbol,
-                            side=ord['side'],
-                            tipo_orden='ENTRY',
-                            price=ord['price'],
-                            quantity=ord['quantity']
-                        )
-                        order_ids_guardados.append(res['orderId'])
-                    except Exception as e2:
-                        print(f"  ❌ [EXECUTOR] Fallback final falló: {e2}")
+                            orderId=env['orderId']
+                        ))
+                        print(f"  [V7.1] Rollback: orden {env['orderId']} cancelada")
+                    except Exception as e_cancel:
+                        rollback_fallos += 1
+                        print(f"  ⚠️ [V7.1] Rollback falló para {env['orderId']}: {e_cancel}")
 
-            if i + batch_size < len(ordenes):
-                await asyncio.sleep(0.1)
+                print(f"  🛑 [V7.1] {symbol} Grid abortado. Rollback: {len(enviadas)} canceladas, "
+                      f"{rollback_fallos} fallos de cancelación")
+                return []  # Lista vacía = fallo total
 
-        # Verificar si hubo rechazos en el batch
-        rechazos_batch = [r for r in resultados if r.get('code')]
-        if rechazos_batch:
-            print(f"  ❌ [EXECUTOR] {symbol} Batch con rechazos: {len(rechazos_batch)} órdenes. ABORTANDO grid.")
-            # Cancelar órdenes que sí pasaron para no dejar grid roto
-            for oid in order_ids_guardados:
-                try:
-                    await self._api_call(asyncio.to_thread(
-                        self.client.futures_cancel_order, symbol=symbol, orderId=oid
-                    ))
-                except Exception:
-                    pass
-            return []  # Lista vacía = fallo total
-
+        print(f"  ✅ [V7.1] {symbol} Batch atómico exitoso: {len(order_ids_guardados)}/{len(ordenes)} órdenes")
         return order_ids_guardados
 
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -987,114 +1054,147 @@ class GridExecutor:
         }
 
     # ═══════════════════════════════════════════════════════════════════════════════
-    # CREAR GRID LONG (FASE 1)
+    # CREAR GRID LONG (FASE 1) — V7.1 CON LOCK ATÓMICO
     # ═══════════════════════════════════════════════════════════════════════════════
 
     async def _crear_grid_direccional(self, symbol: str, direction: str, params: dict, price: float):
         """
         Crea un grid LONG o SHORT real en Binance Futures.
         direction: 'LONG' o 'SHORT'
+        V7.1: Protegido con asyncio.Lock y verificación de huérfanas.
         """
-        print(f"  [EXECUTOR] >>> SOLICITUD RECIBIDA: {symbol} {direction} @ ${price:.4f}")
-        print(f"  [EXECUTOR] Params: grids={params.get('grid_count')}, range=[{params.get('lower_limit')}, {params.get('upper_limit')}], step_pct={params.get('step_pct')}%")
-        
-        if symbol in self._grids and self._grids[symbol].activa:
-            print(f"  ⚠️ [EXECUTOR] {symbol} Ya hay grid activo, rechazando nuevo")
-            return
-
-        # 1. Calcular leverage adaptativo
-        leverage = self._calcular_leverage_adaptativo(
-            symbol, CONFIG.trading_capital_max_usdt,
-            params['grid_count'], price
-        )
-        if not leverage:
-            await self._notificar_rechazo(symbol, "No alcanza notional mínimo ni con max leverage")
-            return
-
-        # 2. Verificar leverage existente
-        if symbol in self._symbol_leverage and self._symbol_leverage[symbol] != leverage:
-            leverage = self._symbol_leverage[symbol]
-            print(f"  [EXECUTOR] {symbol} Usando leverage existente: {leverage}x")
-
-        # 3. Cambiar leverage en Binance
-        try:
-            await self._cambiar_leverage(symbol, leverage)
-        except Exception:
-            return
-
-        # 4. Generar niveles y qty
-        niveles = self._generar_niveles(params, price, symbol)
-        niveles = self._filtrar_niveles_por_limites_binance(niveles, symbol)
-        if len(niveles) < 3:
-            print(f"  ❌ [EXECUTOR] {symbol} Grid {direction} rechazado: solo {len(niveles)} niveles únicos")
-            await self._notificar_rechazo(symbol, f"Grid inválido: {len(niveles)} niveles únicos")
-            return
-
-        info = self._get_symbol_info(symbol)
-        step_size = Decimal(str(info['stepSize']))
-        notional_total = Decimal(str(CONFIG.trading_capital_max_usdt)) * leverage
-        notional_orden = notional_total / int(params['grid_count'])
-        qty_raw = notional_orden / Decimal(str(price))
-        steps = int(qty_raw / step_size)
-        qty = float(steps * step_size)
-
-        # 5. Guardar grid en SQLite
-        grid_id = await guardar_grid_ejecucion(
-            symbol=symbol, direction=direction, trading_mode=CONFIG.trading_mode,
-            capital_asignado=CONFIG.trading_capital_max_usdt,
-            apalancamiento_usado=leverage, precio_entrada=price,
-            grid_params_json=json.dumps(params),
-            timestamp_inicio=int(time.time())
-        )
-        if not grid_id:
-            print(f"  ❌ [EXECUTOR] {symbol} No se pudo guardar grid en DB")
-            return
-
-        # 6. Generar órdenes LIMIT
-        ordenes = []
-        timestamp = int(time.time() * 1000)
-        side = 'BUY' if direction == 'LONG' else 'SELL'
-        for idx, nivel in enumerate(niveles):
-            if direction == 'LONG':
-                if nivel >= price * 0.999:
-                    continue
-            else:  # SHORT
-                if nivel <= price * 1.001:
-                    continue
-
-            precio_validado = self._validar_y_redondear_precio(nivel, symbol)
-            if precio_validado is None:
-                continue  # Saltar este nivel, no abortar todo el grid
+        # V7.1 FASE 1: Lock atómico por símbolo
+        lock = self._grid_creation_locks.setdefault(symbol, asyncio.Lock())
+        async with lock:
+            print(f"  [EXECUTOR] >>> SOLICITUD RECIBIDA: {symbol} {direction} @ ${price:.4f}")
+            print(f"  [EXECUTOR] Params: grids={params.get('grid_count')}, range=[{params.get('lower_limit')}, {params.get('upper_limit')}], step_pct={params.get('step_pct')}%")
             
-            client_order_id = f"CM{grid_id}_{idx}_{timestamp}"
-            ordenes.append({
-                'symbol': symbol,
-                'side': side,
-                'type': 'LIMIT',
-                'quantity': str(qty),
-                'price': str(precio_validado),
-                'timeInForce': 'GTC',
-                'newClientOrderId': client_order_id
-            })
+            # Doble verificación DENTRO del lock
+            if symbol in self._grids and self._grids[symbol].activa:
+                print(f"  ⚠️ [EXECUTOR] {symbol} Ya hay grid activo, rechazando nuevo")
+                return
 
-        # 7. Enviar en batches
-        order_ids_guardados = await self._enviar_ordenes_batch(symbol, ordenes, grid_id)
+            # V7.1 FASE 1: Verificación CRÍTICA de órdenes huérfanas en Binance
+            tiene_huerfanas = await self._verificar_grid_existente_en_binance(symbol)
+            if tiene_huerfanas:
+                # Intentar recuperar órdenes huérfanas exactas y cancelarlas
+                try:
+                    open_orders = await self._api_call(asyncio.to_thread(
+                        self.client.futures_get_open_orders, symbol=symbol
+                    ))
+                    huerfanas = [o for o in open_orders if o.get('clientOrderId', '').startswith('CM')]
+                    if huerfanas:
+                        await self._cancelar_ordenes_huérfanas(symbol, huerfanas)
+                except Exception as e:
+                    print(f"  ⚠️ [V7.1] {symbol} Error limpiando huérfanas: {e}")
+                    return
 
-        # 8. Verificar que se guardaron órdenes
-        if not order_ids_guardados:
-            print(f"  ❌ [EXECUTOR] {symbol} Grid {direction} FALLÓ: 0 órdenes guardadas")
-            return
+            # 1. Calcular leverage adaptativo
+            leverage = self._calcular_leverage_adaptativo(
+                symbol, CONFIG.trading_capital_max_usdt,
+                params['grid_count'], price
+            )
+            if not leverage:
+                await self._notificar_rechazo(symbol, "No alcanza notional mínimo ni con max leverage")
+                return
 
-        # 9. Crear estado en RAM
-        state = GridExecutionState(
-            grid_id=grid_id, symbol=symbol, direction=direction,
-            capital=CONFIG.trading_capital_max_usdt, leverage=leverage,
-            precio_entrada=price, niveles=niveles, qty_por_orden=qty
-        )
-        self._grids[symbol] = state
+            # 2. Verificar leverage existente
+            if symbol in self._symbol_leverage and self._symbol_leverage[symbol] != leverage:
+                leverage = self._symbol_leverage[symbol]
+                print(f"  [EXECUTOR] {symbol} Usando leverage existente: {leverage}x")
 
-        print(f"  ✅ [EXECUTOR] {symbol} Grid {direction} creado | ID:{grid_id} | "
-              f"Leverage:{leverage}x | Órdenes:{len(order_ids_guardados)}")
+            # 3. Cambiar leverage en Binance
+            try:
+                await self._cambiar_leverage(symbol, leverage)
+            except Exception:
+                return
+
+            # 4. Generar niveles y qty
+            niveles = self._generar_niveles(params, price, symbol)
+            niveles = self._filtrar_niveles_por_limites_binance(niveles, symbol)
+            if len(niveles) < 3:
+                print(f"  ❌ [EXECUTOR] {symbol} Grid {direction} rechazado: solo {len(niveles)} niveles únicos")
+                await self._notificar_rechazo(symbol, f"Grid inválido: {len(niveles)} niveles únicos")
+                return
+
+            # V7.1 FASE 3: Validar integridad de niveles
+            if not self._validar_integridad_niveles(niveles, symbol, int(params['grid_count'])):
+                await self._notificar_rechazo(symbol, "Niveles colapsados por tick_size")
+                return
+
+            info = self._get_symbol_info(symbol)
+            step_size = Decimal(str(info['stepSize']))
+            notional_total = Decimal(str(CONFIG.trading_capital_max_usdt)) * leverage
+            notional_orden = notional_total / int(params['grid_count'])
+            qty_raw = notional_orden / Decimal(str(price))
+            steps = int(qty_raw / step_size)
+            qty = float(steps * step_size)
+
+            # 5. Guardar grid en SQLite
+            grid_id = await guardar_grid_ejecucion(
+                symbol=symbol, direction=direction, trading_mode=CONFIG.trading_mode,
+                capital_asignado=CONFIG.trading_capital_max_usdt,
+                apalancamiento_usado=leverage, precio_entrada=price,
+                grid_params_json=json.dumps(params),
+                timestamp_inicio=int(time.time())
+            )
+            if not grid_id:
+                print(f"  ❌ [EXECUTOR] {symbol} No se pudo guardar grid en DB")
+                return
+
+            # 6. Generar órdenes LIMIT
+            ordenes = []
+            timestamp = int(time.time() * 1000)
+            side = 'BUY' if direction == 'LONG' else 'SELL'
+            for idx, nivel in enumerate(niveles):
+                if direction == 'LONG':
+                    if nivel >= price * 0.999:
+                        continue
+                else:  # SHORT
+                    if nivel <= price * 1.001:
+                        continue
+
+                precio_validado = self._validar_y_redondear_precio(nivel, symbol)
+                if precio_validado is None:
+                    continue  # Saltar este nivel, no abortar todo el grid
+                
+                client_order_id = f"CM{grid_id}_{idx}_{timestamp}"
+                ordenes.append({
+                    'symbol': symbol,
+                    'side': side,
+                    'type': 'LIMIT',
+                    'quantity': str(qty),
+                    'price': str(precio_validado),
+                    'timeInForce': 'GTC',
+                    'newClientOrderId': client_order_id
+                })
+
+            # 7. Enviar en batches (V7.1 FASE 2: atómico con rollback)
+            order_ids_guardados = await self._enviar_ordenes_batch(symbol, ordenes, grid_id)
+
+            # 8. Verificar que se guardaron órdenes
+            if not order_ids_guardados:
+                print(f"  ❌ [EXECUTOR] {symbol} Grid {direction} FALLÓ: 0 órdenes guardadas")
+                # V7.1: Marcar DB como abortado si el batch falló
+                await actualizar_grid_ejecucion_cierre(
+                    grid_id=grid_id, estado='ABORTADO', pnl_real=0, fees_real=0,
+                    razon_cierre='grid_incompleto_batch_rechazado'
+                )
+                return
+
+            # 9. Crear estado en RAM
+            state = GridExecutionState(
+                grid_id=grid_id, symbol=symbol, direction=direction,
+                capital=CONFIG.trading_capital_max_usdt, leverage=leverage,
+                precio_entrada=price, niveles=niveles, qty_por_orden=qty
+            )
+            self._grids[symbol] = state
+
+            # V7.1 FASE 4: Registrar timestamp de creación exitosa para debounce
+            self._grid_pending_creation[symbol] = time.time()
+
+            print(f"  ✅ [EXECUTOR] {symbol} Grid {direction} creado | ID:{grid_id} | "
+                  f"Leverage:{leverage}x | Órdenes:{len(order_ids_guardados)}")
 
     async def _crear_grid_long(self, symbol: str, params: dict, price: float):
         await self._crear_grid_direccional(symbol, 'LONG', params, price)
@@ -1103,140 +1203,168 @@ class GridExecutor:
         await self._crear_grid_direccional(symbol, 'SHORT', params, price)
 
     # ═══════════════════════════════════════════════════════════════════════════════
-    # CREAR GRID NEUTRAL (FASE 2 — Autónomo, sin helper)
+    # CREAR GRID NEUTRAL (FASE 2 — Autónomo, sin helper) — V7.1 CON LOCK ATÓMICO
     # ═══════════════════════════════════════════════════════════════════════════════
 
     async def _crear_grid_neutral(self, symbol: str, params: dict, price: float):
-        """Crea un grid neutral usando lógica interna del executor (FASE 2)."""
-        if symbol in self._grids and self._grids[symbol].activa:
-            print(f"  ⚠️ [EXECUTOR] {symbol} Ya hay grid activo")
-            return
+        """Crea un grid neutral usando lógica interna del executor (FASE 2). V7.1: Lock atómico."""
+        # V7.1 FASE 1: Lock atómico por símbolo
+        lock = self._grid_creation_locks.setdefault(symbol, asyncio.Lock())
+        async with lock:
+            if symbol in self._grids and self._grids[symbol].activa:
+                print(f"  ⚠️ [EXECUTOR] {symbol} Ya hay grid activo")
+                return
 
-        # 1. Calcular leverage (igual que directional)
-        leverage = self._calcular_leverage_adaptativo(
-            symbol, CONFIG.trading_capital_max_usdt,
-            params['grid_count'], price
-        )
-        if not leverage:
-            await self._notificar_rechazo(symbol, "No alcanza notional mínimo ni con max leverage")
-            return
-
-        # 2. Verificar leverage existente
-        if symbol in self._symbol_leverage and self._symbol_leverage[symbol] != leverage:
-            leverage = self._symbol_leverage[symbol]
-            print(f"  [EXECUTOR] {symbol} Usando leverage existente: {leverage}x")
-
-        # 3. Cambiar leverage en Binance
-        try:
-            await self._cambiar_leverage(symbol, leverage)
-        except Exception:
-            return
-
-        # 4. Generar niveles (igual que directional pero para ambos lados)
-        niveles = self._generar_niveles(params, price, symbol)
-        niveles = self._filtrar_niveles_por_limites_binance(niveles, symbol)
-
-        # VALIDACIÓN mínima de niveles
-        if len(niveles) < 3:
-            print(f"  ❌ [EXECUTOR] {symbol} Grid NEUTRAL rechazado: solo {len(niveles)} niveles únicos")
-            await self._notificar_rechazo(symbol, f"Grid inválido: {len(niveles)} niveles únicos")
-            return
-
-        # 5. Separar niveles BUY (debajo) y SELL (encima)
-        niveles_buy = [n for n in niveles if n < price * 0.9995]
-        niveles_sell = [n for n in niveles if n > price * 1.0005]
-
-        if len(niveles_buy) < 1 or len(niveles_sell) < 1:
-            print(f"  ❌ [EXECUTOR] {symbol} Grid NEUTRAL rechazado: BUY={len(niveles_buy)} SELL={len(niveles_sell)}")
-            await self._notificar_rechazo(symbol, f"Grid neutral inválido: {len(niveles_buy)} buy, {len(niveles_sell)} sell niveles")
-            return
-
-        # 6. Calcular qty
-        info = self._get_symbol_info(symbol)
-        step_size = Decimal(str(info['stepSize']))
-        notional_total = Decimal(str(CONFIG.trading_capital_max_usdt)) * leverage
-        notional_orden = notional_total / int(params['grid_count'])
-        qty_raw = notional_orden / Decimal(str(price))
-        steps = int(qty_raw / step_size)
-        qty = float(steps * step_size)
-
-        # 7. Guardar grid en DB (igual)
-        grid_id = await guardar_grid_ejecucion(
-            symbol=symbol, direction='NEUTRAL', trading_mode=CONFIG.trading_mode,
-            capital_asignado=CONFIG.trading_capital_max_usdt,
-            apalancamiento_usado=leverage, precio_entrada=price,
-            grid_params_json=json.dumps(params),
-            timestamp_inicio=int(time.time())
-        )
-
-        if not grid_id:
-            print(f"  ❌ [EXECUTOR] {symbol} No se pudo guardar grid en DB")
-            return
-
-        # 8. Crear estado del executor
-        state = GridExecutionState(
-            grid_id=grid_id, symbol=symbol, direction='NEUTRAL',
-            capital=CONFIG.trading_capital_max_usdt, leverage=leverage,
-            precio_entrada=price, niveles=niveles, qty_por_orden=qty
-        )
-
-        # 9. INICIAR GridState propio del executor (FASE 2)
-        state.init_grid_state(niveles_buy=niveles_buy, niveles_sell=niveles_sell)
-
-        # 10. Colocar órdenes LIMIT reales: BUY debajo, SELL encima
-        ordenes = []
-        timestamp = int(time.time() * 1000)
-        for idx, nivel in enumerate(niveles_buy):
-            precio_validado = self._validar_y_redondear_precio(nivel, symbol)
-            if precio_validado is None:
-                continue  # Saltar este nivel, no abortar todo el grid
-            
-            ordenes.append({
-                'symbol': symbol, 'side': 'BUY', 'type': 'LIMIT',
-                'quantity': str(qty), 'price': str(precio_validado),
-                'timeInForce': 'GTC', 'newClientOrderId': f"CM{grid_id}_BUY_{idx}_{timestamp}"
-            })
-        for idx, nivel in enumerate(niveles_sell):
-            precio_validado = self._validar_y_redondear_precio(nivel, symbol)
-            if precio_validado is None:
-                continue  # Saltar este nivel, no abortar todo el grid
-            
-            ordenes.append({
-                'symbol': symbol, 'side': 'SELL', 'type': 'LIMIT',
-                'quantity': str(qty), 'price': str(precio_validado),
-                'timeInForce': 'GTC', 'newClientOrderId': f"CM{grid_id}_SELL_{idx}_{timestamp}"
-            })
-
-        # 11. Enviar batches (igual que directional)
-        order_ids_guardados = await self._enviar_ordenes_batch(symbol, ordenes, grid_id)
-
-        # FIX V7.1: Verificar integridad del grid
-        if len(order_ids_guardados) < len(ordenes):
-            print(f"  ❌ [EXECUTOR] {symbol} Grid NEUTRAL INCOMPLETO: {len(order_ids_guardados)}/{len(ordenes)} órdenes. Abortando.")
-            # Cancelar las que quedaron
-            for oid in order_ids_guardados:
+            # V7.1 FASE 1: Verificación CRÍTICA de órdenes huérfanas
+            tiene_huerfanas = await self._verificar_grid_existente_en_binance(symbol)
+            if tiene_huerfanas:
                 try:
-                    await self._api_call(asyncio.to_thread(self.client.futures_cancel_order, symbol=symbol, orderId=oid))
-                except Exception:
-                    pass
-            # Marcar DB como abortado
-            await actualizar_grid_ejecucion_cierre(
-                grid_id=grid_id, estado='ABORTADO', pnl_real=0, fees_real=0,
-                razon_cierre='grid_incompleto_batch_rechazado'
-            )
-            return
+                    open_orders = await self._api_call(asyncio.to_thread(
+                        self.client.futures_get_open_orders, symbol=symbol
+                    ))
+                    huerfanas = [o for o in open_orders if o.get('clientOrderId', '').startswith('CM')]
+                    if huerfanas:
+                        await self._cancelar_ordenes_huérfanas(symbol, huerfanas)
+                except Exception as e:
+                    print(f"  ⚠️ [V7.1] {symbol} Error limpiando huérfanas: {e}")
+                    return
 
-        self._grids[symbol] = state
-        print(f"  ✅ [EXECUTOR] {symbol} Grid NEUTRAL creado | BUY:{len(niveles_buy)} SELL:{len(niveles_sell)} | Órdenes:{len(order_ids_guardados)}")
+            # 1. Calcular leverage (igual que directional)
+            leverage = self._calcular_leverage_adaptativo(
+                symbol, CONFIG.trading_capital_max_usdt,
+                params['grid_count'], price
+            )
+            if not leverage:
+                await self._notificar_rechazo(symbol, "No alcanza notional mínimo ni con max leverage")
+                return
+
+            # 2. Verificar leverage existente
+            if symbol in self._symbol_leverage and self._symbol_leverage[symbol] != leverage:
+                leverage = self._symbol_leverage[symbol]
+                print(f"  [EXECUTOR] {symbol} Usando leverage existente: {leverage}x")
+
+            # 3. Cambiar leverage en Binance
+            try:
+                await self._cambiar_leverage(symbol, leverage)
+            except Exception:
+                return
+
+            # 4. Generar niveles (igual que directional pero para ambos lados)
+            niveles = self._generar_niveles(params, price, symbol)
+            niveles = self._filtrar_niveles_por_limites_binance(niveles, symbol)
+
+            # VALIDACIÓN mínima de niveles
+            if len(niveles) < 3:
+                print(f"  ❌ [EXECUTOR] {symbol} Grid NEUTRAL rechazado: solo {len(niveles)} niveles únicos")
+                await self._notificar_rechazo(symbol, f"Grid inválido: {len(niveles)} niveles únicos")
+                return
+
+            # V7.1 FASE 3: Validar integridad de niveles
+            if not self._validar_integridad_niveles(niveles, symbol, int(params['grid_count'])):
+                await self._notificar_rechazo(symbol, "Niveles colapsados por tick_size")
+                return
+
+            # 5. Separar niveles BUY (debajo) y SELL (encima)
+            niveles_buy = [n for n in niveles if n < price * 0.9995]
+            niveles_sell = [n for n in niveles if n > price * 1.0005]
+
+            if len(niveles_buy) < 1 or len(niveles_sell) < 1:
+                print(f"  ❌ [EXECUTOR] {symbol} Grid NEUTRAL rechazado: BUY={len(niveles_buy)} SELL={len(niveles_sell)}")
+                await self._notificar_rechazo(symbol, f"Grid neutral inválido: {len(niveles_buy)} buy, {len(niveles_sell)} sell niveles")
+                return
+
+            # 6. Calcular qty
+            info = self._get_symbol_info(symbol)
+            step_size = Decimal(str(info['stepSize']))
+            notional_total = Decimal(str(CONFIG.trading_capital_max_usdt)) * leverage
+            notional_orden = notional_total / int(params['grid_count'])
+            qty_raw = notional_orden / Decimal(str(price))
+            steps = int(qty_raw / step_size)
+            qty = float(steps * step_size)
+
+            # 7. Guardar grid en DB (igual)
+            grid_id = await guardar_grid_ejecucion(
+                symbol=symbol, direction='NEUTRAL', trading_mode=CONFIG.trading_mode,
+                capital_asignado=CONFIG.trading_capital_max_usdt,
+                apalancamiento_usado=leverage, precio_entrada=price,
+                grid_params_json=json.dumps(params),
+                timestamp_inicio=int(time.time())
+            )
+
+            if not grid_id:
+                print(f"  ❌ [EXECUTOR] {symbol} No se pudo guardar grid en DB")
+                return
+
+            # 8. Crear estado del executor
+            state = GridExecutionState(
+                grid_id=grid_id, symbol=symbol, direction='NEUTRAL',
+                capital=CONFIG.trading_capital_max_usdt, leverage=leverage,
+                precio_entrada=price, niveles=niveles, qty_por_orden=qty
+            )
+
+            # 9. INICIAR GridState propio del executor (FASE 2)
+            state.init_grid_state(niveles_buy=niveles_buy, niveles_sell=niveles_sell)
+
+            # 10. Colocar órdenes LIMIT reales: BUY debajo, SELL encima
+            ordenes = []
+            timestamp = int(time.time() * 1000)
+            for idx, nivel in enumerate(niveles_buy):
+                precio_validado = self._validar_y_redondear_precio(nivel, symbol)
+                if precio_validado is None:
+                    continue  # Saltar este nivel, no abortar todo el grid
+                
+                ordenes.append({
+                    'symbol': symbol, 'side': 'BUY', 'type': 'LIMIT',
+                    'quantity': str(qty), 'price': str(precio_validado),
+                    'timeInForce': 'GTC', 'newClientOrderId': f"CM{grid_id}_BUY_{idx}_{timestamp}"
+                })
+            for idx, nivel in enumerate(niveles_sell):
+                precio_validado = self._validar_y_redondear_precio(nivel, symbol)
+                if precio_validado is None:
+                    continue  # Saltar este nivel, no abortar todo el grid
+                
+                ordenes.append({
+                    'symbol': symbol, 'side': 'SELL', 'type': 'LIMIT',
+                    'quantity': str(qty), 'price': str(precio_validado),
+                    'timeInForce': 'GTC', 'newClientOrderId': f"CM{grid_id}_SELL_{idx}_{timestamp}"
+                })
+
+            # 11. Enviar batches (V7.1 FASE 2: atómico con rollback)
+            order_ids_guardados = await self._enviar_ordenes_batch(symbol, ordenes, grid_id)
+
+            # FIX V7.1: Verificar integridad del grid
+            if len(order_ids_guardados) < len(ordenes):
+                print(f"  ❌ [EXECUTOR] {symbol} Grid NEUTRAL INCOMPLETO: {len(order_ids_guardados)}/{len(ordenes)} órdenes. Abortando.")
+                # Cancelar las que quedaron
+                for oid in order_ids_guardados:
+                    try:
+                        await self._api_call(asyncio.to_thread(self.client.futures_cancel_order, symbol=symbol, orderId=oid))
+                    except Exception:
+                        pass
+                # Marcar DB como abortado
+                await actualizar_grid_ejecucion_cierre(
+                    grid_id=grid_id, estado='ABORTADO', pnl_real=0, fees_real=0,
+                    razon_cierre='grid_incompleto_batch_rechazado'
+                )
+                return
+
+            self._grids[symbol] = state
+
+            # V7.1 FASE 4: Registrar timestamp de creación exitosa
+            self._grid_pending_creation[symbol] = time.time()
+
+            print(f"  ✅ [EXECUTOR] {symbol} Grid NEUTRAL creado | BUY:{len(niveles_buy)} SELL:{len(niveles_sell)} | Órdenes:{len(order_ids_guardados)}")
 
     # ═══════════════════════════════════════════════════════════════════════════════
-    # MONITOREO PERIÓDICO
+    # MONITOREO PERIÓDICO — V7.1 FASE 4: SANIDAD PERIÓDICA
     # ═══════════════════════════════════════════════════════════════════════════════
 
     async def _monitoring_loop(self):
-        """Monitorea grids activos cada N segundos."""
+        """Monitorea grids activos cada N segundos. V7.1: Incluye verificación de integridad."""
+        ciclo = 0
         while not self._shutdown.is_set():
             await asyncio.sleep(CONFIG.trading_polling_interval_seg)
+            ciclo += 1
 
             # FASE 3: Verificar límite de pérdida diaria
             await self._verificar_limite_perdida()
@@ -1267,8 +1395,76 @@ class GridExecutor:
 
                         print(f"  [EXECUTOR] {symbol} Monitoreo | Pos: {float(st.posicion_neta):.4f} | PnL: {float(st.pnl_real):+.4f} | Fees: {float(st.fees_real):.4f}")
                     await self._monitorear_grid(symbol)
+
+                    # V7.1 FASE 4: Verificación de integridad cada 3 ciclos (~30s)
+                    if ciclo % 3 == 0:
+                        await self._verificar_integridad_grid(symbol, st)
                 except Exception as e:
                     print(f"  ❌ [EXECUTOR] Error monitoreando {symbol}: {e}")
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # V7.1 FASE 4: VERIFICACIÓN DE INTEGRIDAD DEL GRID
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    async def _verificar_integridad_grid(self, symbol: str, state: GridExecutionState):
+        """
+        V7.1 FASE 4: Detecta grids fantasmas, duplicación de órdenes, o grids huérfanos.
+        Se ejecuta cada ~30 segundos desde _monitoring_loop.
+        """
+        if not state.grid_state or not state.grid_state.activa:
+            return
+
+        try:
+            # 1. Consultar órdenes abiertas en Binance
+            open_orders = await self._api_call(asyncio.to_thread(
+                self.client.futures_get_open_orders, symbol=symbol
+            ))
+
+            # 2. Filtrar órdenes de este grid por prefix
+            prefix = f"CM{state.grid_id}"
+            ordenes_nuestras = [o for o in open_orders if o.get('clientOrderId', '').startswith(prefix)]
+            total_open = len(open_orders)
+
+            # 3. Grid fantasma: 0 órdenes nuestras pero grid dice activo
+            if len(ordenes_nuestras) == 0 and total_open == 0:
+                # Verificar si hay posición real
+                position = await self._api_call(asyncio.to_thread(
+                    self.client.futures_position_information, symbol=symbol
+                ))
+                pos_amt = Decimal(str(position[0].get('positionAmt', 0))) if position else Decimal('0')
+                if abs(pos_amt) < Decimal('0.0001'):
+                    print(f"  🚨 [V7.1] {symbol} Grid fantasma detectado (0 órdenes, 0 posición). Marcando cerrado.")
+                    await actualizar_grid_ejecucion_cierre(
+                        grid_id=state.grid_id,
+                        estado='CERRADO',
+                        pnl_real=float(state.pnl_real),
+                        fees_real=float(state.fees_real),
+                        razon_cierre='grid_fantasma_detectado_integridad'
+                    )
+                    state.activa = False
+                    if symbol in self._grids:
+                        del self._grids[symbol]
+                    return
+
+            # 4. Duplicación detectada: más órdenes de las esperadas
+            # (esto solo detecta órdenes de OTROS grids CM, no del actual)
+            ordenes_otros_cm = [o for o in open_orders if o.get('clientOrderId', '').startswith('CM') and not o.get('clientOrderId', '').startswith(prefix)]
+            if len(ordenes_otros_cm) > 0:
+                print(f"  🚨 [V7.1] {symbol} Detectadas {len(ordenes_otros_cm)} órdenes de OTROS grids CM. Posible duplicación.")
+                # Cancelar órdenes ajenas para evitar interferencia
+                for o in ordenes_otros_cm:
+                    try:
+                        await self._api_call(asyncio.to_thread(
+                            self.client.futures_cancel_order,
+                            symbol=symbol,
+                            orderId=o['orderId']
+                        ))
+                        print(f"  [V7.1] {symbol} Orden ajena {o['orderId']} cancelada")
+                    except Exception as e:
+                        print(f"  ⚠️ [V7.1] No se pudo cancelar orden ajena {o['orderId']}: {e}")
+
+        except Exception as e:
+            print(f"  ⚠️ [V7.1] {symbol} Error en verificación de integridad: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # FASE 3 PLAN 6.3: REEMPLAZAR LLAMADAS AL HELPER POR LÓGICA INTERNA
@@ -2560,6 +2756,15 @@ class GridExecutor:
 
         if tipo == 'CREAR_GRID':
             direction = msg.get('direction')
+            symbol = msg.get('symbol')
+
+            # V7.1 FASE 4: Debounce interno — ignorar si se creó hace menos de 60s
+            if symbol and symbol in self._grid_pending_creation:
+                tiempo_desde_ultimo = time.time() - self._grid_pending_creation[symbol]
+                if tiempo_desde_ultimo < 60:
+                    print(f"  ⚠️ [V7.1] {symbol} Debounce activo: {tiempo_desde_ultimo:.0f}s < 60s. Ignorando CREAR_GRID.")
+                    return
+
             if direction == 'LONG':
                 await self._crear_grid_long(
                     msg['symbol'], msg['params'], msg['price']

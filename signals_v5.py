@@ -6,7 +6,7 @@ from typing import Dict, Optional, Tuple, Set
 from config import CONFIG
 from coin_config_adapter import get_coin_config, get_category_emoji
 import pytz
-
+import time
 
 class SignalState:
     """Estado de la maquina de estados por simbolo — V5.7 Fases 1-5."""
@@ -104,9 +104,10 @@ class SignalGenerator:
         self._historial_1m: Dict[str, list] = {s: [] for s in CONFIG.symbols}
 
         self.audit_logger = None
+        # V7.1 FASE 4: Debounce de CREAR_GRID para evitar spam al executor
+        self._grid_pending_creation: Dict[str, float] = {}
         # FASE 4: Grid neutral ahora es manejado 100% por el executor
-        # self.grid_simulator eliminado — lógica movida a executor.py como helper sincrono
-
+        
     ARMED_TIMEOUT_MIN = 30
     SCORE_DISPARO_MIN = 70
     SCORE_MANTENIMIENTO_ARMED = 50
@@ -410,10 +411,14 @@ class SignalGenerator:
                     'razon': razon
                 })
                 state._aborto_enviado_ts = ahora
+                # V7.1 FASE 4: Limpiar debounce de creación al abortar
+                if symbol in self._grid_pending_creation:
+                    del self._grid_pending_creation[symbol]
+                    print(f"  [V7.1] {symbol} Debounce CREAR_GRID limpiado por aborto")
                 print(f"  [ABORTO] {symbol} Enviado al executor | Razón: {razon}")
             except Exception as e:
                 print(f"  ⚠️ [ABORTO] Error enviando aborto {symbol}: {e}")
-
+                
     # ═══════════════════════════════════════════════════════════════════════════════
     # LOOP PRINCIPAL
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -447,9 +452,9 @@ class SignalGenerator:
                         self._rango_reciente[symbol]['highs'] = self._rango_reciente[symbol]['highs'][-20:]
                         self._rango_reciente[symbol]['lows'] = self._rango_reciente[symbol]['lows'][-20:]
 
-                # ═══════════════════════════════════════════════════════════════════
+                # -------------------------------------------------------------------
                 # FASE 5: Evaluar aborto de NEUTRAL_GRID en cada vela 15m
-                # ═══════════════════════════════════════════════════════════════════
+                # -------------------------------------------------------------------
                 state = self.states[symbol]
                 
                 # FIX: Solo evaluar aborto si estamos realmente en NEUTRAL_GRID
@@ -466,8 +471,10 @@ class SignalGenerator:
                         state.grid_params_neutral = None
                         state.filtro_macro_aprobado = False
                         state.direccion_filtro = None
+                        # V7.1 FASE 4: Limpiar debounce al salir de NEUTRAL_GRID por aborto macro
+                        if symbol in self._grid_pending_creation:
+                            del self._grid_pending_creation[symbol]
                         print(f"  [NEUTRAL_GRID] {symbol} -> MONITOREO (aborto: {razon})")
-                        
                         await self._enviar_aborto_seguro(symbol, razon)
                         
                         if self.audit_logger:
@@ -915,19 +922,45 @@ class SignalGenerator:
                     print(f"  [NEUTRAL_GRID] {symbol} -> NEUTRAL_GRID | {razon_grid}")
 
                     state.grid_params_neutral = grid_params
-                    # FASE 4: Grid neutral ejecutado por executor, no por simulador async
-                    if hasattr(self, 'executor') and self.executor:
-                        try:
-                            await self.executor.queue.put({
-                                'tipo': 'CREAR_GRID',
-                                'symbol': symbol,
-                                'direction': 'NEUTRAL',
-                                'params': grid_params,
-                                'price': price
-                            })
-                            print(f"  [FASE 4] {symbol} Grid NEUTRAL enviado al executor")
-                        except Exception as e:
-                            print(f"  ⚠️ [FASE 4] Error enviando grid neutral al executor: {e}")
+
+                    # V7.1 FASE 4: Debounce — evitar spam de CREAR_GRID al executor
+                    ahora = time.time()
+                    if symbol in self._grid_pending_creation:
+                        tiempo_desde_ultimo = ahora - self._grid_pending_creation[symbol]
+                        if tiempo_desde_ultimo < 60:
+                            print(f"  ⚠️ [V7.1] {symbol} Debounce CREAR_GRID: {tiempo_desde_ultimo:.0f}s < 60s. No se reenvía.")
+                            # No retornamos False para no romper el flujo, solo no enviamos al executor
+                            # El estado ya cambió a NEUTRAL_GRID, eso es correcto
+                        else:
+                            self._grid_pending_creation[symbol] = ahora
+                            # FASE 4: Grid neutral ejecutado por executor, no por simulador async
+                            if hasattr(self, 'executor') and self.executor:
+                                try:
+                                    await self.executor.queue.put({
+                                        'tipo': 'CREAR_GRID',
+                                        'symbol': symbol,
+                                        'direction': 'NEUTRAL',
+                                        'params': grid_params,
+                                        'price': price
+                                    })
+                                    print(f"  [FASE 4] {symbol} Grid NEUTRAL enviado al executor")
+                                except Exception as e:
+                                    print(f"  ⚠️ [FASE 4] Error enviando grid neutral al executor: {e}")
+                    else:
+                        self._grid_pending_creation[symbol] = ahora
+                        # FASE 4: Grid neutral ejecutado por executor, no por simulador async
+                        if hasattr(self, 'executor') and self.executor:
+                            try:
+                                await self.executor.queue.put({
+                                    'tipo': 'CREAR_GRID',
+                                    'symbol': symbol,
+                                    'direction': 'NEUTRAL',
+                                    'params': grid_params,
+                                    'price': price
+                                })
+                                print(f"  [FASE 4] {symbol} Grid NEUTRAL enviado al executor")
+                            except Exception as e:
+                                print(f"  ⚠️ [FASE 4] Error enviando grid neutral al executor: {e}")
 
                     if self.audit_logger:
                         await self.audit_logger.log_cambio_estado(
@@ -998,7 +1031,7 @@ class SignalGenerator:
                 print(f"  [NEUTRAL_GRID] {symbol} Dir {direction} ({state.neutral_grid_dir_consec}/2 velas)")
 
         return entro_neutral_grid
-
+    
     # ═══════════════════════════════════════════════════════════════════════════════
     # CR1 FASE 1: DIRECCIÓN CON FALLBACK PROGRESIVO (desacoplada de 4h)
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -1509,6 +1542,9 @@ class SignalGenerator:
                     state.estado = 'MONITOREO'
                     state.neutral_grid_timestamp = 0
                     state.grid_params_neutral = None
+                    # V7.1 FASE 4: Limpiar debounce al salir de NEUTRAL_GRID
+                    if symbol in self._grid_pending_creation:
+                        del self._grid_pending_creation[symbol]
                     print(f"  [NEUTRAL_GRID] {symbol} -> MONITOREO (aborto emergencia: precio {price_1m:.4f} fuera de grid [{lower:.4f}, {upper:.4f}])")
                     if self.audit_logger:
                         await self.audit_logger.log_cambio_estado(
