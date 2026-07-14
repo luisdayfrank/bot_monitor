@@ -418,6 +418,34 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_fills_order ON fills_tracking(binance_order_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_fills_procesado ON fills_tracking(procesado)")
 
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # CR2: TABLA PARA EVENTOS DE PnL (cada trade genera un evento)
+        # ═══════════════════════════════════════════════════════════════════════════════
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS pnl_eventos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                grid_ejecucion_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                tipo_evento TEXT NOT NULL,
+                side TEXT NOT NULL,
+                binance_trade_id TEXT NOT NULL UNIQUE,
+                binance_order_id TEXT NOT NULL,
+                price REAL NOT NULL,
+                qty REAL NOT NULL,
+                commission REAL NOT NULL,
+                commission_asset TEXT,
+                realized_pnl REAL NOT NULL,
+                notional REAL NOT NULL,
+                timestamp_ms INTEGER NOT NULL,
+                timestamp_local TEXT,
+                procesado INTEGER DEFAULT 1,
+                FOREIGN KEY (grid_ejecucion_id) REFERENCES grid_ejecuciones(id)
+            )
+        """)
+
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_pnl_grid ON pnl_eventos(grid_ejecucion_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_pnl_symbol ON pnl_eventos(symbol)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_pnl_timestamp ON pnl_eventos(timestamp_ms)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_grid_ejec_symbol ON grid_ejecuciones(symbol)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_grid_ejec_estado ON grid_ejecuciones(estado)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_ordenes_client_id ON grid_ejecucion_ordenes(client_order_id)")
@@ -1335,3 +1363,63 @@ async def obtener_ultimo_trade_timestamp(symbol):
         """, (symbol,))
         row = await cursor.fetchone()
         return row[0] if row and row[0] else 0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CR2: FUNCIONES DE ACCESO A EVENTOS DE PnL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def guardar_pnl_evento(grid_ejecucion_id: int, symbol: str, tipo_evento: str,
+                               side: str, binance_trade_id: str, binance_order_id: str,
+                               price: float, qty: float, commission: float,
+                               commission_asset: str, realized_pnl: float,
+                               notional: float, timestamp_ms: int):
+    """Guarda un evento de PnL inmediatamente al procesar un trade."""
+    timestamp_local = datetime.now(get_tz()).isoformat()
+
+    await _execute_with_retry("""
+        INSERT OR IGNORE INTO pnl_eventos
+        (grid_ejecucion_id, symbol, tipo_evento, side, binance_trade_id,
+         binance_order_id, price, qty, commission, commission_asset,
+         realized_pnl, notional, timestamp_ms, timestamp_local)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (grid_ejecucion_id, symbol, tipo_evento, side, binance_trade_id,
+          binance_order_id, price, qty, commission, commission_asset,
+          realized_pnl, notional, timestamp_ms, timestamp_local))
+
+
+async def calcular_pnl_acumulado(grid_ejecucion_id: int) -> dict:
+    """Calcula PnL acumulado desde la base de datos (fuente de verdad)."""
+    db = await _get_db()
+    async with _db_lock:
+        cursor = await db.execute("""
+            SELECT COALESCE(SUM(realized_pnl), 0) as pnl_total,
+                   COALESCE(SUM(commission), 0) as fees_total,
+                   COUNT(*) as total_trades,
+                   SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as trades_ganadores,
+                   SUM(CASE WHEN realized_pnl < 0 THEN 1 ELSE 0 END) as trades_perdedores
+            FROM pnl_eventos
+            WHERE grid_ejecucion_id = ?
+        """, (grid_ejecucion_id,))
+        row = await cursor.fetchone()
+
+        return {
+            'pnl_real': float(row[0]),
+            'fees_real': float(row[1]),
+            'total_trades': int(row[2]),
+            'trades_ganadores': int(row[3]),
+            'trades_perdedores': int(row[4])
+        }
+
+
+async def obtener_pnl_por_tipo(grid_ejecucion_id: int) -> dict:
+    """Desglose de PnL por tipo de evento."""
+    db = await _get_db()
+    async with _db_lock:
+        cursor = await db.execute("""
+            SELECT tipo_evento, COALESCE(SUM(realized_pnl), 0), COUNT(*)
+            FROM pnl_eventos
+            WHERE grid_ejecucion_id = ?
+            GROUP BY tipo_evento
+        """, (grid_ejecucion_id,))
+        rows = await cursor.fetchall()
+        return {row[0]: {'pnl': float(row[1]), 'count': int(row[2])} for row in rows}

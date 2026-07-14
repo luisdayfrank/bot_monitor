@@ -1,9 +1,11 @@
 """
-executor.py — PLAN 6.3 FASES 1-4 + FIXES V7.1
+executor.py — PLAN 6.3 FASES 1-4 + FIXES V7.1 + CR3 CIERRE ATÓMICO + CR2 PnL COMPLETO
 Motor de ejecución real de grids en Binance Futures (Testnet / Real).
 Flujo: recibe mensajes por cola, coloca órdenes LIMIT, trackea fills, maneja aborto.
 Arquitectura: 100% autónomo — lógica operativa interna (PosicionReal + GridState).
 GridSimulator eliminado completamente. No quedan dependencias externas.
+CR3 FIX: Cierre atómico con máquina de estados y verificación de estado real en Binance.
+CR2 FIX: Arquitectura de PnL completa — cada trade persiste realizedPnl en DB.
 """
 
 import asyncio
@@ -20,8 +22,6 @@ from database_v5 import (
     guardar_grid_ejecucion,
     guardar_orden_ejecucion,
     actualizar_orden_fill,
-    cargar_grid_ejecuciones_activos,
-    cargar_ordenes_por_grid,
     actualizar_grid_ejecucion_cierre,
     # CR16: Tracking proactivo de fills
     guardar_fill_tracking,
@@ -31,6 +31,10 @@ from database_v5 import (
     _execute_with_retry,
     _get_db,
     _db_lock,
+    # CR2: Arquitectura de PnL completa
+    guardar_pnl_evento,
+    calcular_pnl_acumulado,
+    obtener_pnl_por_tipo,
 )
 
 
@@ -194,6 +198,87 @@ class GridExecutionState:
         if niveles_sell:
             self.grid_state.niveles_sell = [Decimal(str(n)) for n in niveles_sell]
         self.grid_state.precio_referencia = Decimal(str(self.precio_entrada))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CR3 FIX: MÁQUINA DE ESTADOS DE CIERRE ATÓMICO
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class CierreState:
+    """
+    CR3 FIX: Máquina de estados para el proceso de cierre.
+    Garantiza que cada paso se completa antes de pasar al siguiente.
+    
+    Estados:
+        INICIADO → CANCELANDO_ORDENES → ORDENES_CANCELADAS → CERRANDO_POSICION
+        → POSICION_CERRADA → VERIFICANDO → COMPLETADO
+        
+        En cualquier fallo: REINTENTO → o FALLIDO si se agotan intentos.
+    """
+    
+    ESTADOS = [
+        'INICIADO',
+        'CANCELANDO_ORDENES',
+        'ORDENES_CANCELADAS',
+        'CERRANDO_POSICION',
+        'POSICION_CERRADA',
+        'VERIFICANDO',
+        'COMPLETADO',
+        'FALLIDO'
+    ]
+    
+    def __init__(self, grid_id: int, symbol: str, razon: str, timestamp_inicio: int):
+        self.grid_id = grid_id
+        self.symbol = symbol
+        self.razon = razon
+        self.timestamp_inicio = timestamp_inicio
+        self.estado = 'INICIADO'
+        self.intentos = 0
+        self.MAX_INTENTOS = 5
+        
+        # Tracking de cada paso
+        self.ordenes_canceladas = False
+        self.ordenes_canceladas_count = 0
+        self.ordenes_fallidas = []
+        
+        self.posicion_cerrada = False
+        self.posicion_cierre_order_id = None
+        self.posicion_cierre_qty = 0.0
+        self.posicion_cierre_precio = 0.0
+        
+        self.verificacion_ok = False
+        self.posicion_final = None
+        self.ordenes_restantes = None
+        
+        # Métricas
+        self.timestamp_completado = None
+        self.duracion_total = 0
+
+    def puede_reintentar(self) -> bool:
+        return self.intentos < self.MAX_INTENTOS and self.estado != 'COMPLETADO'
+    
+    def avanzar(self, nuevo_estado: str):
+        if nuevo_estado in self.ESTADOS:
+            self.estado = nuevo_estado
+            print(f"  [CIERRE] {self.symbol} {self.razon} → {nuevo_estado} "
+                  f"(intento {self.intentos + 1}/{self.MAX_INTENTOS})")
+    
+    def fallar(self, detalle: str):
+        self.intentos += 1
+        if self.intentos >= self.MAX_INTENTOS:
+            self.estado = 'FALLIDO'
+            print(f"  🚨 [CIERRE] {self.symbol} {self.razon} → FALLIDO después de "
+                  f"{self.MAX_INTENTOS} intentos: {detalle}")
+        else:
+            print(f"  ⚠️ [CIERRE] {self.symbol} {self.razon} → Reintento "
+                  f"{self.intentos}/{self.MAX_INTENTOS}: {detalle}")
+    
+    def completar(self):
+        self.estado = 'COMPLETADO'
+        self.timestamp_completado = int(time.time())
+        self.duracion_total = self.timestamp_completado - self.timestamp_inicio
+        print(f"  ✅ [CIERRE] {self.symbol} {self.razon} → COMPLETADO en "
+              f"{self.duracion_total}s")
 
 
 class GridExecutor:
@@ -1338,6 +1423,10 @@ class GridExecutor:
                 binance_trade_id=fill['binance_trade_id']
             )
 
+            # CR2 FIX: Procesar PnL del trade
+            tipo_evento = 'FILL_ENTRADA' if orden['tipo_orden'] == 'ENTRY' else 'FILL_SALIDA' if orden['tipo_orden'] == 'TAKE_PROFIT' else 'FILL_DESCONOCIDO'
+            await self._procesar_trade_con_pnl(state, fill, tipo_evento)
+
             # Actualizar orden en DB
             await actualizar_orden_fill(
                 orden_id=orden['id'],
@@ -1467,6 +1556,7 @@ class GridExecutor:
         3. Monitoreo reactivo de órdenes abiertas (detecta cambios de estado)
         4. Evaluar kill switch
         5. Reconciliar con Binance
+        6. Reconciliar PnL con DB
         """
         state = self._grids[symbol]
 
@@ -1510,6 +1600,11 @@ class GridExecutor:
         # PASO 5: RECONCILIACIÓN
         # ═══════════════════════════════════════════════════════════════════
         await self._reconciliar_con_binance(state)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # CR2 PASO 6: RECONCILIAR PnL CON DB
+        # ═══════════════════════════════════════════════════════════════════
+        await self._reconciliar_pnl(state)
 
 
     async def _reconciliar_con_binance(self, state: GridExecutionState):
@@ -1621,6 +1716,94 @@ class GridExecutor:
               f"Fills totales: {total_fills} | "
               f"Procesados: {fills_procesados} | "
               f"Pendientes: {total_fills - fills_procesados}")
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # CR2 FIX: PROCESAR TRADE CON PnL Y RECONCILIACIÓN
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    async def _procesar_trade_con_pnl(self, state: GridExecutionState, trade: dict,
+                                        tipo_evento: str) -> dict:
+        """
+        CR2 FIX: Procesa un trade de Binance extrayendo y persistiendo el PnL real.
+        Cada trade genera un evento de PnL que se persiste inmediatamente en DB.
+        """
+        price = float(trade['price'])
+        qty = float(trade['qty'])
+        commission = float(trade['commission'])
+        realized_pnl = float(trade.get('realizedPnl', 0))
+        notional = price * qty
+
+        # Persistir inmediatamente en DB (fuente de verdad)
+        await guardar_pnl_evento(
+            grid_ejecucion_id=state.grid_id,
+            symbol=state.symbol,
+            tipo_evento=tipo_evento,
+            side=trade['side'],
+            binance_trade_id=trade['id'],
+            binance_order_id=str(trade['orderId']),
+            price=price,
+            qty=qty,
+            commission=commission,
+            commission_asset=trade.get('commissionAsset', ''),
+            realized_pnl=realized_pnl,
+            notional=notional,
+            timestamp_ms=trade['time']
+        )
+
+        # Actualizar estado en RAM (para respuesta rápida)
+        state.fees_real += Decimal(str(commission))
+
+        # El realized_pnl solo se suma al estado si es un evento de cierre
+        # (Las entradas tienen realized_pnl = 0, los cierres tienen el PnL real)
+        if realized_pnl != 0:
+            state.pnl_real += Decimal(str(realized_pnl))
+            print(f"  [PnL] {state.symbol} {tipo_evento} | "
+                  f"Realized PnL: {realized_pnl:+.4f} | "
+                  f"Commission: {commission:.4f} | "
+                  f"Trade: {trade['id']}")
+
+        return {
+            'realized_pnl': realized_pnl,
+            'commission': commission,
+            'notional': notional
+        }
+
+    async def _reconciliar_pnl(self, state: GridExecutionState):
+        """
+        CR2 FIX: Reconcilia el PnL en RAM con la base de datos (fuente de verdad).
+        Detecta discrepancias y corrige el estado interno.
+        """
+        if not state.grid_state:
+            return
+
+        # Calcular PnL desde DB (fuente de verdad)
+        pnl_db = await calcular_pnl_acumulado(state.grid_id)
+
+        pnl_db_val = Decimal(str(pnl_db['pnl_real']))
+        fees_db_val = Decimal(str(pnl_db['fees_real']))
+
+        pnl_ram = state.pnl_real
+        fees_ram = state.fees_real
+
+        # Detectar discrepancia
+        discrepancia_pnl = abs(pnl_db_val - pnl_ram)
+        discrepancia_fees = abs(fees_db_val - fees_ram)
+
+        if discrepancia_pnl > Decimal('0.0001') or discrepancia_fees > Decimal('0.0001'):
+            print(f"  🚨 [PnL RECONCILIACIÓN] {state.symbol} Discrepancia detectada:")
+            print(f"     PnL RAM: {float(pnl_ram):.4f} | DB: {float(pnl_db_val):.4f} | Diff: {float(discrepancia_pnl):.4f}")
+            print(f"     Fees RAM: {float(fees_ram):.4f} | DB: {float(fees_db_val):.4f} | Diff: {float(discrepancia_fees):.4f}")
+
+            # Corregir: DB gana
+            state.pnl_real = pnl_db_val
+            state.fees_real = fees_db_val
+
+            print(f"  ✅ [PnL RECONCILIACIÓN] {state.symbol} Estado corregido desde DB")
+
+        # Actualizar GridState con PnL reconciliado
+        state.grid_state.pnl_bruto = pnl_db_val + fees_db_val
+        state.grid_state.pnl_neto = pnl_db_val
+        state.grid_state.fees_totales = fees_db_val
 
     async def _colocar_take_profit(self, symbol: str, state: GridExecutionState,
                                     orden_entry: dict):
@@ -1742,8 +1925,20 @@ class GridExecutor:
     async def _ejecutar_kill_switch_real(self, symbol: str, state: GridExecutionState,
                                           pos_id: str, pos_tipo: str, qty: float, 
                                           razon: str, binance_order_id: str = None):
-        """Ejecuta el cierre real de una posición identificada por el executor."""
-        print(f"  🛑 [EXECUTOR] Kill Switch {pos_tipo} {pos_id} | Razón: {razon}")
+        """
+        CR3 FIX: Kill switch que garantiza cierre completo.
+        
+        Si la razón implica cierre total del grid, delega al proceso atómico.
+        Si es cierre de posición individual, ejecuta MARKET con verificación.
+        """
+        # Si es cierre total del grid, usar el proceso atómico
+        if razon in ('grid_completo', 'aborto_manual', 'limite_perdida_diaria', 
+                     'grid_incompleto_batch_rechazado', 'recuperacion_post_crash_ya_terminado'):
+            print(f"  🛑 [CIERRE] Kill Switch delega a cierre atómico | Razón: {razon}")
+            await self._abortar_grid(symbol, razon)
+            return
+        
+        print(f"  🛑 [CIERRE] Kill Switch {pos_tipo} {pos_id} | Razón: {razon}")
 
         # FASE 3: Cancelar take-profit de la posición ANTES de cerrar
         if state.grid_state:
@@ -1754,9 +1949,9 @@ class GridExecutor:
                             self.client.futures_cancel_order,
                             symbol=symbol, orderId=pos.orden_cierre_id
                         ))
-                        print(f"  [EXECUTOR] TP {pos.orden_cierre_id} cancelado antes de kill switch")
+                        print(f"  [CIERRE] TP {pos.orden_cierre_id} cancelado antes de kill switch")
                     except Exception as e:
-                        print(f"  ⚠️ [EXECUTOR] Error cancelando TP: {e}")
+                        print(f"  ⚠️ [CIERRE] Error cancelando TP: {e}")
                     break
 
         # Cerrar con MARKET order (reduceOnly)
@@ -1770,7 +1965,7 @@ class GridExecutor:
                 quantity=float(qty), reduceOnly=True
             ))
             order_id = str(res.get('orderId', ''))
-            print(f"  ✅ [EXECUTOR] Kill Switch ejecutado: {side_cierre} {qty} | Order:{order_id}")
+            print(f"  ✅ [CIERRE] Kill Switch ejecutado: {side_cierre} {qty} | Order:{order_id}")
 
             # Esperar propagación del fill
             await asyncio.sleep(0.3)
@@ -1782,6 +1977,10 @@ class GridExecutor:
                     symbol=symbol, orderId=order_id
                 ))
                 if trades:
+                    # CR2 FIX: Procesar cada trade con PnL
+                    for trade in trades:
+                        await self._procesar_trade_con_pnl(state, trade, 'KILL_SWITCH')
+
                     total_qty = sum(float(t['qty']) for t in trades)
                     avg_price = sum(float(t['price']) * float(t['qty']) for t in trades) / total_qty if total_qty > 0 else 0
                     total_commission = sum(float(t['commission']) for t in trades)
@@ -1796,158 +1995,423 @@ class GridExecutor:
                         binance_order_id=order_id
                     )
 
-                    # Actualizar estado del executor (compatibilidad)
-                    state.pnl_real += Decimal(str(total_realized_pnl))
-                    state.fees_real += Decimal(str(total_commission))
+                    # CR2: PnL y fees ya actualizados por _procesar_trade_con_pnl
 
-                    print(f"  [EXECUTOR] Pos {pos_id} cerrada @ ${avg_price:.4f} | "
+                    print(f"  [CIERRE] Pos {pos_id} cerrada @ ${avg_price:.4f} | "
                           f"PnL:{total_realized_pnl:+.4f} | Fee:{total_commission:.4f}")
+                else:
+                    print(f"  🚨 [CIERRE] Kill Switch sin trades confirmados — posible huérfana")
+                    # CR3: Si no hay trades, verificar con el proceso atómico
+                    await self._abortar_grid(symbol, f"kill_switch_sin_trades:{pos_id}")
+                    return
 
         except Exception as e:
-            print(f"  ❌ [EXECUTOR] Kill Switch falló: {e}")
-            
+            print(f"  ❌ [CIERRE] Kill Switch falló: {e}")
+            # CR3: Si falla el kill switch individual, forzar cierre completo del grid
+            await self._abortar_grid(symbol, f"kill_switch_fallido:{e}")
+
     # ═══════════════════════════════════════════════════════════════════════════════
-    # ABORTO SEGURO
+    # CR3 FIX: CIERRE ATÓMICO CON MÁQUINA DE ESTADOS
     # ═══════════════════════════════════════════════════════════════════════════════
 
     async def _abortar_grid(self, symbol: str, razon: str):
-        """Aborta un grid: cancela órdenes, cierra posiciones, resumen con lógica interna."""
+        """
+        CR3 FIX: Cierre atómico con máquina de estados y verificación.
+        
+        Flujo garantizado:
+        1. Cancelar TODAS las órdenes abiertas (con verificación loop)
+        2. Cerrar posición con MARKET (con verificación de fill)
+        3. Verificar que posición = 0 en Binance
+        4. Verificar que no quedan órdenes abiertas
+        5. Solo entonces: actualizar estado interno y DB
+        """
         if symbol not in self._grids:
             return
 
         state = self._grids[symbol]
         if state.cerrando:
+            print(f"  [CIERRE] {symbol} Ya está en proceso de cierre")
             return
 
         state.cerrando = True
-        print(f"  🛑 [EXECUTOR] {symbol} Abortando grid... Razón: {razon}")
+        
+        # CR3: Crear máquina de estados del cierre
+        cierre = CierreState(
+            grid_id=state.grid_id,
+            symbol=symbol,
+            razon=razon,
+            timestamp_inicio=int(time.time())
+        )
+        
+        print(f"  🛑 [CIERRE] {symbol} Iniciando cierre atómico... Razón: {razon}")
 
-        # 1. Cancelar TODAS las órdenes abiertas
-        for intento_cancel in range(3):
+        try:
+            # ═══════════════════════════════════════════════════════════════════
+            # PASO 1: CANCELAR ÓRDENES ABIERTAS (con verificación loop)
+            # ═══════════════════════════════════════════════════════════════════
+            await self._paso_cancelar_ordenes(state, cierre)
+            
+            if cierre.estado == 'FALLIDO':
+                await self._manejar_cierre_fallido(state, cierre)
+                return
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # PASO 2: CERRAR POSICIÓN CON MARKET (con verificación de fill)
+            # ═══════════════════════════════════════════════════════════════════
+            await self._paso_cerrar_posicion(state, cierre)
+            
+            if cierre.estado == 'FALLIDO':
+                await self._manejar_cierre_fallido(state, cierre)
+                return
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # PASO 3: VERIFICAR POSICIÓN = 0 (loop con timeout)
+            # ═══════════════════════════════════════════════════════════════════
+            await self._paso_verificar_posicion(state, cierre)
+            
+            if cierre.estado == 'FALLIDO':
+                await self._manejar_cierre_fallido(state, cierre)
+                return
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # PASO 4: VERIFICAR SIN ÓRDENES ABIERTAS
+            # ═══════════════════════════════════════════════════════════════════
+            await self._paso_verificar_ordenes(state, cierre)
+            
+            if cierre.estado == 'FALLIDO':
+                await self._manejar_cierre_fallido(state, cierre)
+                return
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # PASO 5: COMPLETAR CIERRE (solo si todo verificado)
+            # ═══════════════════════════════════════════════════════════════════
+            await self._paso_completar_cierre(state, cierre)
+            
+        except Exception as e:
+            print(f"  🚨 [CIERRE] {symbol} Error inesperado: {e}")
+            cierre.fallar(f"Excepción: {e}")
+            await self._manejar_cierre_fallido(state, cierre)
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # CR3: PASOS DEL CIERRE ATÓMICO
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    async def _paso_cancelar_ordenes(self, state: GridExecutionState, cierre: CierreState):
+        """Cancela todas las órdenes y verifica que no queden pendientes."""
+        cierre.avanzar('CANCELANDO_ORDENES')
+        
+        while cierre.puede_reintentar():
             try:
+                # Cancelar todas las órdenes abiertas
                 await self._api_call(asyncio.to_thread(
-                    self.client.futures_cancel_all_open_orders, symbol=symbol
+                    self.client.futures_cancel_all_open_orders,
+                    symbol=cierre.symbol
                 ))
-                await asyncio.sleep(0.5)
-                open_orders_check = await self._api_call(asyncio.to_thread(
-                    self.client.futures_get_open_orders, symbol=symbol
+                
+                await asyncio.sleep(0.5)  # Esperar propagación
+                
+                # Verificar que no quedan órdenes
+                open_orders = await self._api_call(asyncio.to_thread(
+                    self.client.futures_get_open_orders,
+                    symbol=cierre.symbol
                 ))
-                if not open_orders_check:
-                    print(f"  ✅ [EXECUTOR] {symbol} Órdenes canceladas (0 pendientes)")
-                    break
-                else:
-                    ids_pendientes = [o['orderId'] for o in open_orders_check]
-                    print(f"  ⚠️ [EXECUTOR] {symbol} Quedan {len(open_orders_check)} órdenes: {ids_pendientes}")
-                    if intento_cancel == 2:
-                        for o in open_orders_check:
-                            try:
-                                await self._api_call(asyncio.to_thread(
-                                    self.client.futures_cancel_order,
-                                    symbol=symbol, orderId=o['orderId']
-                                ))
-                            except Exception as e_one:
-                                print(f"  ❌ [EXECUTOR] No se pudo cancelar orden {o['orderId']}: {e_one}")
+                
+                cierre.ordenes_restantes = len(open_orders)
+                
+                if not open_orders:
+                    cierre.ordenes_canceladas = True
+                    cierre.avanzar('ORDENES_CANCELADAS')
+                    print(f"  ✅ [CIERRE] {cierre.symbol} Órdenes canceladas (0 pendientes)")
+                    return
+                
+                # Si quedan órdenes, intentar cancelar una por una
+                cierre.ordenes_fallidas = [o['orderId'] for o in open_orders]
+                print(f"  ⚠️ [CIERRE] {cierre.symbol} Quedan {len(open_orders)} órdenes: {cierre.ordenes_fallidas}")
+                
+                for o in open_orders:
+                    try:
+                        await self._api_call(asyncio.to_thread(
+                            self.client.futures_cancel_order,
+                            symbol=cierre.symbol,
+                            orderId=o['orderId']
+                        ))
+                        cierre.ordenes_canceladas_count += 1
+                    except Exception as e_one:
+                        print(f"  ❌ [CIERRE] No se pudo cancelar orden {o['orderId']}: {e_one}")
+                
+                cierre.fallar(f"{len(open_orders)} órdenes persisten")
+                await asyncio.sleep(1)  # Esperar antes de reintentar
+                
             except Exception as e:
-                print(f"  ❌ [EXECUTOR] {symbol} Error cancelando órdenes: {e}")
+                cierre.fallar(f"Error cancelando órdenes: {e}")
+        
+        # Si llegamos aquí, agotamos reintentos
+        cierre.avanzar('FALLIDO')
 
-        # 2. Esperar propagación
-        await asyncio.sleep(0.5)
+    async def _paso_cerrar_posicion(self, state: GridExecutionState, cierre: CierreState):
+        """Cierra la posición con MARKET y verifica el fill."""
+        cierre.avanzar('CERRANDO_POSICION')
+        
+        while cierre.puede_reintentar():
+            try:
+                # Consultar posición actual
+                position = await self._api_call(asyncio.to_thread(
+                    self.client.futures_position_information,
+                    symbol=cierre.symbol
+                ))
+                
+                if not position or len(position) == 0:
+                    cierre.posicion_cerrada = True
+                    print(f"  ✅ [CIERRE] {cierre.symbol} Sin posición que cerrar")
+                    cierre.avanzar('POSICION_CERRADA')
+                    return
+                
+                pos_amt = Decimal(str(position[0].get('positionAmt', 0)))
+                
+                if abs(pos_amt) < Decimal('0.0001'):
+                    cierre.posicion_cerrada = True
+                    print(f"  ✅ [CIERRE] {cierre.symbol} Posición ya es 0")
+                    cierre.avanzar('POSICION_CERRADA')
+                    return
+                
+                # Calcular lado y cantidad
+                side = 'SELL' if pos_amt > 0 else 'BUY'
+                qty = float(abs(pos_amt))
+                
+                # Enviar orden MARKET con reduceOnly
+                res_cierre = await self._api_call(asyncio.to_thread(
+                    self.client.futures_create_order,
+                    symbol=cierre.symbol,
+                    side=side,
+                    type='MARKET',
+                    quantity=qty,
+                    reduceOnly=True
+                ))
+                
+                cierre.posicion_cierre_order_id = str(res_cierre.get('orderId', ''))
+                cierre.posicion_cierre_qty = qty
+                
+                print(f"  ✅ [CIERRE] {cierre.symbol} Orden MARKET enviada: "
+                      f"{side} {qty} | Order: {cierre.posicion_cierre_order_id}")
+                
+                # Esperar y verificar fill
+                await asyncio.sleep(0.5)
+                
+                # Consultar trades de esta orden
+                if cierre.posicion_cierre_order_id:
+                    trades = await self._api_call(asyncio.to_thread(
+                        self.client.futures_account_trades,
+                        symbol=cierre.symbol,
+                        orderId=cierre.posicion_cierre_order_id
+                    ))
 
-        # ═══════════════════════════════════════════════════════════════════════════════
-        # FASE 3: Cerrar GridState propio (reemplaza grid_sim.close_sim_state)
-        # ═══════════════════════════════════════════════════════════════════════════════
-        precio_actual = self.precios_vivo.get(symbol, 0)
+                    if trades:
+                        # CR2 FIX: Procesar cada trade con PnL
+                        for trade in trades:
+                            await self._procesar_trade_con_pnl(state, trade, 'ABORTO')
+
+                        total_qty = sum(float(t['qty']) for t in trades)
+                        avg_price = sum(float(t['price']) * float(t['qty']) for t in trades) / total_qty if total_qty > 0 else 0
+                        total_commission = sum(float(t['commission']) for t in trades)
+                        total_pnl = sum(float(t.get('realizedPnl', 0)) for t in trades)
+
+                        cierre.posicion_cierre_precio = avg_price
+                        # CR2: PnL y fees ya actualizados por _procesar_trade_con_pnl
+
+                        print(f"  ✅ [CIERRE] {cierre.symbol} Posición cerrada @ ${avg_price:.4f} | "
+                              f"PnL: {total_pnl:+.4f} | Fee: {total_commission:.4f}")
+
+                        cierre.posicion_cerrada = True
+                        cierre.avanzar('POSICION_CERRADA')
+                        return
+                    else:
+                        cierre.fallar("Orden MARKET enviada pero sin trades confirmados")
+                else:
+                    cierre.fallar("No se obtuvo orderId del cierre")
+                    
+            except Exception as e:
+                cierre.fallar(f"Error cerrando posición: {e}")
+        
+        cierre.avanzar('FALLIDO')
+
+    async def _paso_verificar_posicion(self, state: GridExecutionState, cierre: CierreState):
+        """Verifica que la posición real en Binance sea 0."""
+        cierre.avanzar('VERIFICANDO')
+        
+        max_verificaciones = 25  # 5 segundos máximo (0.2s * 25)
+        
+        for i in range(max_verificaciones):
+            await asyncio.sleep(0.2)
+            
+            try:
+                position = await self._api_call(asyncio.to_thread(
+                    self.client.futures_position_information,
+                    symbol=cierre.symbol
+                ))
+                
+                if not position or len(position) == 0:
+                    cierre.verificacion_ok = True
+                    cierre.posicion_final = 0
+                    print(f"  ✅ [CIERRE] {cierre.symbol} Posición verificada: 0")
+                    return
+                
+                pos_amt_check = Decimal(str(position[0].get('positionAmt', 0)))
+                cierre.posicion_final = float(pos_amt_check)
+                
+                if abs(pos_amt_check) < Decimal('0.0001'):
+                    cierre.verificacion_ok = True
+                    print(f"  ✅ [CIERRE] {cierre.symbol} Posición confirmada en 0 "
+                          f"({i+1}/{max_verificaciones} intentos)")
+                    return
+                
+                # Si aún hay posición, reintentar cierre
+                if i == max_verificaciones - 1:
+                    cierre.fallar(f"Posición persistente: {float(pos_amt_check):.4f}")
+                    cierre.avanzar('FALLIDO')
+                    return
+                
+            except Exception as e:
+                if i == max_verificaciones - 1:
+                    cierre.fallar(f"Error verificando posición: {e}")
+                    cierre.avanzar('FALLIDO')
+                    return
+        
+        cierre.avanzar('FALLIDO')
+
+    async def _paso_verificar_ordenes(self, state: GridExecutionState, cierre: CierreState):
+        """Verifica que no queden órdenes abiertas."""
+        try:
+            open_orders = await self._api_call(asyncio.to_thread(
+                self.client.futures_get_open_orders,
+                symbol=cierre.symbol
+            ))
+            
+            if open_orders:
+                # Órdenes fantasmas detectadas
+                ids_fantasmas = [o['orderId'] for o in open_orders]
+                print(f"  🚨 [CIERRE] {cierre.symbol} ÓRDENES FANTASMAS detectadas: {ids_fantasmas}")
+                
+                # Intentar cancelar de nuevo
+                for o in open_orders:
+                    try:
+                        await self._api_call(asyncio.to_thread(
+                            self.client.futures_cancel_order,
+                            symbol=cierre.symbol,
+                            orderId=o['orderId']
+                        ))
+                    except Exception:
+                        pass
+                
+                cierre.fallar(f"Órdenes fantasmas: {ids_fantasmas}")
+                cierre.avanzar('FALLIDO')
+                return
+            
+            print(f"  ✅ [CIERRE] {cierre.symbol} Sin órdenes abiertas confirmado")
+            
+        except Exception as e:
+            cierre.fallar(f"Error verificando órdenes: {e}")
+            cierre.avanzar('FALLIDO')
+            return
+
+    async def _paso_completar_cierre(self, state: GridExecutionState, cierre: CierreState):
+        """Completa el cierre solo si todas las verificaciones pasaron."""
+        
+        # Cerrar GridState interno
+        precio_actual = self.precios_vivo.get(cierre.symbol, 0)
         if state.grid_state and precio_actual > 0:
             resumen = self._cerrar_grid_total(state, precio_actual)
+            
             pnl_real = float(state.pnl_real)
             pnl_interno = resumen.get('pnl_neto', 0)
             
-            print(f"  [EXECUTOR] Resumen grid: PnL Real={pnl_real:+.4f} | Interno={pnl_interno:+.4f}")
-
+            print(f"  [CIERRE] {cierre.symbol} Resumen: PnL Real={pnl_real:+.4f} | "
+                  f"Interno={pnl_interno:+.4f}")
+            
+            # Notificar
             if self.notifier:
                 try:
                     await self.notifier.enviar_telegram(
-                        f"🏁 <b>Grid Cerrado — {symbol}</b>\n"
-                        f"Razón: {razon}\n"
-                        f"📊 <b>Real (Binance):</b> {pnl_real:+.4f} USDT\n"
-                        f"🤖 <b>Interno:</b> {pnl_interno:+.4f} USDT\n"
+                        f"🏁 <b>Grid Cerrado — {cierre.symbol}</b>\\n"
+                        f"Razón: {cierre.razon}\\n"
+                        f"📊 <b>Real (Binance):</b> {pnl_real:+.4f} USDT\\n"
+                        f"🤖 <b>Interno:</b> {pnl_interno:+.4f} USDT\\n"
                         f"Trades: {resumen.get('trades_completados', 0)} | "
                         f"KS: {resumen.get('trades_kill_switch', 0)} | "
-                        f"Forzadas: {resumen.get('posiciones_forzadas', 0)}"
+                        f"Duración: {cierre.duracion_total}s"
                     )
                 except Exception as e:
-                    print(f"  ⚠️ [EXECUTOR] Error notificando cierre: {e}")
-        # ═══════════════════════════════════════════════════════════════════════════════
-
-        # 3. Consultar y cerrar posición restante en Binance
-        orden_cierre_id = None
-        try:
-            position = await self._api_call(asyncio.to_thread(
-                self.client.futures_position_information, symbol=symbol
-            ))
-
-            if position and len(position) > 0:
-                pos_amt = Decimal(str(position[0].get('positionAmt', 0)))
-                if abs(pos_amt) > 0:
-                    side = 'SELL' if pos_amt > 0 else 'BUY'
-                    res_cierre = await self._api_call(asyncio.to_thread(
-                        self.client.futures_create_order,
-                        symbol=symbol, side=side, type='MARKET',
-                        quantity=float(abs(pos_amt)), reduceOnly=True
-                    ))
-                    orden_cierre_id = str(res_cierre.get('orderId', ''))
-                    print(f"  ✅ [EXECUTOR] {symbol} Posición cerrada: {float(pos_amt)} | Order: {orden_cierre_id}")
-
-                    # Capturar realizedPnl del cierre
-                    await asyncio.sleep(0.5)
-                    if orden_cierre_id:
-                        trades_cierre = await self._api_call(asyncio.to_thread(
-                            self.client.futures_account_trades,
-                            symbol=symbol, orderId=orden_cierre_id
-                        ))
-                        for trade in trades_cierre:
-                            pnl_trade = Decimal(str(trade.get('realizedPnl', 0)))
-                            comm_trade = Decimal(str(trade.get('commission', 0)))
-                            if pnl_trade != 0 or comm_trade != 0:
-                                state.pnl_real += pnl_trade
-                                state.fees_real += comm_trade
-                                print(f"  [EXECUTOR] {symbol} Cierre trade | PnL: {float(pnl_trade):+.4f} | Fee: {float(comm_trade):.4f}")
-        except Exception as e:
-            print(f"  ❌ [EXECUTOR] {symbol} Error cerrando posición: {e}")
-
-        # 4. Verificar que la posición sea 0
-        for _ in range(25):
-            await asyncio.sleep(0.2)
-            try:
-                position = await self._api_call(asyncio.to_thread(
-                    self.client.futures_position_information, symbol=symbol
-                ))
-                if not position or len(position) == 0:
-                    break
-                pos_amt_check = Decimal(str(position[0].get('positionAmt', 0)))
-                if abs(pos_amt_check) < Decimal('0.0001'):
-                    print(f"  ✅ [EXECUTOR] {symbol} Posición confirmada en 0")
-                    break
-            except Exception as e:
-                print(f"  ⚠️ [EXECUTOR] {symbol} Error verificando posición: {e}")
-                break
-
-        # 5. Calcular PnL final y guardar en DB
+                    print(f"  ⚠️ [CIERRE] Error notificando: {e}")
+        
+        # Guardar en DB
         pnl_final = float(state.pnl_real)
         fees_final = float(state.fees_real)
-
+        
         await actualizar_grid_ejecucion_cierre(
             grid_id=state.grid_id,
             estado='CERRADO',
             pnl_real=pnl_final,
             fees_real=fees_final,
-            razon_cierre=razon
+            razon_cierre=cierre.razon
         )
-
+        
+        # Guardar métricas del cierre
+        await self._guardar_metricas_cierre(cierre)
+        
+        # Limpiar estado
         state.activa = False
-        del self._grids[symbol]
+        if cierre.symbol in self._grids:
+            del self._grids[cierre.symbol]
+        
+        cierre.completar()
 
-        print(f"  ✅ [EXECUTOR] {symbol} Grid cerrado | PnL:{pnl_final:+.4f} | Fees:{fees_final:.4f}")
+    async def _manejar_cierre_fallido(self, state: GridExecutionState, cierre: CierreState):
+        """Maneja un cierre que no pudo completarse."""
+        
+        print(f"  🚨 [CIERRE] {cierre.symbol} CIERRE FALLIDO — Estado: {cierre.estado}")
+        
+        # Alerta crítica
+        if self.notifier:
+            try:
+                await self.notifier.enviar_telegram(
+                    f"🚨 <b>CIERRE FALLIDO — {cierre.symbol}</b>\\n"
+                    f"Razón original: {cierre.razon}\\n"
+                    f"Estado final: {cierre.estado}\\n"
+                    f"Intentos: {cierre.intentos}/{cierre.MAX_INTENTOS}\\n"
+                    f"Órdenes restantes: {cierre.ordenes_restantes or 'N/A'}\\n"
+                    f"Posición final: {cierre.posicion_final or 'N/A'}\\n\\n"
+                    f"<b>⚠️ INTERVENCIÓN MANUAL REQUERIDA</b>\\n"
+                    f"Verificar en Binance: posición y órdenes abiertas."
+                )
+            except Exception as e:
+                print(f"  ⚠️ Error enviando alerta: {e}")
+        
+        # Marcar en DB como FALLIDO para seguimiento
+        await actualizar_grid_ejecucion_cierre(
+            grid_id=state.grid_id,
+            estado='CIERRE_FALLIDO',
+            pnl_real=float(state.pnl_real),
+            fees_real=float(state.fees_real),
+            razon_cierre=f"{cierre.razon} | FALLIDO: {cierre.estado}"
+        )
+        
+        # NO eliminar del diccionario para mantener referencia
+        # state.activa = False  # ← NO, mantener para investigación
+        state.cerrando = False  # Permitir reintentar manualmente
+        
+        print(f"  [CIERRE] {cierre.symbol} Grid marcado como CIERRE_FALLIDO. "
+              f"NO se eliminó de memoria para investigación.")
+
+    async def _guardar_metricas_cierre(self, cierre: CierreState):
+        """Guarda métricas del proceso de cierre para análisis posterior."""
+        print(f"  [CIERRE METRICS] {cierre.symbol}: "
+              f"Duración={cierre.duracion_total}s | "
+              f"Intentos={cierre.intentos} | "
+              f"Órdenes canceladas={cierre.ordenes_canceladas_count} | "
+              f"Posición cerrada={cierre.posicion_cerrada}")
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 3 PLAN 6.3: LÍMITE DE PÉRDIDA DIARIA
+    # ═══════════════════════════════════════════════════════════════════════════════
 
     async def _verificar_limite_perdida(self):
         """FASE 3: Aborta todos los grids si el PnL diario (cerrado + activo) supera el límite."""
@@ -1981,9 +2445,9 @@ class GridExecutor:
                 if self.notifier:
                     try:
                         await self.notifier.enviar_telegram(
-                            f"🛑 <b>LÍMITE DE PÉRDIDA DIARIO ALCANZADO</b>\n"
-                            f"PnL total: <code>{pnl_total:.4f} USDT</code>\n"
-                            f"(Cerrado: {pnl_cerrado:.4f} | Activo: {pnl_activo:.4f})\n"
+                            f"🛑 <b>LÍMITE DE PÉRDIDA DIARIO ALCANZADO</b>\\n"
+                            f"PnL total: <code>{pnl_total:.4f} USDT</code>\\n"
+                            f"(Cerrado: {pnl_cerrado:.4f} | Activo: {pnl_activo:.4f})\\n"
                             f"Abortando todos los grids activos..."
                         )
                     except Exception as e:
@@ -1996,11 +2460,11 @@ class GridExecutor:
             print(f"  ⚠️ [EXECUTOR] Error verificando límite de pérdida: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════════════
-    # RECUPERACIÓN POST-CRASH
+    # CR3 FIX: RECUPERACIÓN POST-CRASH CON VERIFICACIÓN
     # ═══════════════════════════════════════════════════════════════════════════════
 
     async def _recuperar_grids_activos(self):
-        """Al arrancar: recupera grids que quedaron activos en DB."""
+        """CR3 FIX: Recuperar con verificación de que el grid sigue coherente."""
         grids_db = await cargar_grid_ejecuciones_activos()
         if not grids_db:
             print("  [EXECUTOR] No hay grids activos para recuperar")
@@ -2011,16 +2475,37 @@ class GridExecutor:
             print(f"  [EXECUTOR] Recuperando grid {symbol} (ID:{grid['id']})...")
 
             try:
+                # CR3: Verificar si el grid sigue activo en Binance
+                position = await self._api_call(asyncio.to_thread(
+                    self.client.futures_position_information,
+                    symbol=symbol
+                ))
+                
+                open_orders = await self._api_call(asyncio.to_thread(
+                    self.client.futures_get_open_orders,
+                    symbol=symbol
+                ))
+                
+                pos_amt = Decimal(str(position[0].get('positionAmt', 0))) if position else Decimal('0')
+                tiene_posicion = abs(pos_amt) > Decimal('0.0001')
+                tiene_ordenes = len(open_orders) > 0
+                
+                if not tiene_posicion and not tiene_ordenes:
+                    # Grid ya terminó naturalmente, marcar como cerrado
+                    print(f"  [EXECUTOR] {symbol} Grid ya terminado (pos 0, sin órdenes). Marcando CERRADO.")
+                    await actualizar_grid_ejecucion_cierre(
+                        grid_id=grid['id'],
+                        estado='CERRADO',
+                        pnl_real=0,
+                        fees_real=0,
+                        razon_cierre='recuperacion_post_crash_ya_terminado'
+                    )
+                    continue
+                
                 # Reconstruir parámetros desde JSON
                 params = json.loads(grid['grid_params_json']) if grid.get('grid_params_json') else {}
                 niveles = params.get('niveles', [])
                 qty = params.get('qty_por_orden', 0)
-
-                open_orders = await self._api_call(asyncio.to_thread(
-                    self.client.futures_get_open_orders, symbol=symbol
-                ))
-
-                db_ordenes = await cargar_ordenes_por_grid(grid['id'])
 
                 # Reconstruir estado
                 state = GridExecutionState(
@@ -2045,33 +2530,17 @@ class GridExecutor:
                     except Exception as e:
                         print(f"  ⚠️ [EXECUTOR] {symbol} Error reconstruyendo grid_state: {e}")
                 
-                # Consultar posición actual en Binance para este símbolo
-                position = await self._api_call(asyncio.to_thread(
-                    self.client.futures_position_information, symbol=symbol
-                ))
-                if position and len(position) > 0:
-                    pos_amt = Decimal(str(position[0].get('positionAmt', 0)))
-                    state.posicion_neta = pos_amt
-                    print(f"  [EXECUTOR] {symbol} Posición recuperada: {float(pos_amt):.4f}")
+                # Sincronizar posición real
+                state.posicion_neta = pos_amt
+                print(f"  [EXECUTOR] {symbol} Posición recuperada: {float(pos_amt):.4f}")
 
+                db_ordenes = await cargar_ordenes_por_grid(grid['id'])
                 for orden in db_ordenes:
                     if orden['status'] == 'NEW':
                         vivo = any(str(o['orderId']) == orden['binance_order_id']
                                   for o in open_orders)
                         if vivo:
                             state.ordenes[orden['client_order_id']] = orden
-
-                # Si posición 0 y sin órdenes abiertas, el grid ya terminó
-                if float(state.posicion_neta) == 0 and not open_orders:
-                    print(f"  [EXECUTOR] {symbol} Grid ya estaba terminado (pos 0, sin órdenes). Marcando CERRADO.")
-                    await actualizar_grid_ejecucion_cierre(
-                        grid_id=grid['id'],
-                        estado='CERRADO',
-                        pnl_real=0,
-                        fees_real=0,
-                        razon_cierre='recuperacion_post_crash_ya_terminado'
-                    )
-                    continue
 
                 self._grids[symbol] = state
                 self._symbol_leverage[symbol] = grid['apalancamiento_usado']
