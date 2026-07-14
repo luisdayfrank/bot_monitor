@@ -54,7 +54,7 @@ class Config(BaseModel):
     # Lista completa: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
     # ───────────────────────────────────────────────────────────────────────────────
     timezone: str = "America/Caracas"  # UTC-4, sin horario de verano
-    grid_direccional_timeout_min = 120  # 2 horas default
+    grid_direccional_timeout_min: int = 120  # 2 horas default
     # --- PLAN 3.1: Parametros globales (fallbacks) ---
     adx_reject_global: float = 55.0          # Fallback si no hay registry
 
