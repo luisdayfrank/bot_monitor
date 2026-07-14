@@ -1163,6 +1163,10 @@ class GridExecutor:
             steps = int(qty_raw / step_size)
             qty = float(steps * step_size)
 
+            # FASE 2: Persistir niveles reales y qty en params para recuperación post-crash
+            params['niveles'] = [float(n) for n in niveles]
+            params['qty_por_orden'] = qty
+
             # 5. Guardar grid en SQLite
             grid_id = await guardar_grid_ejecucion(
                 symbol=symbol, direction=direction, trading_mode=CONFIG.trading_mode,
@@ -1314,6 +1318,10 @@ class GridExecutor:
             qty_raw = notional_orden / Decimal(str(price))
             steps = int(qty_raw / step_size)
             qty = float(steps * step_size)
+
+            # FASE 2: Persistir niveles reales y qty en params para recuperación post-crash
+            params['niveles'] = [float(n) for n in niveles]
+            params['qty_por_orden'] = qty
 
             # 7. Guardar grid en DB (igual)
             grid_id = await guardar_grid_ejecucion(
@@ -1617,77 +1625,99 @@ class GridExecutor:
         Procesa fills que están en tracking pero no han sido aplicados al estado.
         CR16 FIX: Pipeline de procesamiento garantizado.
         FASE 2 FIX: Bifurcación limpia entre NEUTRAL y DIRECCIONAL.
+        FASE 3 FIX: Atómico por fill — marca como procesado INMEDIATAMENTE después
+        de actualizar el estado RAM, ANTES de side-effects (TP, PnL). Esto garantiza
+        que un fill nunca se reprocese, incluso si TP o PnL fallan.
         """
         if not state.activa:
             return
 
         fills = await cargar_fills_sin_procesar(state.grid_id)
+        if not fills:
+            return
 
         # Cargar órdenes de DB una sola vez
         db_ordenes = await cargar_ordenes_por_grid(state.grid_id)
 
         for fill in fills:
-            # Buscar la orden correspondiente en nuestra DB
-            orden = next((o for o in db_ordenes if str(o['binance_order_id']) == fill['binance_order_id']), None)
+            fill_id = fill['id']
+            try:
+                # ─── PASO 0: Identificar orden ───
+                orden = next((o for o in db_ordenes if str(o['binance_order_id']) == fill['binance_order_id']), None)
 
-            if not orden:
-                print(f"  ⚠️ [CR16] Fill {fill['id']} sin orden en DB, saltando")
-                await marcar_fill_procesado(fill['id'], 'SIN_ORDEN')
-                continue
+                if not orden:
+                    print(f"  ⚠️ [CR16] Fill {fill_id} sin orden en DB, saltando")
+                    await marcar_fill_procesado(fill_id, 'SIN_ORDEN')
+                    continue
 
-            # Verificar si ya fue procesado en el estado
-            if orden['status'] == 'FILLED':
-                await marcar_fill_procesado(fill['id'], 'YA_PROCESADO')
-                continue
+                if orden['status'] == 'FILLED':
+                    await marcar_fill_procesado(fill_id, 'YA_PROCESADO')
+                    continue
 
-            # Procesar el fill
-            side = fill['side']
-            price = fill['price']
-            qty = fill['qty']
-            commission = fill['commission']
-            ts = fill['timestamp_ms'] // 1000  # Convertir a segundos
+                side = fill['side']
+                price = fill['price']
+                qty = fill['qty']
+                commission = fill['commission']
+                ts = fill['timestamp_ms'] // 1000
 
-            # Procesar según modo
-            if state.grid_mode == 'NEUTRAL' and state.grid_state:
-                pos_id = self._on_fill_real(
-                    state=state,
-                    side=side,
-                    price=price,
-                    qty=qty,
-                    fee=commission,
-                    timestamp=ts,
-                    binance_order_id=fill['binance_order_id'],
-                    binance_trade_id=fill['binance_trade_id']
-                )
-                if pos_id and orden['tipo_orden'] == 'ENTRY':
-                    await self._colocar_take_profit_neutral(symbol, state, orden, side, pos_id)
-            else:
-                # LONG o SHORT: procesamiento acumulativo directo
-                await self._procesar_fill_direccional(state, fill, orden)
-                if orden['tipo_orden'] == 'ENTRY':
-                    await self._colocar_take_profit(symbol, state, orden)
+                # ─── PASO 1: Actualizar estado RAM (fuente de verdad operativa) ───
+                # Este paso es crítico: si falla, NO marcamos el fill para que se reintente
+                pos_id = None
+                if state.grid_mode == 'NEUTRAL' and state.grid_state:
+                    pos_id = self._on_fill_real(
+                        state=state,
+                        side=side,
+                        price=price,
+                        qty=qty,
+                        fee=commission,
+                        timestamp=ts,
+                        binance_order_id=fill['binance_order_id'],
+                        binance_trade_id=fill['binance_trade_id']
+                    )
+                else:
+                    await self._procesar_fill_direccional(state, fill, orden)
 
-            # CR2 FIX: Procesar PnL del trade (común a ambos modos)
-            tipo_evento = 'FILL_ENTRADA' if orden['tipo_orden'] == 'ENTRY' else 'FILL_SALIDA' if orden['tipo_orden'] == 'TAKE_PROFIT' else 'FILL_DESCONOCIDO'
-            await self._procesar_trade_con_pnl(state, fill, tipo_evento)
+                # ─── PASO 2: MARCAR COMO PROCESADO (garantía anti-bucle infinito) ───
+                # Una vez que el estado RAM refleja el fill, MARCAMOS INMEDIATAMENTE.
+                # Si los pasos siguientes (TP, PnL) fallan, el fill NO se reprocesará.
+                await marcar_fill_procesado(fill_id, 'PROCESADO')
 
-            # Actualizar orden en DB (común a ambos modos)
-            await actualizar_orden_fill(
-                orden_id=orden['id'],
-                binance_trade_id=fill['binance_trade_id'],
-                price=price,
-                qty=qty,
-                commission=commission,
-                commission_asset=fill['commission_asset'],
-                realized_pnl=fill['realized_pnl'],
-                timestamp=datetime.fromtimestamp(ts).isoformat()
-            )
+                # ─── PASO 3: Side-effects secundarios (fallan → log, no se repiten) ───
+                try:
+                    # 3a. Colocar take-profit si es entrada
+                    if orden['tipo_orden'] == 'ENTRY':
+                        if state.grid_mode == 'NEUTRAL' and state.grid_state and pos_id:
+                            await self._colocar_take_profit_neutral(symbol, state, orden, side, pos_id)
+                        elif state.grid_mode in ('LONG', 'SHORT'):
+                            await self._colocar_take_profit(symbol, state, orden)
 
-            # Marcar fill como procesado
-            await marcar_fill_procesado(fill['id'], 'PROCESADO')
+                    # 3b. Procesar PnL
+                    tipo_evento = 'FILL_ENTRADA' if orden['tipo_orden'] == 'ENTRY' else 'FILL_SALIDA' if orden['tipo_orden'] == 'TAKE_PROFIT' else 'FILL_DESCONOCIDO'
+                    await self._procesar_trade_con_pnl(state, fill, tipo_evento)
 
-            print(f"  [CR16] {symbol} Fill procesado: {side} @ ${price:.4f} | "
-                  f"Modo: {state.grid_mode} | Qty: {qty}")
+                    # 3c. Actualizar orden en DB
+                    await actualizar_orden_fill(
+                        orden_id=orden['id'],
+                        binance_trade_id=fill['binance_trade_id'],
+                        price=price,
+                        qty=qty,
+                        commission=commission,
+                        commission_asset=fill['commission_asset'],
+                        realized_pnl=fill['realized_pnl'],
+                        timestamp=datetime.fromtimestamp(ts).isoformat()
+                    )
+                except Exception as e_side:
+                    # Side-effect falló pero fill YA está marcado → no se repite
+                    print(f"  ⚠️ [FASE 3] {symbol} Fill {fill_id} side-effect falló "
+                          f"(TP/PnL/orden) pero YA MARCADO como procesado: {e_side}")
+
+                print(f"  [CR16] {symbol} Fill procesado: {side} @ ${price:.4f} | "
+                      f"Modo: {state.grid_mode} | Qty: {qty}")
+
+            except Exception as e:
+                # Error en paso 1 (estado RAM) → NO marcar, se reintentará en siguiente ciclo
+                print(f"  ❌ [FASE 3] {symbol} Error procesando fill {fill_id}: {e}. "
+                      f"NO se marcó como procesado — se reintentará en próximo ciclo.")
 
 
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -1762,7 +1792,8 @@ class GridExecutor:
                         orderId=orden_id
                     ))
 
-                    if order_info['status'] == 'FILLED':
+                    # FASE 6: Proteger acceso si Binance devuelve respuesta inesperada
+                    if order_info.get('status') == 'FILLED':
                         # Este fill debería haber sido capturado por el poll proactivo
                         # Si llegamos aquí, el poll proactivo falló → anomalía
                         print(f"  🚨 [CR16] {symbol} Orden {orden_id} FILLED no detectada "
@@ -1840,6 +1871,34 @@ class GridExecutor:
 
         if state.cerrando:
             return
+
+        # ═══════════════════════════════════════════════════════════════════
+        # FASE 6: RECONCILIACIÓN RÁPIDA DE POSICIÓN NETA vs BINANCE
+        # Se ejecuta cada ciclo de monitoreo. Si diverge >1%, fuerza sync.
+        # ═══════════════════════════════════════════════════════════════════
+        try:
+            position = await self._api_call(asyncio.to_thread(
+                self.client.futures_position_information,
+                symbol=symbol
+            ))
+            if position and len(position) > 0:
+                pos_amt_real = Decimal(str(position[0].get('positionAmt', 0)))
+                pos_amt_interno = state.posicion_neta
+                if pos_amt_real != 0 and abs(pos_amt_interno) > Decimal('0.0001'):
+                    divergencia_pct = abs((pos_amt_real - pos_amt_interno) / pos_amt_real) * 100
+                    if divergencia_pct > Decimal('1.0'):
+                        print(f"  🚨 [FASE 6] {symbol} DIVERGENCIA POSICIÓN: "
+                              f"Binance={float(pos_amt_real):.4f} vs "
+                              f"Interno={float(pos_amt_interno):.4f} "
+                              f"({float(divergencia_pct):.2f}%). Forzando sync...")
+                        state.posicion_neta = pos_amt_real
+                elif pos_amt_real == 0 and abs(pos_amt_interno) > Decimal('0.0001'):
+                    print(f"  🚨 [FASE 6] {symbol} Posición real=0 pero interno={float(pos_amt_interno):.4f}. "
+                          f"Forzando sync a 0.")
+                    state.posicion_neta = Decimal('0')
+        except Exception as e_rec:
+            # FASE 6: No bloquear monitoreo si reconciliación falla
+            print(f"  ⚠️ [FASE 6] {symbol} Error reconciliando posición: {e_rec}")
 
         # ═══════════════════════════════════════════════════════════════════
         # CR16 PASO 1: POLL PROACTIVO DE TRADES
@@ -2040,11 +2099,38 @@ class GridExecutor:
         """
         CR2 FIX: Procesa un trade de Binance extrayendo y persistiendo el PnL real.
         Cada trade genera un evento de PnL que se persiste inmediatamente en DB.
+
+        FASE 1 FIX: Normaliza mapeo de claves entre API Binance (orderId, id, time)
+        y filas de SQLite (binance_order_id, binance_trade_id, timestamp_ms).
+        Evita KeyError cuando el trade proviene de fills_tracking (DB).
         """
-        price = float(trade['price'])
-        qty = float(trade['qty'])
-        commission = float(trade['commission'])
-        realized_pnl = float(trade.get('realizedPnl', 0))
+        # ─── Normalización defensiva de claves (API vs DB) ───
+        price_raw = trade.get('price')
+        qty_raw = trade.get('qty')
+        side_raw = trade.get('side')
+        commission_raw = trade.get('commission')
+
+        # Identificadores con fallback API → DB
+        binance_trade_id = str(trade.get('binance_trade_id') or trade.get('id') or 'UNKNOWN')
+        binance_order_id = str(trade.get('binance_order_id') or trade.get('orderId') or 'UNKNOWN')
+        timestamp_ms = trade.get('timestamp_ms') or trade.get('time') or 0
+        commission_asset = trade.get('commissionAsset') or trade.get('commission_asset') or ''
+        realized_pnl = float(trade.get('realizedPnl') or trade.get('realized_pnl') or 0)
+
+        # Validación mínima: si faltan datos críticos, abortar sin excepción
+        if any(v is None for v in [price_raw, qty_raw, side_raw, commission_raw]):
+            print(f"  ⚠️ [PnL] {state.symbol} Trade descartado: datos críticos faltantes "
+                  f"(price={price_raw}, qty={qty_raw}, side={side_raw}, comm={commission_raw})")
+            return {'realized_pnl': 0, 'commission': 0, 'notional': 0, 'descartado': True}
+
+        if binance_trade_id == 'UNKNOWN' or binance_order_id == 'UNKNOWN':
+            print(f"  ⚠️ [PnL] {state.symbol} Trade con IDs desconocidos: "
+                  f"trade_id={binance_trade_id}, order_id={binance_order_id}. "
+                  f"Se procesa PnL pero trazabilidad limitada.")
+
+        price = float(price_raw)
+        qty = float(qty_raw)
+        commission = float(commission_raw)
         notional = price * qty
 
         # Persistir inmediatamente en DB (fuente de verdad)
@@ -2052,16 +2138,16 @@ class GridExecutor:
             grid_ejecucion_id=state.grid_id,
             symbol=state.symbol,
             tipo_evento=tipo_evento,
-            side=trade['side'],
-            binance_trade_id=trade['id'],
-            binance_order_id=str(trade['orderId']),
+            side=side_raw,
+            binance_trade_id=binance_trade_id,
+            binance_order_id=binance_order_id,
             price=price,
             qty=qty,
             commission=commission,
-            commission_asset=trade.get('commissionAsset', ''),
+            commission_asset=commission_asset,
             realized_pnl=realized_pnl,
             notional=notional,
-            timestamp_ms=trade['time']
+            timestamp_ms=int(timestamp_ms)
         )
 
         # Actualizar estado en RAM (para respuesta rápida)
@@ -2074,7 +2160,7 @@ class GridExecutor:
             print(f"  [PnL] {state.symbol} {tipo_evento} | "
                   f"Realized PnL: {realized_pnl:+.4f} | "
                   f"Commission: {commission:.4f} | "
-                  f"Trade: {trade['id']}")
+                  f"Trade: {binance_trade_id}")
 
         return {
             'realized_pnl': realized_pnl,
@@ -2125,7 +2211,14 @@ class GridExecutor:
 
     async def _colocar_take_profit(self, symbol: str, state: GridExecutionState,
                                     orden_entry: dict):
-        """Coloca take-profit para un fill de entrada (LONG o SHORT). FASE 3: Tracking de TP."""
+        """Coloca take-profit para un fill de entrada (LONG o SHORT). FASE 3: Tracking de TP.
+        FASE 5: Defensiva — verifica niveles disponibles y protege contra errores de API.
+        """
+        # FASE 5: Verificar que hay niveles disponibles para calcular TP
+        if not state.niveles:
+            print(f"  ⚠️ [FASE 5] {symbol} Sin niveles disponibles, no se puede colocar TP")
+            return
+
         info = self._get_symbol_info(symbol)
         tick_size = Decimal(str(info['tickSize']))
 
@@ -2165,6 +2258,7 @@ class GridExecutor:
                 quantity=qty, price=tp_price,
                 timeInForce='GTC', newClientOrderId=client_order_id
             ))
+            # FASE 5: Guardar en DB ANTES de añadir a estado interno
             await guardar_orden_ejecucion(
                 grid_ejecucion_id=state.grid_id,
                 binance_order_id=str(res['orderId']),
@@ -2179,7 +2273,8 @@ class GridExecutor:
             }
             print(f"  ✅ [EXECUTOR] {symbol} Take-profit {side} colocado @ ${tp_price} | Qty:{qty}")
         except Exception as e:
-            print(f"  ❌ [EXECUTOR] {symbol} Error colocando take-profit: {e}")
+            # FASE 5: No propagar excepción — el TP puede reintentarse vía monitoreo reactivo
+            print(f"  ⚠️ [FASE 5] {symbol} Error colocando take-profit {side} @ ${tp_price}: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # TAKE-PROFIT NEUTRAL Y KILL SWITCH (FASE 3 — Autónomo)
@@ -2187,15 +2282,24 @@ class GridExecutor:
 
     async def _colocar_take_profit_neutral(self, symbol: str, state: GridExecutionState,
                                             orden_entry: dict, side_filled: str, pos_id: str):
-        """Cuando se ejecuta un BUY, coloca SELL take-profit. Cuando SELL, coloca BUY."""
+        """Cuando se ejecuta un BUY, coloca SELL take-profit. Cuando SELL, coloca BUY.
+        FASE 5: Defensiva — verifica grid_state y niveles, guarda DB antes de RAM.
+        """
+        # FASE 5: Verificar grid_state disponible
+        gs = state.grid_state if state else None
+        if not gs:
+            print(f"  ⚠️ [FASE 5] {symbol} Sin grid_state, no se puede colocar TP neutral")
+            return
+
         info = self._get_symbol_info(symbol)
         tick_size = Decimal(str(info['tickSize']))
-
-        gs = state.grid_state
         precio_entry = Decimal(str(orden_entry['price']))
 
         if side_filled == 'BUY':
             # Colocar SELL en el siguiente nivel superior (de niveles_sell)
+            if not gs.niveles_sell:
+                print(f"  ⚠️ [FASE 5] {symbol} Sin niveles_sell, no se puede colocar TP")
+                return
             candidatos = [n for n in gs.niveles_sell if n > precio_entry * Decimal('1.0001')]
             if not candidatos:
                 return
@@ -2203,6 +2307,9 @@ class GridExecutor:
             tp_side = 'SELL'
         else:
             # Colocar BUY en el siguiente nivel inferior (de niveles_buy)
+            if not gs.niveles_buy:
+                print(f"  ⚠️ [FASE 5] {symbol} Sin niveles_buy, no se puede colocar TP")
+                return
             candidatos = [n for n in gs.niveles_buy if n < precio_entry * Decimal('0.9999')]
             if not candidatos:
                 return
@@ -2223,17 +2330,9 @@ class GridExecutor:
                 quantity=qty, price=tp_price,
                 timeInForce='GTC', newClientOrderId=client_id
             ))
-            
-            # FASE 3: Trackear orden TP en el estado propio
+
+            # FASE 5: Guardar en DB ANTES de modificar estado interno
             tp_order_id = str(res['orderId'])
-            gs.ordenes_tp_pendientes[pos_id] = tp_order_id
-            
-            # Actualizar PosicionReal con el ID de cierre
-            for pos in gs.posiciones:
-                if pos.id == pos_id:
-                    pos.orden_cierre_id = tp_order_id
-                    break
-            
             await guardar_orden_ejecucion(
                 grid_ejecucion_id=state.grid_id,
                 binance_order_id=tp_order_id,
@@ -2241,9 +2340,20 @@ class GridExecutor:
                 symbol=symbol, side=tp_side, tipo_orden='TAKE_PROFIT',
                 price=tp_price, quantity=qty
             )
+
+            # FASE 3: Trackear orden TP en el estado propio (después de DB)
+            gs.ordenes_tp_pendientes[pos_id] = tp_order_id
+
+            # Actualizar PosicionReal con el ID de cierre
+            for pos in gs.posiciones:
+                if pos.id == pos_id:
+                    pos.orden_cierre_id = tp_order_id
+                    break
+
             print(f"  ✅ [EXECUTOR] {symbol} TP {tp_side} @ ${tp_price} (respuesta a {side_filled}) | Pos: {pos_id}")
         except Exception as e:
-            print(f"  ❌ [EXECUTOR] Error TP neutral: {e}")
+            # FASE 5: No propagar — TP puede reintentarse vía monitoreo reactivo
+            print(f"  ⚠️ [FASE 5] {symbol} Error TP neutral {tp_side} @ ${tp_price}: {e}")
 
     async def _ejecutar_kill_switch_real(self, symbol: str, state: GridExecutionState,
                                           pos_id: str, pos_tipo: str, qty: float, 
@@ -2831,6 +2941,30 @@ class GridExecutor:
                 params = json.loads(grid['grid_params_json']) if grid.get('grid_params_json') else {}
                 niveles = params.get('niveles', [])
                 qty = params.get('qty_por_orden', 0)
+
+                # FASE 2: Fallback — si niveles no persistieron (grids antiguos), regenerar desde límites
+                if not niveles and params.get('lower_limit') is not None and params.get('upper_limit') is not None:
+                    try:
+                        lower = float(params['lower_limit'])
+                        upper = float(params['upper_limit'])
+                        grid_count = int(params.get('grid_count', 7))
+                        info = self._get_symbol_info(symbol)
+                        tick_size = Decimal(str(info['tickSize']))
+                        rango = Decimal(str(upper)) - Decimal(str(lower))
+                        step = rango / (grid_count - 1) if grid_count > 1 else rango
+                        niveles_regen = []
+                        vistos = set()
+                        for i in range(grid_count):
+                            nivel = lower + float(step) * i
+                            ticks = int(Decimal(str(nivel)) / tick_size)
+                            nivel = float(ticks * tick_size)
+                            if nivel not in vistos:
+                                vistos.add(nivel)
+                                niveles_regen.append(nivel)
+                        niveles = niveles_regen
+                        print(f"  [FASE 2] {symbol} Niveles regenerados desde límites post-crash: {len(niveles)} niveles")
+                    except Exception as e_regen:
+                        print(f"  ⚠️ [FASE 2] {symbol} No se pudieron regenerar niveles: {e_regen}")
 
                 # Reconstruir estado
                 state = GridExecutionState(
