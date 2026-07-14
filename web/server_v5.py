@@ -482,6 +482,12 @@ async def get_stats_summary(request: Request):
             tipo_ev, sym_ev, ts_ev = ultimo_evento
             if isinstance(ts_ev, str):
                 ts_ev = datetime.fromisoformat(ts_ev.replace('Z', '+00:00'))
+                # Asegurar que tenga zona horaria UTC
+                if ts_ev.tzinfo is None:
+                    ts_ev = ts_ev.replace(tzinfo=pytz.UTC)
+            # Si ya es datetime, verificar también
+            if isinstance(ts_ev, datetime) and ts_ev.tzinfo is None:
+                ts_ev = ts_ev.replace(tzinfo=pytz.UTC)
             mins_ago = int((datetime.now(pytz.UTC).timestamp() - ts_ev.timestamp()) / 60) if ts_ev else None
 
         # ─── 6. Rechazados hoy ───
