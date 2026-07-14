@@ -7,6 +7,7 @@ GridSimulator eliminado completamente. No quedan dependencias externas.
 CR3 FIX: Cierre atómico con máquina de estados y verificación de estado real en Binance.
 CR2 FIX: Arquitectura de PnL completa — cada trade persiste realizedPnl en DB.
 V7.1: Grid atómico — locks, anti-duplicación, validación defensiva de niveles, sanidad periódica.
+FASE 1-8 FIX: LONG/SHORT son ciudadanos de primera clase — pipeline unificada de fills.
 """
 
 import asyncio
@@ -1016,41 +1017,73 @@ class GridExecutor:
         else:
             return (float(pos.precio_ejecucion) - precio_cierre) * float(pos.qty)
 
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 7: DASHBOARD Y ESTADO PÚBLICO UNIFICADO
+    # ═══════════════════════════════════════════════════════════════════════════════
+
     def get_estado_grid(self, state: GridExecutionState) -> Optional[dict]:
         """
-        FASE 2.7: Retorna el estado actual del grid para el dashboard.
-        Reemplaza a GridSimulator.get_estado_simulacion().
+        FASE 2.7 / FASE 7: Retorna el estado actual del grid para el dashboard.
+        Unificado para NEUTRAL y DIRECCIONAL.
         """
-        if not state or not state.activa or not state.grid_state:
+        if not state or not state.activa:
             return None
         
-        gs = state.grid_state
-        pos_abiertas = gs.posiciones_abiertas_list()
-        pos_vencidas = sum(
-            1 for p in pos_abiertas
-            if (int(time.time()) - p.timestamp_apertura) > CONFIG.grid_neutral_posicion_timeout_min * 60
-        )
+        # MODO NEUTRAL: lógica existente
+        if state.grid_mode == 'NEUTRAL' and state.grid_state:
+            gs = state.grid_state
+            pos_abiertas = gs.posiciones_abiertas_list()
+            pos_vencidas = sum(
+                1 for p in pos_abiertas
+                if (int(time.time()) - p.timestamp_apertura) > CONFIG.grid_neutral_posicion_timeout_min * 60
+            )
+            return {
+                'grid_id': gs.grid_id,
+                'symbol': gs.symbol,
+                'activa': gs.activa,
+                'niveles': len(gs.niveles),
+                'niveles_buy': len(gs.niveles_buy),
+                'niveles_sell': len(gs.niveles_sell),
+                'posiciones_abiertas': len(pos_abiertas),
+                'posiciones_atrapadas': len(gs.posiciones_atrapadas),
+                'posiciones_vencidas': pos_vencidas,
+                'trades_completados': gs.trades_completados,
+                'trades_kill_switch': gs.trades_kill_switch,
+                'pnl_neto': float(gs.pnl_neto),
+                'pnl_bruto': float(gs.pnl_bruto),
+                'fees_totales': float(gs.fees_totales),
+                'max_posiciones_simultaneas': gs.max_posiciones_simultaneas,
+                'ultimo_tick_segundos_ago': int(time.time()) - gs.ultimo_tick_ts,
+                'timestamp_inicio': gs.timestamp_inicio,
+                'posicion_neta': float(state.posicion_neta),
+                'ordenes_tp_pendientes': len(gs.ordenes_tp_pendientes),
+                'grid_mode': state.grid_mode,
+            }
         
+        # MODO DIRECCIONAL: datos desde GridExecutionState directamente
+        niveles_buy = len([n for n in state.niveles if n < state.precio_entrada]) if state.grid_mode == 'LONG' else 0
+        niveles_sell = len([n for n in state.niveles if n > state.precio_entrada]) if state.grid_mode == 'SHORT' else 0
         return {
-            'grid_id': gs.grid_id,
-            'symbol': gs.symbol,
-            'activa': gs.activa,
-            'niveles': len(gs.niveles),
-            'niveles_buy': len(gs.niveles_buy),
-            'niveles_sell': len(gs.niveles_sell),
-            'posiciones_abiertas': len(pos_abiertas),
-            'posiciones_atrapadas': len(gs.posiciones_atrapadas),
-            'posiciones_vencidas': pos_vencidas,
-            'trades_completados': gs.trades_completados,
-            'trades_kill_switch': gs.trades_kill_switch,
-            'pnl_neto': float(gs.pnl_neto),
-            'pnl_bruto': float(gs.pnl_bruto),
-            'fees_totales': float(gs.fees_totales),
-            'max_posiciones_simultaneas': gs.max_posiciones_simultaneas,
-            'ultimo_tick_segundos_ago': int(time.time()) - gs.ultimo_tick_ts,
-            'timestamp_inicio': gs.timestamp_inicio,
+            'grid_id': state.grid_id,
+            'symbol': state.symbol,
+            'activa': state.activa,
+            'niveles': len(state.niveles),
+            'niveles_buy': niveles_buy,
+            'niveles_sell': niveles_sell,
+            'posiciones_abiertas': 1 if float(state.posicion_neta) != 0 else 0,
+            'posiciones_atrapadas': 0,
+            'posiciones_vencidas': 0,
+            'trades_completados': 0,
+            'trades_kill_switch': 0,
+            'pnl_neto': float(state.pnl_real),
+            'pnl_bruto': float(state.pnl_real) + float(state.fees_real),
+            'fees_totales': float(state.fees_real),
+            'max_posiciones_simultaneas': 0,
+            'ultimo_tick_segundos_ago': int(time.time()) - int(state.timestamp_inicio),
+            'timestamp_inicio': int(state.timestamp_inicio),
             'posicion_neta': float(state.posicion_neta),
-            'ordenes_tp_pendientes': len(gs.ordenes_tp_pendientes),
+            'ordenes_tp_pendientes': len([o for o in state.ordenes.values() if o.get('tipo') == 'TAKE_PROFIT']),
+            'grid_mode': state.grid_mode,
         }
 
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -1408,10 +1441,13 @@ class GridExecutor:
 
     async def _verificar_integridad_grid(self, symbol: str, state: GridExecutionState):
         """
-        V7.1 FASE 4: Detecta grids fantasmas, duplicación de órdenes, o grids huérfanos.
+        V7.1 FASE 4 / FASE 8: Detecta grids fantasmas, duplicación de órdenes, o grids huérfanos.
         Se ejecuta cada ~30 segundos desde _monitoring_loop.
+        Funciona para NEUTRAL y DIRECCIONAL.
         """
-        if not state.grid_state or not state.grid_state.activa:
+        if not state.activa:
+            return
+        if state.grid_mode == 'NEUTRAL' and (not state.grid_state or not state.grid_state.activa):
             return
 
         try:
@@ -1489,7 +1525,9 @@ class GridExecutor:
         Returns:
             List[dict]: Nuevos fills detectados, no procesados
         """
-        if not state.grid_state or not state.grid_state.activa:
+        if not state.activa:
+            return []
+        if state.grid_mode == 'NEUTRAL' and (not state.grid_state or not state.grid_state.activa):
             return []
 
         # 1. Obtener timestamp del último trade conocido
@@ -1578,8 +1616,9 @@ class GridExecutor:
         """
         Procesa fills que están en tracking pero no han sido aplicados al estado.
         CR16 FIX: Pipeline de procesamiento garantizado.
+        FASE 2 FIX: Bifurcación limpia entre NEUTRAL y DIRECCIONAL.
         """
-        if not state.grid_state:
+        if not state.activa:
             return
 
         fills = await cargar_fills_sin_procesar(state.grid_id)
@@ -1608,23 +1647,31 @@ class GridExecutor:
             commission = fill['commission']
             ts = fill['timestamp_ms'] // 1000  # Convertir a segundos
 
-            # Registrar en estado interno
-            pos_id = self._on_fill_real(
-                state=state,
-                side=side,
-                price=price,
-                qty=qty,
-                fee=commission,
-                timestamp=ts,
-                binance_order_id=fill['binance_order_id'],
-                binance_trade_id=fill['binance_trade_id']
-            )
+            # Procesar según modo
+            if state.grid_mode == 'NEUTRAL' and state.grid_state:
+                pos_id = self._on_fill_real(
+                    state=state,
+                    side=side,
+                    price=price,
+                    qty=qty,
+                    fee=commission,
+                    timestamp=ts,
+                    binance_order_id=fill['binance_order_id'],
+                    binance_trade_id=fill['binance_trade_id']
+                )
+                if pos_id and orden['tipo_orden'] == 'ENTRY':
+                    await self._colocar_take_profit_neutral(symbol, state, orden, side, pos_id)
+            else:
+                # LONG o SHORT: procesamiento acumulativo directo
+                await self._procesar_fill_direccional(state, fill, orden)
+                if orden['tipo_orden'] == 'ENTRY':
+                    await self._colocar_take_profit(symbol, state, orden)
 
-            # CR2 FIX: Procesar PnL del trade
+            # CR2 FIX: Procesar PnL del trade (común a ambos modos)
             tipo_evento = 'FILL_ENTRADA' if orden['tipo_orden'] == 'ENTRY' else 'FILL_SALIDA' if orden['tipo_orden'] == 'TAKE_PROFIT' else 'FILL_DESCONOCIDO'
             await self._procesar_trade_con_pnl(state, fill, tipo_evento)
 
-            # Actualizar orden en DB
+            # Actualizar orden en DB (común a ambos modos)
             await actualizar_orden_fill(
                 orden_id=orden['id'],
                 binance_trade_id=fill['binance_trade_id'],
@@ -1637,18 +1684,51 @@ class GridExecutor:
             )
 
             # Marcar fill como procesado
-            await marcar_fill_procesado(fill['id'], pos_id or 'PROCESADO')
-
-            # Colocar take-profit
-            if state.grid_mode == 'NEUTRAL' and pos_id:
-                await self._colocar_take_profit_neutral(
-                    symbol, state, orden, side, pos_id
-                )
-            elif orden['tipo_orden'] == 'ENTRY':
-                await self._colocar_take_profit(symbol, state, orden)
+            await marcar_fill_procesado(fill['id'], 'PROCESADO')
 
             print(f"  [CR16] {symbol} Fill procesado: {side} @ ${price:.4f} | "
-                  f"Pos: {pos_id} | Qty: {qty}")
+                  f"Modo: {state.grid_mode} | Qty: {qty}")
+
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 2: PROCESAMIENTO DE FILLS DIRECCIONALES
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    async def _procesar_fill_direccional(self, state: GridExecutionState, fill: dict, orden: dict):
+        """
+        FASE 2.1: Procesa un fill para grid LONG/SHORT actualizando posición neta y PnL real.
+        Usa realized_pnl de Binance (ya calculado por reducción de posición).
+        """
+        side = fill['side']
+        price = float(fill['price'])
+        qty = float(fill['qty'])
+        commission = float(fill['commission'])
+        realized_pnl = float(fill.get('realized_pnl', 0))
+        ts = fill['timestamp_ms'] // 1000
+
+        # Actualizar posición neta (modelo acumulativo de Binance Futures)
+        if side == 'BUY':
+            state.posicion_neta += Decimal(str(qty))
+        else:
+            state.posicion_neta -= Decimal(str(qty))
+
+        # Actualizar fees y PnL real
+        state.fees_real += Decimal(str(commission))
+        if realized_pnl != 0:
+            state.pnl_real += Decimal(str(realized_pnl))
+
+        # Tracking en memoria para referencia rápida
+        state.ordenes[fill['binance_order_id']] = {
+            'side': side,
+            'price': price,
+            'qty': qty,
+            'filled': True,
+            'realized_pnl': realized_pnl,
+            'timestamp': ts
+        }
+
+        print(f"  [EXECUTOR] {state.symbol} Fill {state.grid_mode}: {side} {qty} @ ${price:.4f} | "
+              f"Pos neta: {float(state.posicion_neta):+.4f} | PnL: {realized_pnl:+.4f} | Fee: {commission:.4f}")
 
 
     async def _monitorear_ordenes_abiertas(self, symbol: str, state: GridExecutionState):
@@ -1746,6 +1826,7 @@ class GridExecutor:
     async def _monitorear_grid(self, symbol: str):
         """
         CR16 FIX: Monitoreo proactivo de fills + reactivo como fallback.
+        FASE 4 FIX: Kill switch adaptativo por modo.
 
         Flujo:
         1. Poll proactivo de trades (descubre fills nuevos)
@@ -1793,6 +1874,10 @@ class GridExecutor:
                             symbol=symbol, state=state, **accion
                         )
 
+        elif state.grid_mode in ('LONG', 'SHORT'):
+            # FASE 4: Kill switch direccional
+            await self._evaluar_kill_switch_direccional(symbol, state)
+
         # ═══════════════════════════════════════════════════════════════════
         # PASO 5: RECONCILIACIÓN
         # ═══════════════════════════════════════════════════════════════════
@@ -1804,12 +1889,42 @@ class GridExecutor:
         await self._reconciliar_pnl(state)
 
 
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 4: KILL SWITCH ADAPTATIVO POR MODO
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    async def _evaluar_kill_switch_direccional(self, symbol: str, state: GridExecutionState):
+        """
+        FASE 4.2: Para direccionales: cierra el grid completo si:
+        1. Hay posición abierta pero no hay órdenes de entrada ni TP pendientes (grid agotado)
+        2. Timeout desde creación del grid (configurable)
+        3. PnL unrealizado excede umbral negativo (opcional, futuro)
+        """
+        if not state.activa or state.cerrando:
+            return
+
+        # Timeout global del grid (no por posición, ya que es posición neta)
+        tiempo_vida = int(time.time()) - int(state.timestamp_inicio)
+        timeout_grid = getattr(CONFIG, 'grid_direccional_timeout_min', 120) * 60  # default 2h
+        
+        if tiempo_vida > timeout_grid and float(state.posicion_neta) != 0:
+            print(f"  🛑 [EXECUTOR] {symbol} Grid {state.grid_mode} vencido: {tiempo_vida}s > {timeout_grid}s")
+            await self._abortar_grid(symbol, f'timeout_direccional_{tiempo_vida}s')
+            return
+
+        # Si posición neta es 0 pero aún hay órdenes abiertas, es normal (esperando fills)
+        # Si posición neta es 0 y NO hay órdenes, el auto-cleanup de _monitoring_loop se encargará
+
+
     async def _reconciliar_con_binance(self, state: GridExecutionState):
         """
         CR16: Reconciliación completa del estado interno vs Binance.
         Detecta fills perdidos, posiciones huérfanas, órdenes fantasmas.
+        FASE 5: Unificada para NEUTRAL y DIRECCIONAL.
         """
-        if not state.grid_state or not state.grid_state.activa:
+        if not state.activa:
+            return
+        if state.grid_mode == 'NEUTRAL' and (not state.grid_state or not state.grid_state.activa):
             return
 
         try:
@@ -1872,18 +1987,20 @@ class GridExecutor:
                 symbol=state.symbol
             ))
 
-            open_ids_binance = {str(o['orderId']) for o in open_orders}
-            open_ids_interno = set(state.grid_state.ordenes_tp_pendientes.values())
+            # FASE 5: Reconciliación de órdenes solo para NEUTRAL (tiene tracking de TP)
+            if state.grid_mode == 'NEUTRAL' and state.grid_state:
+                open_ids_binance = {str(o['orderId']) for o in open_orders}
+                open_ids_interno = set(state.grid_state.ordenes_tp_pendientes.values())
 
-            # Órdenes en Binance que no tenemos trackeadas
-            for oid in open_ids_binance - open_ids_interno:
-                print(f"  🚨 [CR16] {state.symbol} Orden huérfana en Binance: {oid}")
+                # Órdenes en Binance que no tenemos trackeadas
+                for oid in open_ids_binance - open_ids_interno:
+                    print(f"  🚨 [CR16] {state.symbol} Orden huérfana en Binance: {oid}")
 
-            # Órdenes que creímos abiertas pero Binance no las tiene
-            for pos_id, oid in list(state.grid_state.ordenes_tp_pendientes.items()):
-                if oid not in open_ids_binance:
-                    print(f"  ⚠️ [CR16] {state.symbol} TP {oid} desaparecido, limpiando tracking")
-                    del state.grid_state.ordenes_tp_pendientes[pos_id]
+                # Órdenes que creímos abiertas pero Binance no las tiene
+                for pos_id, oid in list(state.grid_state.ordenes_tp_pendientes.items()):
+                    if oid not in open_ids_binance:
+                        print(f"  ⚠️ [CR16] {state.symbol} TP {oid} desaparecido, limpiando tracking")
+                        del state.grid_state.ordenes_tp_pendientes[pos_id]
 
         except Exception as e:
             print(f"  ⚠️ [CR16] Error en reconciliación: {e}")
@@ -2002,9 +2119,13 @@ class GridExecutor:
         state.grid_state.pnl_neto = pnl_db_val
         state.grid_state.fees_totales = fees_db_val
 
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 3: TAKE-PROFIT PARA DIRECCIONALES (INTEGRACIÓN COMPLETA)
+    # ═══════════════════════════════════════════════════════════════════════════════
+
     async def _colocar_take_profit(self, symbol: str, state: GridExecutionState,
                                     orden_entry: dict):
-        """Coloca take-profit para un fill de entrada (LONG o SHORT)."""
+        """Coloca take-profit para un fill de entrada (LONG o SHORT). FASE 3: Tracking de TP."""
         info = self._get_symbol_info(symbol)
         tick_size = Decimal(str(info['tickSize']))
 
@@ -2051,6 +2172,11 @@ class GridExecutor:
                 symbol=symbol, side=side, tipo_orden='TAKE_PROFIT',
                 price=tp_price, quantity=qty
             )
+            # FASE 3: Tracking de TP pendiente para direccionales
+            state.ordenes[client_order_id] = {
+                'side': side, 'price': tp_price, 'qty': qty,
+                'tipo': 'TAKE_PROFIT', 'binance_order_id': str(res['orderId'])
+            }
             print(f"  ✅ [EXECUTOR] {symbol} Take-profit {side} colocado @ ${tp_price} | Qty:{qty}")
         except Exception as e:
             print(f"  ❌ [EXECUTOR] {symbol} Error colocando take-profit: {e}")
@@ -2658,10 +2784,12 @@ class GridExecutor:
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # CR3 FIX: RECUPERACIÓN POST-CRASH CON VERIFICACIÓN
+    # FASE 6: Adaptativa para direccionales (sin grid_state)
     # ═══════════════════════════════════════════════════════════════════════════════
 
     async def _recuperar_grids_activos(self):
-        """CR3 FIX: Recuperar con verificación de que el grid sigue coherente."""
+        """CR3 FIX: Recuperar con verificación de que el grid sigue coherente.
+        FASE 6: Direccionales no reconstruyen grid_state."""
         grids_db = await cargar_grid_ejecuciones_activos()
         if not grids_db:
             print("  [EXECUTOR] No hay grids activos para recuperar")
@@ -2713,7 +2841,7 @@ class GridExecutor:
                 )
                 state.pares_abiertos = []  # FIX: Inicializar atributo faltante en recuperación
                 
-                # FASE 2: Reconstruir grid_state para grids neutral recuperados
+                # FASE 2 / FASE 6: Reconstruir grid_state SOLO para grids neutral
                 if grid['direction'] == 'NEUTRAL':
                     state.grid_mode = 'NEUTRAL'
                     try:
@@ -2726,6 +2854,10 @@ class GridExecutor:
                         print(f"  [EXECUTOR] {symbol} GridState neutral reconstruido post-crash")
                     except Exception as e:
                         print(f"  ⚠️ [EXECUTOR] {symbol} Error reconstruyendo grid_state: {e}")
+                else:
+                    # FASE 6: Direccionales — NO reconstruir grid_state
+                    state.grid_mode = grid['direction']
+                    print(f"  [EXECUTOR] {symbol} Grid direccional recuperado sin grid_state")
                 
                 # Sincronizar posición real
                 state.posicion_neta = pos_amt
