@@ -388,7 +388,7 @@ async def get_stats_summary(request: Request):
     try:
         db = await _get_db()
         hoy_local = now_local().strftime("%Y-%m-%d")
-        ts_inicio_dia = datetime.datetime.now(pytz.UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        ts_inicio_dia = datetime.now(pytz.UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
         # ─── 1. Fires hoy ───
         cursor = await db.execute(
@@ -476,7 +476,7 @@ async def get_stats_summary(request: Request):
         ultimo_evento_info = None
 ##        if ultimo_evento:
 ##            tipo_ev, sym_ev, ts_ev = ultimo_evento
-##            mins_ago = int((datetime.datetime.now(pytz.UTC).timestamp() - ts_ev) / 60) if ts_ev else None
+##            mins_ago = int((datetime.now(pytz.UTC).timestamp() - ts_ev) / 60) if ts_ev else None
 ##            ultimo_evento_info = {"tipo": tipo_ev, "symbol": sym_ev, "minutos_ago": mins_ago}
         if ultimo_evento:
             tipo_ev, sym_ev, ts_ev = ultimo_evento
@@ -531,7 +531,7 @@ async def get_stats_per_coin(request: Request):
     try:
         db = await _get_db()
         hoy_local = now_local().strftime("%Y-%m-%d")
-        ts_inicio_dia = datetime.datetime.now(pytz.UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        ts_inicio_dia = datetime.now(pytz.UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
         result = []
         # Obtener lista de monedas activas del registro
@@ -1341,7 +1341,7 @@ async def get_stats_extended(request: Request):
     try:
         db = await _get_db()
         hoy_local = now_local().strftime("%Y-%m-%d")
-        ts_inicio_dia = datetime.datetime.now(pytz.UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        ts_inicio_dia = datetime.now(pytz.UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
         # Fires hoy
         cursor = await db.execute("SELECT count(*) FROM auditoria_eventos WHERE tipo = 'FIRE' AND fecha = ?", (hoy_local,))
