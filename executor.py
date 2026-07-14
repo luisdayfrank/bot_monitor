@@ -35,6 +35,7 @@ from database_v5 import (
     guardar_pnl_evento,
     calcular_pnl_acumulado,
     obtener_pnl_por_tipo,
+    cargar_grid_ejecuciones_activos,
 )
 
 
