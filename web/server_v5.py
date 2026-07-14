@@ -474,10 +474,15 @@ async def get_stats_summary(request: Request):
         )
         ultimo_evento = await cursor.fetchone()
         ultimo_evento_info = None
+##        if ultimo_evento:
+##            tipo_ev, sym_ev, ts_ev = ultimo_evento
+##            mins_ago = int((datetime.datetime.now(pytz.UTC).timestamp() - ts_ev) / 60) if ts_ev else None
+##            ultimo_evento_info = {"tipo": tipo_ev, "symbol": sym_ev, "minutos_ago": mins_ago}
         if ultimo_evento:
             tipo_ev, sym_ev, ts_ev = ultimo_evento
-            mins_ago = int((datetime.datetime.now(pytz.UTC).timestamp() - ts_ev) / 60) if ts_ev else None
-            ultimo_evento_info = {"tipo": tipo_ev, "symbol": sym_ev, "minutos_ago": mins_ago}
+            if isinstance(ts_ev, str):
+                ts_ev = datetime.fromisoformat(ts_ev.replace('Z', '+00:00'))
+            mins_ago = int((datetime.now(pytz.UTC).timestamp() - ts_ev.timestamp()) / 60) if ts_ev else None
 
         # ─── 6. Rechazados hoy ───
         cursor = await db.execute(
