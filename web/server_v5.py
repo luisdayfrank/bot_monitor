@@ -2035,7 +2035,7 @@ async def get_grids(request: Request, symbol: str = None, estado_grid: str = Non
 
         query = f"""
             SELECT 
-                g.id AS grid_id, g.symbol, g.timestamp_inicio, g.timestamp_fin,
+                g.id AS grid_id, g.symbol, g.timestamp_inicio, timestamp_fin,
                 g.estado, g.direction, g.precio_entrada, g.grid_params_json,
                 g.pnl_real, g.fees_real, g.razon_cierre, g.trading_mode,
                 COALESCE(SUM(p.realized_pnl), 0) as pnl_verificado,
@@ -2077,7 +2077,7 @@ async def get_grids_legacy(request: Request, symbol: str = None, estado_grid: st
 
         query = f"""
             SELECT 
-                g.id AS grid_id, g.symbol, g.timestamp_inicio, g.timestamp_fin,
+                g.id AS grid_id, g.symbol, g.timestamp_inicio, g.closed_at as timestamp_fin,
                 g.estado AS grid_estado, g.direccion, g.precio_entrada, g.grid_params_json,
                 s.id AS sim_id, s.precio_inicio, s.precio_fin, s.pnl_bruto,
                 s.pnl_neto, s.fees_totales, s.slippage_total, s.trades_completados,
