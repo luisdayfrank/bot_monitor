@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Crypto Monitor V6.1 — Análisis en Caliente</title>
+    <title>Crypto Monitor V6.2 — Análisis en Caliente</title>
     <link rel="icon" href="data:,">
 
     <script src="https://cdn.tailwindcss.com"></script>
@@ -32,30 +32,12 @@
             to { opacity: 0; transform: translateX(100%); }
         }
 
-        .pulse-dot {
-            box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7);
-            animation: pulse-green 2s infinite;
-        }
-        .pulse-dot-armed {
-            box-shadow: 0 0 0 0 rgba(234, 179, 8, 0.7);
-            animation: pulse-yellow 1.2s infinite;
-        }
-        .pulse-dot-fire {
-            box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
-            animation: pulse-red 0.6s infinite;
-        }
-        .pulse-dot-cooldown {
-            box-shadow: 0 0 0 0 rgba(249, 115, 22, 0.7);
-            animation: pulse-orange 1.5s infinite;
-        }
-        .pulse-dot-circuit {
-            box-shadow: 0 0 0 0 rgba(168, 85, 247, 0.7);
-            animation: pulse-purple 1.0s infinite;
-        }
-        .pulse-dot-neutral {
-            box-shadow: 0 0 0 0 rgba(6, 182, 212, 0.7);
-            animation: pulse-cyan 1.5s infinite;
-        }
+        .pulse-dot { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7); animation: pulse-green 2s infinite; }
+        .pulse-dot-armed { box-shadow: 0 0 0 0 rgba(234, 179, 8, 0.7); animation: pulse-yellow 1.2s infinite; }
+        .pulse-dot-fire { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); animation: pulse-red 0.6s infinite; }
+        .pulse-dot-cooldown { box-shadow: 0 0 0 0 rgba(249, 115, 22, 0.7); animation: pulse-orange 1.5s infinite; }
+        .pulse-dot-circuit { box-shadow: 0 0 0 0 rgba(168, 85, 247, 0.7); animation: pulse-purple 1.0s infinite; }
+        .pulse-dot-neutral { box-shadow: 0 0 0 0 rgba(6, 182, 212, 0.7); animation: pulse-cyan 1.5s infinite; }
 
         @keyframes pulse-green {
             0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7); }
@@ -89,23 +71,16 @@
         }
 
         .state-badge {
-            font-size: 9px;
-            font-weight: 800;
-            letter-spacing: 0.05em;
-            text-transform: uppercase;
-            padding: 2px 6px;
-            border-radius: 4px;
+            font-size: 9px; font-weight: 800; letter-spacing: 0.05em;
+            text-transform: uppercase; padding: 2px 6px; border-radius: 4px;
         }
         .state-badge-monitoreo { background: #374151; color: #9ca3af; }
         .state-badge-armed { background: #78350f; color: #fbbf24; border: 1px solid #fbbf24; }
         .state-badge-fire { background: #7f1d1d; color: #fca5a5; border: 1px solid #ef4444; animation: shake 0.5s infinite; }
         .state-badge-cooldown { background: #431407; color: #fdba74; border: 1px solid #f97316; }
         .state-badge-circuit { background: #581c87; color: #e9d5ff; border: 1px solid #a855f7; }
-        .state-badge-neutral { 
-            background: #164e63;
-            color: #67e8f9;
-            border: 1px solid #06b6d4;
-        }
+        .state-badge-neutral { background: #164e63; color: #67e8f9; border: 1px solid #06b6d4; }
+        .state-badge-inactive { background: #1f2937; color: #6b7280; border: 1px dashed #4b5563; }
 
         @keyframes shake {
             0%, 100% { transform: translateX(0); }
@@ -113,53 +88,28 @@
             75% { transform: translateX(1px); }
         }
 
-        .coin-item {
-            transition: all 0.15s ease;
-        }
-        .coin-item:hover {
-            background: rgba(59, 130, 246, 0.08);
-        }
-        .coin-item.active {
-            background: rgba(59, 130, 246, 0.15);
-            border-left: 3px solid #3b82f6;
-        }
-        .coin-item.disabled {
-            opacity: 0.4;
-            filter: grayscale(0.6);
-        }
+        .coin-item { transition: all 0.15s ease; }
+        .coin-item:hover { background: rgba(59, 130, 246, 0.08); }
+        .coin-item.active { background: rgba(59, 130, 246, 0.15); border-left: 3px solid #3b82f6; }
+        .coin-item.disabled { opacity: 0.4; filter: grayscale(0.6); }
+        .coin-item.inactive-selected { background: rgba(245, 158, 11, 0.1); border-left: 3px solid #f59e0b; }
 
         .toggle-switch {
-            position: relative;
-            width: 36px;
-            height: 20px;
-            background-color: #374151;
-            border-radius: 10px;
-            cursor: pointer;
-            transition: background-color 0.2s;
-            flex-shrink: 0;
+            position: relative; width: 36px; height: 20px;
+            background-color: #374151; border-radius: 10px;
+            cursor: pointer; transition: background-color 0.2s; flex-shrink: 0;
         }
-        .toggle-switch.active {
-            background-color: #22c55e;
-        }
+        .toggle-switch.active { background-color: #22c55e; }
         .toggle-switch::after {
-            content: '';
-            position: absolute;
-            top: 2px;
-            left: 2px;
-            width: 16px;
-            height: 16px;
-            background-color: white;
-            border-radius: 50%;
-            transition: transform 0.2s;
+            content: ''; position: absolute; top: 2px; left: 2px;
+            width: 16px; height: 16px; background-color: white;
+            border-radius: 50%; transition: transform 0.2s;
         }
-        .toggle-switch.active::after {
-            transform: translateX(16px);
-        }
+        .toggle-switch.active::after { transform: translateX(16px); }
 
         .glass-panel {
             background: rgba(17, 24, 39, 0.85);
-            backdrop-filter: blur(12px);
-            -webkit-backdrop-filter: blur(12px);
+            backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
             border-bottom: 1px solid rgba(255,255,255,0.05);
         }
 
@@ -180,29 +130,24 @@
 
         .kpi-card {
             background: rgba(31, 41, 55, 0.6);
-            border: 1px solid #374151;
-            border-radius: 12px;
-            padding: 16px;
+            border: 1px solid #374151; border-radius: 12px; padding: 16px;
         }
         .sub-tab-btn {
-            padding: 6px 14px;
-            border-radius: 6px;
-            font-size: 12px;
-            font-weight: 600;
-            color: #9ca3af;
-            background: transparent;
-            border: 1px solid transparent;
-            transition: all 0.2s;
-            white-space: nowrap;
+            padding: 6px 14px; border-radius: 6px; font-size: 12px; font-weight: 600;
+            color: #9ca3af; background: transparent; border: 1px solid transparent;
+            transition: all 0.2s; white-space: nowrap;
         }
         .sub-tab-btn.active {
-            background: #3b82f6;
-            color: white;
-            border-color: #3b82f6;
+            background: #3b82f6; color: white; border-color: #3b82f6;
         }
         .sub-tab-btn:hover:not(.active) {
-            background: rgba(255,255,255,0.05);
-            color: #e5e7eb;
+            background: rgba(255,255,255,0.05); color: #e5e7eb;
+        }
+
+        .warning-banner {
+            background: rgba(245, 158, 11, 0.1);
+            border: 1px solid rgba(245, 158, 11, 0.3);
+            color: #fbbf24;
         }
     </style>
 <base target="_blank">
@@ -217,7 +162,7 @@
         <div class="p-4 border-b border-gray-800 flex justify-between items-center bg-gray-900/50">
             <h1 class="text-lg font-bold flex items-center gap-2 tracking-wide">
                 <span id="status-dot" class="w-3 h-3 rounded-full bg-yellow-500"></span>
-                Sniper <span class="text-blue-500">V6.1</span>
+                Sniper <span class="text-blue-500">V6.2</span>
             </h1>
             <div class="flex flex-col items-end gap-0.5">
                 <span id="ws-status" class="text-xs text-yellow-500 font-mono">Conectando...</span>
@@ -247,6 +192,7 @@
                     <option value="all">Todos</option>
                     <option value="active">Activos</option>
                     <option value="paused">Pausados</option>
+                    <option value="inactive">Inactivos</option>
                     <option value="FIRE">FIRE</option>
                     <option value="ARMED">ARMED</option>
                     <option value="COOLDOWN">COOLDOWN</option>
@@ -304,6 +250,7 @@
                         <span id="active-coin-state" class="text-xs font-bold px-2 py-1 rounded bg-gray-700 text-gray-400">MONITOREO</span>
                         <span id="active-coin-dir" class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-gray-800 text-gray-500 hidden">DIR</span>
                         <span id="active-coin-cb" class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-purple-900 text-purple-400 hidden">🔒CB</span>
+                        <span id="active-coin-inactive" class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-yellow-900 text-yellow-400 hidden">⚠️ INACTIVA</span>
                     </div>
 
                     <div class="flex items-center gap-4 shrink-0">
@@ -385,13 +332,19 @@
             </div>
 
             <!-- VISTA ESTADÍSTICAS -->
-                        <div id="stats-view" class="hidden absolute inset-0 overflow-y-auto p-4 md:p-8 bg-[#0b0e14]">
+            <div id="stats-view" class="hidden absolute inset-0 overflow-y-auto p-4 md:p-8 bg-[#0b0e14]">
                 <div class="flex items-center justify-between mb-2">
                     <div>
                         <h2 class="text-2xl font-bold text-white">Rendimiento del Bot</h2>
                         <p class="text-xs text-gray-500 mb-6">Datos extraídos directamente de la base de datos SQLite — V6.2</p>
                     </div>
-                    <div id="stats-last-update" class="text-[10px] text-gray-600 font-mono">--</div>
+                    <div class="flex items-center gap-2">
+                        <button onclick="exportStatsCSV()" class="text-xs px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded-lg transition flex items-center gap-1">
+                            <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                            CSV
+                        </button>
+                        <div id="stats-last-update" class="text-[10px] text-gray-600 font-mono">--</div>
+                    </div>
                 </div>
 
                 <!-- FILA 1: Métricas principales -->
@@ -482,16 +435,19 @@
 
                 <!-- SECCIÓN: Ranking por Moneda -->
                 <div class="mb-6">
-                    <h3 class="text-lg font-bold text-white mb-3 flex items-center gap-2">
-                        <span>🏆</span> Ranking por Moneda
-                    </h3>
+                    <div class="flex items-center justify-between mb-3">
+                        <h3 class="text-lg font-bold text-white flex items-center gap-2">
+                            <span>🏆</span> Ranking por Moneda
+                        </h3>
+                        <button onclick="exportRankingCSV()" class="text-xs px-2 py-1 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded transition">📥 CSV</button>
+                    </div>
                     <div class="overflow-x-auto rounded-xl border border-gray-700/50 max-h-[400px] overflow-y-auto">
                         <table class="analysis-table" id="ranking-table">
                             <thead><tr>
                                 <th>Moneda</th><th>Estado</th><th>Fires</th><th>Rechazos</th>
-                                <th>NM Fin</th><th>Win Rate</th><th>PnL Real</th>
+                                <th>NM Fin</th><th>Win Rate</th><th>PnL Real</th><th>Streak</th><th>Mejor Trade</th>
                             </tr></thead>
-                            <tbody><tr><td colspan="7" class="text-center text-gray-500 py-8">Cargando...</td></tr></tbody>
+                            <tbody><tr><td colspan="9" class="text-center text-gray-500 py-8">Cargando...</td></tr></tbody>
                         </table>
                     </div>
                 </div>
@@ -506,6 +462,7 @@
                         <div id="funnel-container" class="space-y-2">
                             <div class="text-xs text-gray-500 text-center py-4">Cargando...</div>
                         </div>
+                        <div id="funnel-latency" class="mt-3 pt-2 border-t border-gray-700 text-[10px] text-gray-500"></div>
                     </div>
                     <!-- Rechazos por Causa -->
                     <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
@@ -520,10 +477,13 @@
 
                 <!-- Grid Neutral (moneda seleccionada) -->
                 <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50 mt-6 mb-6">
-                    <h3 class="text-sm font-bold text-gray-300 mb-3 flex items-center gap-2">
-                        <span>🌐</span> Grid Neutral — <span id="grid-neutral-symbol" class="text-purple-400">Selecciona moneda</span>
-                        <span id="grid-badge" class="hidden px-2 py-0.5 rounded-full text-xs font-bold bg-purple-600 text-white">ACTIVO</span>
-                    </h3>
+                    <div class="flex items-center justify-between mb-3">
+                        <h3 class="text-sm font-bold text-gray-300 flex items-center gap-2">
+                            <span>🌐</span> Grid Neutral — <span id="grid-neutral-symbol" class="text-purple-400">Selecciona moneda</span>
+                            <span id="grid-badge" class="hidden px-2 py-0.5 rounded-full text-xs font-bold bg-purple-600 text-white">ACTIVO</span>
+                        </h3>
+                        <button onclick="exportGridCSV()" class="text-xs px-2 py-1 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded transition">📥 CSV</button>
+                    </div>
                     <div id="grid-info" class="text-xs text-gray-500">Selecciona una moneda para ver estado del grid neutral</div>
                     <div id="grid-stats" class="hidden grid grid-cols-2 md:grid-cols-3 gap-3 mt-3">
                         <div class="bg-gray-900/50 p-3 rounded-lg">
@@ -551,6 +511,11 @@
                             <div class="text-lg font-mono text-gray-400" id="grid-last-tick">--</div>
                         </div>
                     </div>
+                    <!-- V6.2: Desglose PnL por tipo -->
+                    <div id="grid-pnl-breakdown" class="hidden mt-3 bg-gray-900/30 p-3 rounded-lg border border-gray-700/50">
+                        <div class="text-xs text-gray-400 mb-2">Desglose PnL por tipo de evento</div>
+                        <div id="grid-pnl-breakdown-content" class="text-xs font-mono space-y-1"></div>
+                    </div>
                 </div>
 
                 <!-- Leyenda métricas -->
@@ -573,7 +538,7 @@
                 </button>
             </div>
 
-<!-- VISTA ANÁLISIS -->
+            <!-- VISTA ANÁLISIS -->
             <div id="analysis-view" class="hidden absolute inset-0 overflow-hidden flex flex-col bg-[#0b0e14]">
 
                 <!-- Sub-nav de análisis -->
@@ -581,7 +546,11 @@
                     <button onclick="switchAnalysisTab('resumen')" id="analysis-tab-resumen" class="sub-tab-btn active">🌍 Resumen Global</button>
                     <button onclick="switchAnalysisTab('auditoria')" id="analysis-tab-auditoria" class="sub-tab-btn">📋 Auditoría</button>
                     <button onclick="switchAnalysisTab('nearmiss')" id="analysis-tab-nearmiss" class="sub-tab-btn">🎯 Near-Misses</button>
-                    <button onclick="switchAnalysisTab('grids')" id="analysis-tab-grids" class="sub-tab-btn">💠 Grid Neutral</button>
+                    <button onclick="switchAnalysisTab('grids')" id="analysis-tab-grids" class="sub-tab-btn">💠 Grids Reales</button>
+                    <button onclick="switchAnalysisTab('equity')" id="analysis-tab-equity" class="sub-tab-btn">📈 Equity</button>
+                    <button onclick="switchAnalysisTab('filters')" id="analysis-tab-filters" class="sub-tab-btn">🧪 Filtros</button>
+                    <button onclick="switchAnalysisTab('health')" id="analysis-tab-health" class="sub-tab-btn">🩺 Salud</button>
+                    <button onclick="switchAnalysisTab('compare')" id="analysis-tab-compare" class="sub-tab-btn">⚖️ Comparar</button>
                     <div class="flex-1"></div>
                     <button onclick="refreshAnalysis()" class="text-xs px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg font-semibold transition">🔄 Actualizar</button>
                 </div>
@@ -594,9 +563,19 @@
                         <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6" id="kpi-container">
                             <div class="kpi-card"><div class="text-xs text-gray-400">Cargando...</div></div>
                         </div>
-                        <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
-                            <h3 class="text-sm font-bold text-gray-300 mb-2">📊 Distribución de Eventos Hoy</h3>
-                            <div id="chart-distribucion" class="h-64"></div>
+                        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+                            <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                                <h3 class="text-sm font-bold text-gray-300 mb-2">📊 Distribución de Eventos Hoy</h3>
+                                <div id="chart-distribucion" class="h-64"></div>
+                            </div>
+                            <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                                <h3 class="text-sm font-bold text-gray-300 mb-2">🎯 Distribución de Scores</h3>
+                                <div id="chart-score-dist" class="h-64"></div>
+                            </div>
+                        </div>
+                        <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50 mb-6">
+                            <h3 class="text-sm font-bold text-gray-300 mb-2">💰 PnL por Dirección (7 días)</h3>
+                            <div id="chart-direction-pnl" class="h-64"></div>
                         </div>
                     </div>
 
@@ -618,6 +597,7 @@
                                 <option value="NEUTRAL_GRID_ABORT">NEUTRAL_GRID_ABORT</option>
                             </select>
                             <input type="date" id="audit-date" onchange="loadAuditoria()" class="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300">
+                            <button onclick="exportAuditoriaCSV()" class="text-xs px-2 py-1 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded transition">📥 CSV</button>
                         </div>
                         <div class="overflow-x-auto rounded-xl border border-gray-700/50">
                             <table class="analysis-table" id="audit-table">
@@ -641,6 +621,7 @@
                                 <option value="finalizados">Finalizados</option>
                                 <option value="en_curso">En curso</option>
                             </select>
+                            <button onclick="exportNearMissCSV()" class="text-xs px-2 py-1 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded transition">📥 CSV</button>
                         </div>
                         <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
                             <div class="overflow-x-auto rounded-xl border border-gray-700/50 max-h-[500px] overflow-y-auto">
@@ -659,25 +640,25 @@
                         </div>
                     </div>
 
-                    <!-- GRIDS -->
+                    <!-- GRIDS REALES -->
                     <div id="analysis-grids" class="analysis-panel hidden">
                         <div class="flex flex-wrap items-center gap-3 mb-4">
-                            <h2 class="text-xl font-bold text-white">💠 Grids Neutrales</h2>
+                            <h2 class="text-xl font-bold text-white">💠 Grids Reales (Executor)</h2>
                             <select id="grid-symbol-filter" onchange="loadGrids()" class="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300">
                                 <option value="">Todas las monedas</option>
                             </select>
                             <select id="grid-estado-filter" onchange="loadGrids()" class="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300">
                                 <option value="todos">Todos</option>
                                 <option value="ACTIVO">ACTIVO</option>
-                                <option value="ABORTADO">ABORTADO</option>
-                                <option value="COMPLETADO">COMPLETADO</option>
+                                <option value="CERRADO">CERRADO</option>
                             </select>
+                            <button onclick="exportGridsCSV()" class="text-xs px-2 py-1 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded transition">📥 CSV</button>
                         </div>
                         <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
                             <div class="overflow-x-auto rounded-xl border border-gray-700/50 max-h-[500px] overflow-y-auto">
                                 <table class="analysis-table" id="grids-table">
                                     <thead><tr>
-                                        <th>Inicio</th><th>Moneda</th><th>Estado</th><th>PnL Neto</th><th>Fees</th><th>Trades</th><th>KS</th>
+                                        <th>Inicio</th><th>Moneda</th><th>Estado</th><th>Dir</th><th>PnL Real</th><th>Fees</th><th>Fills</th>
                                     </tr></thead>
                                     <tbody><tr><td colspan="7" class="text-center text-gray-500 py-8">Cargando...</td></tr></tbody>
                                 </table>
@@ -687,6 +668,86 @@
                                 <div id="grid-chart" class="h-80"></div>
                                 <div id="grid-detail" class="mt-3 text-xs text-gray-400 space-y-1"></div>
                             </div>
+                        </div>
+                    </div>
+
+                    <!-- EQUITY -->
+                    <div id="analysis-equity" class="analysis-panel hidden">
+                        <h2 class="text-xl font-bold text-white mb-4">📈 Curva de Equity</h2>
+                        <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50 mb-4">
+                            <div class="flex items-center gap-3 mb-4">
+                                <select id="equity-dias" onchange="loadEquity()" class="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300">
+                                    <option value="1">Últimas 24h</option>
+                                    <option value="3">Últimos 3 días</option>
+                                    <option value="7">Últimos 7 días</option>
+                                </select>
+                                <button onclick="exportEquityCSV()" class="text-xs px-2 py-1 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded transition">📥 CSV</button>
+                            </div>
+                            <div id="equity-chart" class="h-80"></div>
+                        </div>
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                                <div class="text-xs text-gray-400 mb-1">Drawdown Máximo</div>
+                                <div class="text-2xl font-mono text-red-400" id="equity-max-dd">--</div>
+                            </div>
+                            <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                                <div class="text-xs text-gray-400 mb-1">Ratio Riesgo/Beneficio</div>
+                                <div class="text-2xl font-mono text-blue-400" id="equity-risk-reward">--</div>
+                            </div>
+                            <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                                <div class="text-xs text-gray-400 mb-1">Win Rate Trades</div>
+                                <div class="text-2xl font-mono text-green-400" id="equity-win-rate">--</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- FILTROS -->
+                    <div id="analysis-filters" class="analysis-panel hidden">
+                        <h2 class="text-xl font-bold text-white mb-4">🧪 Calibración de Filtros</h2>
+                        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+                            <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                                <h3 class="text-sm font-bold text-gray-300 mb-3">Eficiencia por Filtro</h3>
+                                <div id="filter-efficiency-chart" class="h-64"></div>
+                            </div>
+                            <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                                <h3 class="text-sm font-bold text-gray-300 mb-3">Oportunidades Perdidas Rentables</h3>
+                                <div id="missed-opportunities-chart" class="h-64"></div>
+                            </div>
+                        </div>
+                        <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                            <h3 class="text-sm font-bold text-gray-300 mb-3">Latencia ARMED → Decisión</h3>
+                            <div id="latency-chart" class="h-64"></div>
+                        </div>
+                    </div>
+
+                    <!-- SALUD -->
+                    <div id="analysis-health" class="analysis-panel hidden">
+                        <h2 class="text-xl font-bold text-white mb-4">🩺 Salud del Sistema</h2>
+                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6" id="health-container">
+                            <div class="kpi-card"><div class="text-xs text-gray-400">Cargando...</div></div>
+                        </div>
+                        <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                            <h3 class="text-sm font-bold text-gray-300 mb-3">Grids Activos en Executor</h3>
+                            <div id="health-grids-detail" class="text-xs text-gray-400"></div>
+                        </div>
+                    </div>
+
+                    <!-- COMPARAR -->
+                    <div id="analysis-compare" class="analysis-panel hidden">
+                        <h2 class="text-xl font-bold text-white mb-4">⚖️ Comparador de Monedas</h2>
+                        <div class="flex items-center gap-3 mb-4 flex-wrap">
+                            <select id="compare-symbols" multiple class="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-gray-300 h-32">
+                            </select>
+                            <button onclick="loadCompare()" class="text-xs px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg font-semibold transition">Comparar</button>
+                            <button onclick="exportCompareCSV()" class="text-xs px-2 py-1 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded transition">📥 CSV</button>
+                        </div>
+                        <div class="overflow-x-auto rounded-xl border border-gray-700/50">
+                            <table class="analysis-table" id="compare-table">
+                                <thead><tr>
+                                    <th>Moneda</th><th>Precio</th><th>Estado</th><th>Score</th><th>RSI 1m</th><th>RSI 15m</th><th>ADX</th><th>ATR</th><th>EMA Dist</th>
+                                </tr></thead>
+                                <tbody><tr><td colspan="9" class="text-center text-gray-500 py-8">Selecciona monedas para comparar</td></tr></tbody>
+                            </table>
                         </div>
                     </div>
 
@@ -700,7 +761,7 @@
     <script>
 
         // ============================================
-        // ESTADO GLOBAL V6.1
+        // ESTADO GLOBAL V6.2
         // ============================================
         let activeSymbol = null;
         let activeTimeframe = '1m';
@@ -712,10 +773,38 @@
         let lastPing = Date.now();
         let connectionQuality = 'unknown';
         let isFirstConnect = true;
+        let anomaliasDetectadas = new Set();
 
         const MAX_ALERTS = 50;
-        const ALERTS_KEY = 'crypto_monitor_v61_alerts';
+        const ALERTS_KEY = 'crypto_monitor_v62_alerts';
         let unreadAlerts = 0;
+
+        // ============================================
+        // PERSISTENCIA LOCALSTORAGE
+        // ============================================
+        function loadPreferences() {
+            try {
+                const prefs = JSON.parse(localStorage.getItem('cm_v62_prefs') || '{}');
+                if (prefs.activeSymbol && marketData[prefs.activeSymbol]) activeSymbol = prefs.activeSymbol;
+                if (prefs.activeTimeframe) activeTimeframe = prefs.activeTimeframe;
+                if (prefs.activeTab) {
+                    setTimeout(() => switchTab(prefs.activeTab), 100);
+                }
+                if (prefs.analysisTab) {
+                    setTimeout(() => switchAnalysisTab(prefs.analysisTab), 200);
+                }
+            } catch(e) {}
+        }
+        function savePreferences() {
+            localStorage.setItem('cm_v62_prefs', JSON.stringify({
+                activeSymbol: activeSymbol,
+                activeTimeframe: activeTimeframe,
+                activeTab: document.getElementById('chart-view').classList.contains('hidden') ? 
+                    (document.getElementById('stats-view').classList.contains('hidden') ? 'analysis-view' : 'stats-view') : 'chart-view',
+                analysisTab: document.querySelector('.sub-tab-btn.active')?.id.replace('analysis-tab-', '') || 'resumen'
+            }));
+        }
+        window.addEventListener('beforeunload', savePreferences);
 
         // ============================================
         // GRÁFICO
@@ -727,9 +816,7 @@
             grid: { vertLines: { color: '#374151' }, horzLines: { color: '#374151' } },
             crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
             timeScale: {
-                timeVisible: true,
-                secondsVisible: false,
-                borderColor: '#4b5563',
+                timeVisible: true, secondsVisible: false, borderColor: '#4b5563',
                 tickMarkFormatter: (time, tickMarkType, locale) => {
                     const date = new Date(time * 1000);
                     return date.toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' });
@@ -755,10 +842,7 @@
 
         window.addEventListener('resize', () => {
             if (chartContainer.clientWidth > 0 && chartContainer.clientHeight > 0) {
-                chart.applyOptions({
-                    width: chartContainer.clientWidth,
-                    height: chartContainer.clientHeight
-                });
+                chart.applyOptions({ width: chartContainer.clientWidth, height: chartContainer.clientHeight });
             }
         });
 
@@ -766,16 +850,10 @@
             const period = 300;
             const k = 2 / (period + 1);
             if (!velas || velas.length < period) return [];
-
             let ema = 0;
-            for (let i = 0; i < period; i++) {
-                ema += velas[i].close;
-            }
+            for (let i = 0; i < period; i++) ema += velas[i].close;
             ema /= period;
-
-            const result = [];
-            result.push({ time: velas[period - 1].time, value: ema });
-
+            const result = [{ time: velas[period - 1].time, value: ema }];
             for (let i = period; i < velas.length; i++) {
                 ema = velas[i].close * k + ema * (1 - k);
                 result.push({ time: velas[i].time, value: ema });
@@ -784,7 +862,7 @@
         }
 
         // ============================================
-        // V6.1: SISTEMA DE TABS PRINCIPALES
+        // V6.2: SISTEMA DE TABS PRINCIPALES
         // ============================================
         function switchTab(tabId) {
             document.getElementById('chart-view').classList.add('hidden');
@@ -820,13 +898,14 @@
                 btnAnalysis.classList.remove('text-gray-400', 'border-transparent');
                 refreshAnalysis();
             }
+            savePreferences();
         }
 
         // ============================================
-        // V6.1: SUB-TABS DE ANÁLISIS
+        // V6.2: SUB-TABS DE ANÁLISIS
         // ============================================
         function switchAnalysisTab(subTab) {
-            ['resumen', 'auditoria', 'nearmiss', 'grids'].forEach(t => {
+            ['resumen', 'auditoria', 'nearmiss', 'grids', 'equity', 'filters', 'health', 'compare'].forEach(t => {
                 document.getElementById('analysis-' + t).classList.add('hidden');
                 document.getElementById('analysis-tab-' + t).classList.remove('active');
             });
@@ -837,6 +916,11 @@
             if (subTab === 'auditoria') loadAuditoria();
             if (subTab === 'nearmiss') loadNearMisses();
             if (subTab === 'grids') loadGrids();
+            if (subTab === 'equity') loadEquity();
+            if (subTab === 'filters') loadFilters();
+            if (subTab === 'health') loadHealth();
+            if (subTab === 'compare') loadCompareSymbols();
+            savePreferences();
         }
 
         function refreshAnalysis() {
@@ -847,16 +931,27 @@
                 if (tab === 'auditoria') loadAuditoria();
                 if (tab === 'nearmiss') loadNearMisses();
                 if (tab === 'grids') loadGrids();
+                if (tab === 'equity') loadEquity();
+                if (tab === 'filters') loadFilters();
+                if (tab === 'health') loadHealth();
+                if (tab === 'compare') loadCompare();
             }
         }
 
         // ============================================
-        // V6.1: RESUMEN GLOBAL
+        // V6.2: RESUMEN GLOBAL (MEJORADO)
         // ============================================
         async function loadResumenGlobal() {
             try {
-                const res = await fetch('/api/stats/extended');
+                const [res, scoreRes, dirRes] = await Promise.all([
+                    fetch('/api/stats/extended'),
+                    fetch('/api/stats/score-distribution'),
+                    fetch('/api/stats/direction-pnl?dias=7')
+                ]);
                 const d = await res.json();
+                const scoreD = await scoreRes.json();
+                const dirD = await dirRes.json();
+
                 if (d.estado !== 'success') return;
 
                 const kpiContainer = document.getElementById('kpi-container');
@@ -878,29 +973,55 @@
                     </div>
                 `).join('');
 
-                // Gráfico de distribución
+                // Distribución de eventos
                 const dataPlot = [{
                     values: [d.fires_hoy, d.rechazados_hoy, d.armed_hoy, d.near_miss_total],
                     labels: ['FIRE', 'RECHAZADO', 'ARMED', 'NEAR-MISS'],
-                    type: 'pie',
-                    hole: 0.4,
+                    type: 'pie', hole: 0.4,
                     marker: { colors: ['#ef4444', '#f97316', '#eab308', '#3b82f6'] },
-                    textinfo: 'label+value',
-                    textposition: 'outside'
+                    textinfo: 'label+value', textposition: 'outside'
                 }];
                 Plotly.newPlot('chart-distribucion', dataPlot, {
-                    paper_bgcolor: 'rgba(0,0,0,0)',
-                    plot_bgcolor: 'rgba(0,0,0,0)',
+                    paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
                     font: { color: '#9ca3af', size: 11 },
-                    margin: { t: 10, b: 10, l: 10, r: 10 },
-                    showlegend: false
+                    margin: { t: 10, b: 10, l: 10, r: 10 }, showlegend: false
                 }, { responsive: true, displayModeBar: false });
+
+                // Score distribution
+                if (scoreD.estado === 'success') {
+                    const fb = scoreD.fire.buckets || {};
+                    const rb = scoreD.rechazados.buckets || {};
+                    const cats = ['0-30', '31-50', '51-70', '71-85', '86-100'];
+                    Plotly.newPlot('chart-score-dist', [
+                        { x: cats, y: cats.map(c => fb[c] || 0), name: 'FIRE', type: 'bar', marker: { color: '#ef4444' } },
+                        { x: cats, y: cats.map(c => rb[c] || 0), name: 'Rechazados', type: 'bar', marker: { color: '#f97316' } }
+                    ], {
+                        barmode: 'group', paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: '#111827',
+                        font: { color: '#9ca3af' }, xaxis: { gridcolor: '#374151' }, yaxis: { gridcolor: '#374151' },
+                        margin: { t: 30, b: 30, l: 40, r: 20 }, showlegend: true,
+                        legend: { font: { color: '#9ca3af' }, orientation: 'h', y: -0.2 }
+                    }, { responsive: true, displayModeBar: false });
+                }
+
+                // Direction PnL
+                if (dirD.estado === 'success') {
+                    const dirs = Object.keys(dirD.data || {});
+                    const pnls = dirs.map(d => dirD.data[d].pnl);
+                    const colors = dirs.map(d => d === 'LONG' ? '#22c55e' : '#ef4444');
+                    Plotly.newPlot('chart-direction-pnl', [{
+                        x: dirs, y: pnls, type: 'bar', marker: { color: colors }
+                    }], {
+                        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: '#111827',
+                        font: { color: '#9ca3af' }, xaxis: { gridcolor: '#374151' }, yaxis: { gridcolor: '#374151', title: 'PnL (USDT)' },
+                        margin: { t: 30, b: 30, l: 50, r: 20 }, showlegend: false
+                    }, { responsive: true, displayModeBar: false });
+                }
 
             } catch (e) { console.error('[ANALYSIS] Error cargando resumen:', e); }
         }
 
         // ============================================
-        // V6.1: AUDITORÍA
+        // V6.2: AUDITORÍA (CON EXPORT CSV)
         // ============================================
         async function loadAuditoria() {
             const symbol = document.getElementById('audit-symbol-filter').value;
@@ -933,11 +1054,19 @@
                         <td class="text-[11px] text-gray-500">${row.estado_maquina || ''}</td>
                     </tr>`;
                 }).join('');
+                window._auditData = d.data;
             } catch (e) { console.error('[ANALYSIS] Error auditoría:', e); }
         }
 
+        function exportAuditoriaCSV() {
+            if (!window._auditData) return;
+            const headers = ['timestamp_local', 'symbol', 'tipo', 'direccion', 'precio', 'score', 'estado_maquina'];
+            const rows = window._auditData.map(r => headers.map(h => `"${(r[h] || '').toString().replace(/"/g, '""')}"`).join(','));
+            downloadCSV('auditoria.csv', [headers.join(','), ...rows].join('\n'));
+        }
+
         // ============================================
-        // V6.1: NEAR-MISSES
+        // V6.2: NEAR-MISSES (CON EXPORT CSV)
         // ============================================
         let nmDataCache = [];
 
@@ -979,7 +1108,6 @@
             document.querySelectorAll('#nm-table tbody tr').forEach(tr => tr.classList.remove('selected'));
             const rowEl = document.getElementById('nm-row-' + idx);
             if (rowEl) rowEl.classList.add('selected');
-
             const row = nmDataCache[idx];
             if (!row) return;
 
@@ -1003,67 +1131,46 @@
                 const res = await fetch(`/api/velas/range?symbol=${row.symbol}&tf=1m&t_ini_ms=${tIni}&t_fin_ms=${tFin}`);
                 const velasData = await res.json();
                 const velas = velasData.velas || [];
-
-                if (velas.length === 0) {
-                    Plotly.purge('nm-chart');
-                    return;
-                }
+                if (velas.length === 0) { Plotly.purge('nm-chart'); return; }
 
                 const x = velas.map(v => new Date(v.timestamp));
                 const y = velas.map(v => v.close);
-
                 const traces = [{
                     x: x, y: y, mode: 'lines', name: 'Precio',
                     line: { color: '#3b82f6', width: 2 },
                     fill: 'tozeroy', fillcolor: 'rgba(59,130,246,0.1)'
                 }];
-
                 if (row.precio_inicio) {
                     traces.push({
                         x: [x[0], x[x.length-1]], y: [row.precio_inicio, row.precio_inicio],
                         mode: 'lines', name: 'Inicio', line: { color: '#fbbf24', width: 2, dash: 'dash' }
                     });
                 }
-
                 if (row.direccion_nm === 'LONG') {
-                    traces.push({
-                        x: [...x, ...x.slice().reverse()],
-                        y: [...x.map(() => row.precio_inicio), ...x.map(() => row.precio_inicio * 0.95)],
-                        fill: 'toself', fillcolor: 'rgba(239,68,68,0.1)', line: { width: 0 }, showlegend: false
-                    });
-                    traces.push({
-                        x: [...x, ...x.slice().reverse()],
-                        y: [...x.map(() => row.precio_inicio * 1.05), ...x.map(() => row.precio_inicio)],
-                        fill: 'toself', fillcolor: 'rgba(34,197,94,0.1)', line: { width: 0 }, showlegend: false
-                    });
+                    traces.push({ x: [...x, ...x.slice().reverse()], y: [...x.map(() => row.precio_inicio), ...x.map(() => row.precio_inicio * 0.95)], fill: 'toself', fillcolor: 'rgba(239,68,68,0.1)', line: { width: 0 }, showlegend: false });
+                    traces.push({ x: [...x, ...x.slice().reverse()], y: [...x.map(() => row.precio_inicio * 1.05), ...x.map(() => row.precio_inicio)], fill: 'toself', fillcolor: 'rgba(34,197,94,0.1)', line: { width: 0 }, showlegend: false });
                 } else if (row.direccion_nm === 'SHORT') {
-                    traces.push({
-                        x: [...x, ...x.slice().reverse()],
-                        y: [...x.map(() => row.precio_inicio), ...x.map(() => row.precio_inicio * 1.05)],
-                        fill: 'toself', fillcolor: 'rgba(239,68,68,0.1)', line: { width: 0 }, showlegend: false
-                    });
-                    traces.push({
-                        x: [...x, ...x.slice().reverse()],
-                        y: [...x.map(() => row.precio_inicio * 0.95), ...x.map(() => row.precio_inicio)],
-                        fill: 'toself', fillcolor: 'rgba(34,197,94,0.1)', line: { width: 0 }, showlegend: false
-                    });
+                    traces.push({ x: [...x, ...x.slice().reverse()], y: [...x.map(() => row.precio_inicio), ...x.map(() => row.precio_inicio * 1.05)], fill: 'toself', fillcolor: 'rgba(239,68,68,0.1)', line: { width: 0 }, showlegend: false });
+                    traces.push({ x: [...x, ...x.slice().reverse()], y: [...x.map(() => row.precio_inicio * 0.95), ...x.map(() => row.precio_inicio)], fill: 'toself', fillcolor: 'rgba(34,197,94,0.1)', line: { width: 0 }, showlegend: false });
                 }
-
                 Plotly.newPlot('nm-chart', traces, {
                     title: { text: `Near-Miss: ${row.symbol} (${row.direccion_nm})`, font: { color: '#e5e7eb', size: 14 } },
-                    paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: '#111827',
-                    font: { color: '#9ca3af' },
-                    xaxis: { gridcolor: '#374151', title: '' },
-                    yaxis: { gridcolor: '#374151', title: 'Precio (USDT)' },
-                    margin: { t: 40, b: 30, l: 50, r: 20 },
-                    showlegend: false
+                    paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: '#111827', font: { color: '#9ca3af' },
+                    xaxis: { gridcolor: '#374151', title: '' }, yaxis: { gridcolor: '#374151', title: 'Precio (USDT)' },
+                    margin: { t: 40, b: 30, l: 50, r: 20 }, showlegend: false
                 }, { responsive: true, displayModeBar: false });
-
             } catch (e) { console.error('[ANALYSIS] Error cargando velas near-miss:', e); }
         }
 
+        function exportNearMissCSV() {
+            if (!nmDataCache.length) return;
+            const headers = ['id', 'symbol', 'timestamp_inicio', 'direccion_nm', 'score', 'umbral', 'acerto_bot', 'movimiento_pct'];
+            const rows = nmDataCache.map(r => headers.map(h => `"${(r[h] || '').toString().replace(/"/g, '""')}"`).join(','));
+            downloadCSV('near_misses.csv', [headers.join(','), ...rows].join('\n'));
+        }
+
         // ============================================
-        // V6.1: GRIDS NEUTRALES
+        // V6.2: GRIDS REALES (MIGRADO A grid_ejecuciones)
         // ============================================
         let gridDataCache = [];
 
@@ -1086,15 +1193,15 @@
                 }
                 tbody.innerHTML = gridDataCache.map((row, idx) => {
                     const inicio = row.timestamp_inicio ? new Date(row.timestamp_inicio * 1000).toLocaleString() : '-';
-                    const pnlColor = (row.pnl_neto || 0) >= 0 ? 'text-green-400' : 'text-red-400';
+                    const pnlColor = (row.pnl_real || 0) >= 0 ? 'text-green-400' : 'text-red-400';
                     return `<tr onclick="selectGrid(${idx})" class="cursor-pointer" id="grid-row-${idx}">
                         <td class="font-mono text-[11px]">${inicio}</td>
                         <td class="font-bold">${row.symbol}</td>
-                        <td><span class="px-2 py-0.5 rounded text-[10px] font-bold ${row.grid_estado === 'ACTIVO' ? 'bg-purple-900 text-purple-300' : (row.grid_estado === 'ABORTADO' ? 'bg-red-900 text-red-300' : 'bg-green-900 text-green-300')}">${row.grid_estado}</span></td>
-                        <td class="font-mono ${pnlColor}">${row.pnl_neto !== null ? (row.pnl_neto > 0 ? '+' : '') + row.pnl_neto.toFixed(4) : '-'}</td>
-                        <td class="font-mono text-gray-400">${row.fees_totales !== null ? row.fees_totales.toFixed(4) : '-'}</td>
-                        <td>${row.trades_completados || 0}</td>
-                        <td class="text-orange-400">${row.trades_kill_switch || 0}</td>
+                        <td><span class="px-2 py-0.5 rounded text-[10px] font-bold ${row.estado === 'ACTIVO' ? 'bg-purple-900 text-purple-300' : (row.estado === 'CERRADO' ? 'bg-green-900 text-green-300' : 'bg-red-900 text-red-300')}">${row.estado}</span></td>
+                        <td>${row.direction || '-'}</td>
+                        <td class="font-mono ${pnlColor}">${row.pnl_real !== null ? (row.pnl_real > 0 ? '+' : '') + row.pnl_real.toFixed(4) : '-'}</td>
+                        <td class="font-mono text-gray-400">${row.fees_real !== null ? row.fees_real.toFixed(4) : '-'}</td>
+                        <td>${row.total_fills || 0}</td>
                     </tr>`;
                 }).join('');
             } catch (e) { console.error('[ANALYSIS] Error grids:', e); }
@@ -1104,7 +1211,6 @@
             document.querySelectorAll('#grids-table tbody tr').forEach(tr => tr.classList.remove('selected'));
             const rowEl = document.getElementById('grid-row-' + idx);
             if (rowEl) rowEl.classList.add('selected');
-
             const row = gridDataCache[idx];
             if (!row) return;
 
@@ -1114,12 +1220,12 @@
 
             detail.innerHTML = `
                 <div><b>Grid ID:</b> ${row.grid_id}</div>
-                <div><b>Sim ID:</b> ${row.sim_id || '-'}</div>
                 <div><b>Rango:</b> $${params.lower_limit?.toFixed(4) || '-'} - $${params.upper_limit?.toFixed(4) || '-'}</div>
                 <div><b>Grids:</b> ${params.grid_count || '-'}</div>
                 <div><b>Step:</b> ${params.step_pct ? params.step_pct + '%' : '-'}</div>
                 <div><b>Capital:</b> $${params.capital_sugerido || '-'}</div>
-                <div><b>Posiciones abiertas:</b> ${row.posiciones_abiertas_json ? 'Ver tabla' : 'Ninguna'}</div>
+                <div><b>Modo:</b> ${row.trading_mode || 'N/A'}</div>
+                <div><b>Razón cierre:</b> ${row.razon_cierre || 'N/A'}</div>
             `;
 
             if (!row.timestamp_inicio) return;
@@ -1130,52 +1236,260 @@
                 const res = await fetch(`/api/velas/range?symbol=${row.symbol}&tf=1m&t_ini_ms=${tIni}&t_fin_ms=${tFin}`);
                 const velasData = await res.json();
                 const velas = velasData.velas || [];
-
-                if (velas.length === 0) {
-                    Plotly.purge('grid-chart');
-                    return;
-                }
+                if (velas.length === 0) { Plotly.purge('grid-chart'); return; }
 
                 const x = velas.map(v => new Date(v.timestamp));
                 const traces = [{
                     x: x, y: velas.map(v => v.close), mode: 'lines', name: 'Precio',
                     line: { color: '#3b82f6', width: 2 }
                 }];
-
                 if (params.lower_limit && params.upper_limit && params.grid_count) {
                     const step = (params.upper_limit - params.lower_limit) / params.grid_count;
                     for (let i = 0; i <= params.grid_count; i++) {
                         const nivel = params.lower_limit + step * i;
-                        traces.push({
-                            x: [x[0], x[x.length-1]], y: [nivel, nivel],
-                            mode: 'lines', line: { color: 'rgba(6,182,212,0.5)', width: 1, dash: 'dot' },
-                            showlegend: false, hoverinfo: 'skip'
-                        });
+                        traces.push({ x: [x[0], x[x.length-1]], y: [nivel, nivel], mode: 'lines', line: { color: 'rgba(6,182,212,0.5)', width: 1, dash: 'dot' }, showlegend: false, hoverinfo: 'skip' });
                     }
                 }
-
                 if (row.precio_entrada) {
-                    traces.push({
-                        x: [x[0], x[x.length-1]], y: [row.precio_entrada, row.precio_entrada],
-                        mode: 'lines', name: 'Entrada', line: { color: '#fbbf24', width: 2 }
-                    });
+                    traces.push({ x: [x[0], x[x.length-1]], y: [row.precio_entrada, row.precio_entrada], mode: 'lines', name: 'Entrada', line: { color: '#fbbf24', width: 2 } });
                 }
-
                 Plotly.newPlot('grid-chart', traces, {
-                    title: { text: `Grid Neutral: ${row.symbol}`, font: { color: '#e5e7eb', size: 14 } },
-                    paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: '#111827',
-                    font: { color: '#9ca3af' },
-                    xaxis: { gridcolor: '#374151' },
-                    yaxis: { gridcolor: '#374151', title: 'Precio (USDT)' },
-                    margin: { t: 40, b: 30, l: 50, r: 20 },
-                    showlegend: false
+                    title: { text: `Grid: ${row.symbol} (${row.direction || 'N/A'})`, font: { color: '#e5e7eb', size: 14 } },
+                    paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: '#111827', font: { color: '#9ca3af' },
+                    xaxis: { gridcolor: '#374151' }, yaxis: { gridcolor: '#374151', title: 'Precio (USDT)' },
+                    margin: { t: 40, b: 30, l: 50, r: 20 }, showlegend: false
                 }, { responsive: true, displayModeBar: false });
-
             } catch (e) { console.error('[ANALYSIS] Error cargando velas grid:', e); }
         }
 
+        function exportGridsCSV() {
+            if (!gridDataCache.length) return;
+            const headers = ['grid_id', 'symbol', 'timestamp_inicio', 'estado', 'direction', 'pnl_real', 'fees_real', 'total_fills'];
+            const rows = gridDataCache.map(r => headers.map(h => `"${(r[h] || '').toString().replace(/"/g, '""')}"`).join(','));
+            downloadCSV('grids_reales.csv', [headers.join(','), ...rows].join('\n'));
+        }
+
         // ============================================
-        // V6.1: MENÚ MÓVIL
+        // V6.2: EQUITY + DRAWDOWN + RISK/REWARD
+        // ============================================
+        async function loadEquity() {
+            const dias = document.getElementById('equity-dias').value;
+            try {
+                const [eqRes, ddRes, rrRes] = await Promise.all([
+                    fetch(`/api/stats/equity?dias=${dias}`),
+                    fetch(`/api/stats/drawdown?dias=${dias}`),
+                    fetch(`/api/stats/risk-reward?dias=${dias}`)
+                ]);
+                const eq = await eqRes.json();
+                const dd = await ddRes.json();
+                const rr = await rrRes.json();
+
+                if (eq.estado === 'success' && eq.data.length) {
+                    const x = eq.data.map(d => d.hora);
+                    Plotly.newPlot('equity-chart', [{
+                        x: x, y: eq.data.map(d => d.equity), mode: 'lines', name: 'Equity',
+                        line: { color: '#3b82f6', width: 2 }, fill: 'tozeroy', fillcolor: 'rgba(59,130,246,0.1)'
+                    }], {
+                        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: '#111827', font: { color: '#9ca3af' },
+                        xaxis: { gridcolor: '#374151', title: '' }, yaxis: { gridcolor: '#374151', title: 'PnL Acumulado (USDT)' },
+                        margin: { t: 30, b: 30, l: 50, r: 20 }, showlegend: false
+                    }, { responsive: true, displayModeBar: false });
+                } else {
+                    document.getElementById('equity-chart').innerHTML = '<div class="text-xs text-gray-500 text-center py-8">Sin datos de equity</div>';
+                }
+
+                document.getElementById('equity-max-dd').innerText = dd.estado === 'success' ? dd.max_drawdown.toFixed(4) + ' USDT' : '--';
+                document.getElementById('equity-risk-reward').innerText = rr.estado === 'success' && rr.risk_reward_ratio ? rr.risk_reward_ratio.toFixed(2) : '--';
+                document.getElementById('equity-win-rate').innerText = rr.estado === 'success' ? rr.win_pct + '%' : '--';
+            } catch (e) { console.error('[EQUITY] Error:', e); }
+        }
+
+        function exportEquityCSV() {
+            // Se exporta desde el endpoint directamente
+            const dias = document.getElementById('equity-dias').value;
+            window.open(`/api/stats/equity?dias=${dias}`, '_blank');
+        }
+
+        // ============================================
+        // V6.2: FILTROS (EFICIENCIA + OPORTUNIDADES)
+        // ============================================
+        async function loadFilters() {
+            try {
+                const [feRes, moRes, latRes] = await Promise.all([
+                    fetch('/api/stats/filter-efficiency'),
+                    fetch('/api/stats/missed-opportunities'),
+                    fetch('/api/stats/latency')
+                ]);
+                const fe = await feRes.json();
+                const mo = await moRes.json();
+                const lat = await latRes.json();
+
+                if (fe.estado === 'success') {
+                    const causas = fe.data.map(d => d.causa);
+                    const precision = fe.data.map(d => d.precision);
+                    const total = fe.data.map(d => d.total);
+                    Plotly.newPlot('filter-efficiency-chart', [
+                        { x: causas, y: precision, type: 'bar', name: 'Precisión %', marker: { color: '#3b82f6' }, text: total.map(t => `n=${t}`), textposition: 'outside' }
+                    ], {
+                        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: '#111827', font: { color: '#9ca3af' },
+                        xaxis: { gridcolor: '#374151', title: '' }, yaxis: { gridcolor: '#374151', title: 'Precisión (%)', range: [0, 100] },
+                        margin: { t: 30, b: 30, l: 40, r: 20 }, showlegend: false
+                    }, { responsive: true, displayModeBar: false });
+                }
+
+                if (mo.estado === 'success') {
+                    const pf = mo.por_filtro || [];
+                    Plotly.newPlot('missed-opportunities-chart', [
+                        { x: pf.map(p => p.causa), y: pf.map(p => p.count), type: 'bar', marker: { color: '#ef4444' } }
+                    ], {
+                        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: '#111827', font: { color: '#9ca3af' },
+                        xaxis: { gridcolor: '#374151' }, yaxis: { gridcolor: '#374151', title: 'Oportunidades perdidas' },
+                        margin: { t: 30, b: 30, l: 40, r: 20 }, showlegend: false
+                    }, { responsive: true, displayModeBar: false });
+                }
+
+                if (lat.estado === 'success') {
+                    const det = lat.detalle || [];
+                    Plotly.newPlot('latency-chart', [
+                        { x: det.map(d => d.symbol), y: det.map(d => d.segundos), type: 'bar', marker: { color: '#a855f7' } }
+                    ], {
+                        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: '#111827', font: { color: '#9ca3af' },
+                        xaxis: { gridcolor: '#374151', title: '' }, yaxis: { gridcolor: '#374151', title: 'Segundos en ARMED' },
+                        margin: { t: 30, b: 30, l: 40, r: 20 }, showlegend: false
+                    }, { responsive: true, displayModeBar: false });
+                }
+            } catch (e) { console.error('[FILTERS] Error:', e); }
+        }
+
+        // ============================================
+        // V6.2: SALUD DEL SISTEMA
+        // ============================================
+        async function loadHealth() {
+            try {
+                const res = await fetch('/api/system/health');
+                const d = await res.json();
+                if (d.estado !== 'success') return;
+
+                const container = document.getElementById('health-container');
+                container.innerHTML = `
+                    <div class="kpi-card">
+                        <div class="text-xs text-gray-400 mb-1">Executor</div>
+                        <div class="text-2xl font-mono ${d.executor.disponible ? 'text-green-400' : 'text-red-400'}">${d.executor.disponible ? '✅' : '❌'}</div>
+                        <div class="text-xs text-gray-500 mt-1">Grids: ${d.executor.grids_activos} | Cola: ${d.executor.cola_size}</div>
+                    </div>
+                    <div class="kpi-card">
+                        <div class="text-xs text-gray-400 mb-1">Signal Generator</div>
+                        <div class="text-2xl font-mono ${d.signal_generator.disponible ? 'text-green-400' : 'text-red-400'}">${d.signal_generator.disponible ? '✅' : '❌'}</div>
+                        <div class="text-xs text-gray-500 mt-1">Monedas: ${d.signal_generator.monedas_monitoreadas}</div>
+                    </div>
+                    <div class="kpi-card">
+                        <div class="text-xs text-gray-400 mb-1">WebSockets</div>
+                        <div class="text-2xl font-mono text-blue-400">${d.websocket.conexiones_activas}</div>
+                        <div class="text-xs text-gray-500 mt-1">Histórico: ${d.websocket.conexiones_historicas}</div>
+                    </div>
+                    <div class="kpi-card">
+                        <div class="text-xs text-gray-400 mb-1">Precios Vivo</div>
+                        <div class="text-2xl font-mono text-cyan-400">${d.precios_vivo.monedas_con_precio}</div>
+                        <div class="text-xs text-gray-500 mt-1">Monedas con markPrice</div>
+                    </div>
+                `;
+
+                // Detalle de grids activos
+                const detail = document.getElementById('health-grids-detail');
+                const executor = d.executor;
+                detail.innerHTML = `<div class="font-mono text-xs">Grids activos en executor: ${executor.grids_activos} | Órdenes en cola: ${executor.cola_size}</div>`;
+            } catch (e) { console.error('[HEALTH] Error:', e); }
+        }
+
+        // ============================================
+        // V6.2: COMPARADOR DE MONEDAS
+        // ============================================
+        function loadCompareSymbols() {
+            const sel = document.getElementById('compare-symbols');
+            if (sel.options.length > 0) return;
+            const symbols = Object.keys(coinConfig).sort();
+            symbols.forEach(sym => {
+                const opt = document.createElement('option');
+                opt.value = sym; opt.innerText = sym;
+                sel.appendChild(opt);
+            });
+        }
+
+        async function loadCompare() {
+            const sel = document.getElementById('compare-symbols');
+            const selected = Array.from(sel.selectedOptions).map(o => o.value);
+            if (!selected.length) return;
+
+            const tbody = document.querySelector('#compare-table tbody');
+            tbody.innerHTML = selected.map(sym => {
+                const d = marketData[sym];
+                if (!d) return `<tr><td class="font-bold">${sym}</td><td colspan="8" class="text-gray-500">Sin datos</td></tr>`;
+                return `<tr>
+                    <td class="font-bold">${sym}</td>
+                    <td class="font-mono">$${d.price?.toFixed(4) || '--'}</td>
+                    <td><span class="px-1.5 py-0.5 rounded text-[10px] font-bold ${d.estado === 'FIRE' ? 'bg-red-900 text-red-300' : (d.estado === 'ARMED' ? 'bg-yellow-900 text-yellow-300' : 'bg-gray-700 text-gray-300')}">${d.estado || 'MONITOREO'}</span></td>
+                    <td>${d.score || 0}</td>
+                    <td class="font-mono ${(d.rsi_7 || 0) > 75 ? 'text-red-400' : ((d.rsi_7 || 0) < 25 ? 'text-green-400' : 'text-gray-300')}">${d.rsi_7?.toFixed(1) || '--'}</td>
+                    <td class="font-mono">${d.rsi_15m?.toFixed(1) || '--'}</td>
+                    <td class="font-mono">${d.adx?.toFixed(1) || '--'}</td>
+                    <td class="font-mono">${d.atr_1m?.toFixed(4) || '--'}</td>
+                    <td class="font-mono ${(d.ema300_distancia_pct || 0) > 0.5 ? 'text-red-400' : ((d.ema300_distancia_pct || 0) < -0.5 ? 'text-green-400' : 'text-gray-300')}">${d.ema300_distancia_pct?.toFixed(2) + '%' || '--'}</td>
+                </tr>`;
+            }).join('');
+        }
+
+        function exportCompareCSV() {
+            const sel = document.getElementById('compare-symbols');
+            const selected = Array.from(sel.selectedOptions).map(o => o.value);
+            if (!selected.length) return;
+            const headers = ['symbol', 'price', 'estado', 'score', 'rsi_7', 'rsi_15m', 'adx', 'atr_1m', 'ema300_distancia_pct'];
+            const rows = selected.map(sym => {
+                const d = marketData[sym] || {};
+                return headers.map(h => `"${(d[h] || '').toString().replace(/"/g, '""')}"`).join(',');
+            });
+            downloadCSV('comparador.csv', [headers.join(','), ...rows].join('\n'));
+        }
+
+        // ============================================
+        // V6.2: EXPORT CSV UTIL
+        // ============================================
+        function downloadCSV(filename, content) {
+            const blob = new Blob([content], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = filename;
+            link.click();
+        }
+
+        function exportStatsCSV() {
+            // Exporta resumen de stats
+            const data = [
+                ['Métrica', 'Valor'],
+                ['Fires Hoy', document.getElementById('stat-fires').innerText],
+                ['Rechazados Hoy', document.getElementById('stat-rechazados').innerText],
+                ['NM Finalizados', document.getElementById('stat-finalizados').innerText],
+                ['Win Rate', document.getElementById('stat-winrate').innerText],
+                ['Grids Activos', document.getElementById('stat-grids-activos').innerText],
+                ['PnL Real', document.getElementById('stat-pnl-real').innerText],
+                ['Fees', document.getElementById('stat-fees-real').innerText],
+                ['Circuit Breakers', document.getElementById('stat-cb').innerText],
+            ];
+            downloadCSV('stats_summary.csv', data.map(r => r.join(',')).join('\n'));
+        }
+
+        function exportRankingCSV() {
+            if (!window._rankingData) return;
+            const headers = ['symbol', 'fires', 'rechazos', 'nm_finalizados', 'win_rate', 'pnl_real', 'streak_aciertos'];
+            const rows = window._rankingData.map(r => headers.map(h => `"${(r[h] || '').toString().replace(/"/g, '""')}"`).join(','));
+            downloadCSV('ranking.csv', [headers.join(','), ...rows].join('\n'));
+        }
+
+        function exportGridCSV() {
+            // Ya cubierto por exportGridsCSV
+        }
+
+        // ============================================
+        // V6.2: MENÚ MÓVIL
         // ============================================
         function toggleMobileMenu() {
             const sidebar = document.getElementById('sidebar');
@@ -1185,12 +1499,13 @@
         }
 
         // ============================================
-        // V6.1: ESTADÍSTICAS DESDE DB
+        // V6.2: ESTADÍSTICAS DESDE DB (MEJORADAS)
         // ============================================
-                function renderRanking(data) {
+        function renderRanking(data) {
+            window._rankingData = data;
             const tbody = document.querySelector('#ranking-table tbody');
             if (!data || data.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-gray-500 py-8">Sin datos</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="9" class="text-center text-gray-500 py-8">Sin datos</td></tr>';
                 return;
             }
             tbody.innerHTML = data.map(row => {
@@ -1201,6 +1516,7 @@
                 const estadoBadge = row.pausada_manual ? '<span class="px-1.5 py-0.5 rounded bg-orange-900 text-orange-300 text-[10px]">PAUSADA</span>' : 
                                    (row.estado === 'NEUTRAL_GRID' ? '<span class="px-1.5 py-0.5 rounded bg-purple-900 text-purple-300 text-[10px]">N-GRID</span>' : 
                                    '<span class="px-1.5 py-0.5 rounded bg-gray-700 text-gray-300 text-[10px]">' + row.estado + '</span>');
+                const streakColor = row.streak_aciertos >= 3 ? 'text-green-400' : (row.streak_aciertos >= 1 ? 'text-yellow-400' : 'text-gray-500');
                 return `<tr>
                     <td class="font-bold">${row.symbol}</td>
                     <td>${estadoBadge}</td>
@@ -1209,6 +1525,8 @@
                     <td class="font-mono">${row.nm_finalizados}</td>
                     <td class="font-mono ${wrColor}">${wr}</td>
                     <td class="font-mono ${pnlColor}">${pnlStr}</td>
+                    <td class="font-mono ${streakColor}">${row.streak_aciertos || 0}🔥</td>
+                    <td class="font-mono text-green-400">${row.mejor_trade !== null ? '+' + row.mejor_trade.toFixed(2) : '--'}</td>
                 </tr>`;
             }).join('');
         }
@@ -1238,11 +1556,17 @@
                 ${bar('→ FIRE', f.fires, 'bg-red-600', c.armed_to_fire_pct)}
                 ${bar('N-GRID', f.neutral_grids, 'bg-purple-600', null)}
                 ${bar('Rechazados', f.rechazados, 'bg-orange-700', null)}
-                <div class="mt-2 pt-2 border-t border-gray-700 text-[10px] text-gray-500">
+            `;
+
+            const latContainer = document.getElementById('funnel-latency');
+            if (d.latencias) {
+                latContainer.innerHTML = `
                     ARMED→FIRE: <span class="text-white font-bold">${c.armed_to_fire_pct}%</span> | 
                     FIRE vs NEUTRAL: <span class="text-white font-bold">${c.fire_vs_neutral_pct}%</span>
-                </div>
-            `;
+                    ${d.latencias.avg_seg_armed_to_fire ? `<br>⏱️ Latencia promedio FIRE: <span class="text-yellow-400 font-bold">${d.latencias.avg_seg_armed_to_fire}s</span>` : ''}
+                    ${d.latencias.avg_seg_armed_to_reject ? `<br>⏱️ Latencia promedio RECHAZO: <span class="text-orange-400 font-bold">${d.latencias.avg_seg_armed_to_reject}s</span>` : ''}
+                `;
+            }
         }
 
         function renderRechazos(d) {
@@ -1270,7 +1594,6 @@
 
         async function fetchStats() {
             try {
-                // 1. Summary
                 const res = await fetch('/api/stats/summary');
                 const data = await res.json();
 
@@ -1314,6 +1637,20 @@
                     }
 
                     document.getElementById('stats-last-update').innerText = 'Actualizado: ' + new Date().toLocaleTimeString();
+
+                    // V6.2: Detección de anomalías
+                    if (data.win_rate_rechazos !== null && data.win_rate_rechazos < 30 && data.finalizados_hoy >= 5) {
+                        if (!anomaliasDetectadas.has('win_rate_bajo')) {
+                            anomaliasDetectadas.add('win_rate_bajo');
+                            showToast({ symbol: 'SISTEMA', tipo: 'ANOMALIA', direction: 'N/A', score: 0, rechazos: [`Win Rate de near-misses cayó a ${data.win_rate_rechazos}%`], params: null });
+                        }
+                    }
+                    if (pnlReal < -10) {
+                        if (!anomaliasDetectadas.has('pnl_negativo')) {
+                            anomaliasDetectadas.add('pnl_negativo');
+                            showToast({ symbol: 'SISTEMA', tipo: 'ANOMALIA', direction: 'N/A', score: 0, rechazos: [`PnL diario negativo: ${pnlReal.toFixed(2)} USDT`], params: null });
+                        }
+                    }
                 } else {
                     document.getElementById('stat-fires').innerText = 'ERR';
                     document.getElementById('stat-rechazados').innerText = 'ERR';
@@ -1326,9 +1663,7 @@
                     document.getElementById('stat-fees-real').innerText = 'ERR';
                     document.getElementById('stat-cb').innerText = 'ERR';
                 }
-            } catch (e) {
-                console.error("[STATS] Error cargando summary:", e);
-            }
+            } catch (e) { console.error("[STATS] Error cargando summary:", e); }
 
             try {
                 const res2 = await fetch('/api/stats/per-coin');
@@ -1353,27 +1688,45 @@
             }
         }
 
-async function fetchGridNeutral(symbol) {
+        // V6.2: fetchGridNeutral mejorado con desglose PnL
+        async function fetchGridNeutral(symbol) {
             try {
-                const res = await fetch(`/api/grid-neutral/${symbol}`);
-                const data = await res.json();
+                // Primero intentar endpoint detallado de PnL
+                let data = null;
+                let useDetailed = false;
+                try {
+                    const resPnl = await fetch(`/api/grid/${symbol}/pnl`);
+                    if (resPnl.ok) {
+                        data = await resPnl.json();
+                        useDetailed = true;
+                    }
+                } catch(e) {}
+
+                if (!data) {
+                    const res = await fetch(`/api/grid-neutral/${symbol}`);
+                    data = await res.json();
+                }
+
                 const gridInfo = document.getElementById('grid-info');
                 const gridStats = document.getElementById('grid-stats');
                 const gridBadge = document.getElementById('grid-badge');
+                const gridPnlBreakdown = document.getElementById('grid-pnl-breakdown');
+                const gridPnlContent = document.getElementById('grid-pnl-breakdown-content');
 
-                if (data.grid_activo) {
-                    gridInfo.innerText = `Grid ID: ${data.grid_id} | Niveles: ${data.niveles}`;
+                if (data.grid_activo || useDetailed) {
+                    const pnlVal = useDetailed ? data.pnl_db : data.pnl_neto;
+                    gridInfo.innerText = useDetailed ? `Grid ID: ${data.grid_id} | Discrepancia RAM/DB: ${data.discrepancia?.toFixed(4) || 0}` : `Grid ID: ${data.grid_id} | Niveles: ${data.niveles}`;
                     gridStats.classList.remove('hidden');
                     gridBadge.classList.remove('hidden');
 
-                    document.getElementById('grid-pos-open').innerText = data.posiciones_abiertas || 0;
+                    document.getElementById('grid-pos-open').innerText = useDetailed ? data.posiciones_abiertas : (data.posiciones_abiertas || 0);
 
                     const pnlEl = document.getElementById('grid-pnl');
-                    pnlEl.innerText = (data.pnl_neto > 0 ? '+' : '') + data.pnl_neto.toFixed(4) + ' USDT';
-                    pnlEl.className = 'text-lg font-mono ' + (data.pnl_neto >= 0 ? 'text-green-400' : 'text-red-400');
+                    pnlEl.innerText = (pnlVal > 0 ? '+' : '') + (pnlVal || 0).toFixed(4) + ' USDT';
+                    pnlEl.className = 'text-lg font-mono ' + ((pnlVal || 0) >= 0 ? 'text-green-400' : 'text-red-400');
 
-                    document.getElementById('grid-trades').innerText = (data.trades_completados || 0) + ' (' + (data.trades_kill_switch || 0) + ' KS)';
-                    document.getElementById('grid-ks').innerText = data.trades_kill_switch || 0;
+                    document.getElementById('grid-trades').innerText = (useDetailed ? data.total_trades : (data.trades_completados || 0)) + ' (' + (useDetailed ? data.trades_kill_switch : (data.trades_kill_switch || 0)) + ' KS)';
+                    document.getElementById('grid-ks').innerText = useDetailed ? data.trades_kill_switch : (data.trades_kill_switch || 0);
 
                     const trappedEl = document.getElementById('grid-trapped');
                     trappedEl.innerText = data.posiciones_atrapadas || 0;
@@ -1384,18 +1737,27 @@ async function fetchGridNeutral(symbol) {
                     if ((data.posiciones_vencidas || 0) > 0) {
                         gridInfo.innerHTML += ` <span class="text-red-400 font-bold">⚠️ ${data.posiciones_vencidas} vencidas</span>`;
                     }
+
+                    // Desglose PnL por tipo
+                    if (useDetailed && data.desglose) {
+                        gridPnlBreakdown.classList.remove('hidden');
+                        gridPnlContent.innerHTML = Object.entries(data.desglose).map(([tipo, info]) => 
+                            `<div class="flex justify-between"><span>${tipo}:</span><span class="${info.pnl >= 0 ? 'text-green-400' : 'text-red-400'}">${info.pnl >= 0 ? '+' : ''}${info.pnl.toFixed(4)} (${info.count})</span></div>`
+                        ).join('');
+                    } else {
+                        gridPnlBreakdown.classList.add('hidden');
+                    }
                 } else {
                     gridInfo.innerText = data.mensaje || 'Sin grid neutral activo';
                     gridStats.classList.add('hidden');
                     gridBadge.classList.add('hidden');
+                    gridPnlBreakdown.classList.add('hidden');
                 }
-            } catch (e) {
-                console.error("[GRID] Error cargando grid neutral:", e);
-            }
+            } catch (e) { console.error("[GRID] Error cargando grid neutral:", e); }
         }
 
         // ============================================
-        // V6.1: PAUSA RÁPIDA DE MONEDA
+        // V6.2: PAUSA RÁPIDA DE MONEDA
         // ============================================
         async function pauseCurrentCoin() {
             if (!activeSymbol) return;
@@ -1403,18 +1765,9 @@ async function fetchGridNeutral(symbol) {
                 const res = await fetch(`/api/pause/${activeSymbol}`, { method: 'POST' });
                 const data = await res.json();
                 if (data.paused) {
-                    showToast({
-                        symbol: activeSymbol,
-                        tipo: 'PAUSA_MANUAL',
-                        direction: marketData[activeSymbol]?.direccion_filtro || 'N/A',
-                        score: 0,
-                        rechazos: ['Moneda pausada manualmente desde el dashboard'],
-                        params: null
-                    });
+                    showToast({ symbol: activeSymbol, tipo: 'PAUSA_MANUAL', direction: marketData[activeSymbol]?.direccion_filtro || 'N/A', score: 0, rechazos: ['Moneda pausada manualmente desde el dashboard'], params: null });
                 }
-            } catch (e) {
-                console.error("[PAUSE] Error:", e);
-            }
+            } catch (e) { console.error("[PAUSE] Error:", e); }
         }
 
         function updatePauseButton() {
@@ -1445,22 +1798,13 @@ async function fetchGridNeutral(symbol) {
                 const res = await fetch(`/api/resume/${activeSymbol}`, { method: 'POST' });
                 const data = await res.json();
                 if (data.resumed) {
-                    showToast({
-                        symbol: activeSymbol,
-                        tipo: 'REANUDAR',
-                        direction: marketData[activeSymbol]?.direccion_filtro || 'N/A',
-                        score: 0,
-                        rechazos: ['Moneda reanudada manualmente'],
-                        params: null
-                    });
+                    showToast({ symbol: activeSymbol, tipo: 'REANUDAR', direction: marketData[activeSymbol]?.direccion_filtro || 'N/A', score: 0, rechazos: ['Moneda reanudada manualmente'], params: null });
                 }
-            } catch (e) {
-                console.error("[RESUME] Error:", e);
-            }
+            } catch (e) { console.error("[RESUME] Error:", e); }
         }
 
         // ============================================
-        // SISTEMA DE ALERTAS
+        // SISTEMA DE ALERTAS (MEJORADO)
         // ============================================
         function toggleAlertMenu() {
             const dropdown = document.getElementById('alert-dropdown');
@@ -1499,25 +1843,19 @@ async function fetchGridNeutral(symbol) {
             const isCB = alertData.tipo === 'CIRCUIT_BREAKER';
             const isPause = alertData.tipo === 'PAUSA_MANUAL';
             const isNeutralGrid = alertData.tipo === 'NEUTRAL_GRID';
+            const isAnomalia = alertData.tipo === 'ANOMALIA';
 
             let bgColor, borderColor, textColor;
-            if (isFire) {
-                bgColor = 'bg-red-900/90'; borderColor = 'border-red-500'; textColor = 'text-red-400';
-            } else if (isRechazado) {
-                bgColor = 'bg-orange-900/90'; borderColor = 'border-orange-500'; textColor = 'text-orange-400';
-            } else if (isCB) {
-                bgColor = 'bg-purple-900/90'; borderColor = 'border-purple-500'; textColor = 'text-purple-400';
-            } else if (isPause) {
-                bgColor = 'bg-orange-900/90'; borderColor = 'border-orange-500'; textColor = 'text-orange-400';
-            } else if (isNeutralGrid) {
-                bgColor = 'bg-cyan-900/90'; borderColor = 'border-cyan-500'; textColor = 'text-cyan-400';
-            } else {
-                bgColor = 'bg-yellow-900/90'; borderColor = 'border-yellow-500'; textColor = 'text-yellow-400';
-            }
+            if (isFire) { bgColor = 'bg-red-900/90'; borderColor = 'border-red-500'; textColor = 'text-red-400'; }
+            else if (isRechazado) { bgColor = 'bg-orange-900/90'; borderColor = 'border-orange-500'; textColor = 'text-orange-400'; }
+            else if (isCB) { bgColor = 'bg-purple-900/90'; borderColor = 'border-purple-500'; textColor = 'text-purple-400'; }
+            else if (isPause) { bgColor = 'bg-orange-900/90'; borderColor = 'border-orange-500'; textColor = 'text-orange-400'; }
+            else if (isNeutralGrid) { bgColor = 'bg-cyan-900/90'; borderColor = 'border-cyan-500'; textColor = 'text-cyan-400'; }
+            else if (isAnomalia) { bgColor = 'bg-yellow-900/90'; borderColor = 'border-yellow-500'; textColor = 'text-yellow-400'; }
+            else { bgColor = 'bg-yellow-900/90'; borderColor = 'border-yellow-500'; textColor = 'text-yellow-400'; }
 
             const toast = document.createElement('div');
             toast.className = `pointer-events-auto w-80 p-4 rounded-xl border ${borderColor} ${bgColor} backdrop-blur shadow-2xl toast-enter flex flex-col gap-1 cursor-pointer`;
-
             toast.onclick = () => {
                 document.getElementById('alert-dropdown').classList.remove('hidden');
                 unreadAlerts = 0;
@@ -1528,20 +1866,13 @@ async function fetchGridNeutral(symbol) {
             let msg;
             if (isFire) {
                 msg = `🔥 DISPARO <b>${alertData.direction}</b> | Score: ${alertData.score}`;
-                if (alertData.params && alertData.params.auto_compressed) {
-                    msg += ' <span class="text-yellow-400">[AUTO-COMPRIMIDO]</span>';
-                }
-            } else if (isRechazado) {
-                msg = `❌ RECHAZADO <b>${alertData.direction}</b> | ${alertData.rechazos[0]}`;
-            } else if (isCB) {
-                msg = `🔒 CIRCUIT BREAKER | ${alertData.rechazos[0]}`;
-            } else if (isPause) {
-                msg = `⏸️ PAUSADA MANUALMENTE | ${alertData.rechazos[0]}`;
-            } else if (isNeutralGrid) {
-                msg = `💠 GRID NEUTRAL ACTIVADO | El bot asume control lateral`;
-            } else {
-                msg = alertData.tipo;
-            }
+                if (alertData.params && alertData.params.auto_compressed) msg += ' <span class="text-yellow-400">[AUTO-COMPRIMIDO]</span>';
+            } else if (isRechazado) { msg = `❌ RECHAZADO <b>${alertData.direction}</b> | ${alertData.rechazos[0]}`; }
+            else if (isCB) { msg = `🔒 CIRCUIT BREAKER | ${alertData.rechazos[0]}`; }
+            else if (isPause) { msg = `⏸️ PAUSADA MANUALMENTE | ${alertData.rechazos[0]}`; }
+            else if (isNeutralGrid) { msg = `💠 GRID NEUTRAL ACTIVADO | El bot asume control lateral`; }
+            else if (isAnomalia) { msg = `⚠️ ANOMALÍA | ${alertData.rechazos[0]}`; }
+            else { msg = alertData.tipo; }
 
             toast.innerHTML = `
                 <div class="flex justify-between items-start">
@@ -1603,29 +1934,25 @@ async function fetchGridNeutral(symbol) {
             const isFire = alertData.tipo === 'FIRE';
             const isRechazado = alertData.tipo === 'RECHAZADO';
             const isCB = alertData.tipo === 'CIRCUIT_BREAKER';
+            const isAnomalia = alertData.tipo === 'ANOMALIA';
 
             let color, borderColor, bgColor;
             if (isFire) { color = 'text-red-400'; borderColor = 'border-red-800'; bgColor = 'bg-red-900/20'; }
             else if (isRechazado) { color = 'text-orange-400'; borderColor = 'border-orange-800'; bgColor = 'bg-orange-900/20'; }
             else if (isCB) { color = 'text-purple-400'; borderColor = 'border-purple-800'; bgColor = 'bg-purple-900/20'; }
             else if (isNeutralGrid) { color = 'text-cyan-400'; borderColor = 'border-cyan-800'; bgColor = 'bg-cyan-900/20'; }
+            else if (isAnomalia) { color = 'text-yellow-400'; borderColor = 'border-yellow-800'; bgColor = 'bg-yellow-900/20'; }
             else { color = 'text-yellow-400'; borderColor = 'border-yellow-800'; bgColor = 'bg-yellow-900/20'; }
 
             let msg;
             if (isFire) {
                 msg = `🔥 DISPARO <span class="font-bold">${alertData.direction}</span> (Score: ${alertData.score})`;
-                if (alertData.params && alertData.params.auto_compressed) {
-                    msg += ' <span class="text-yellow-400">[AUTO-COMPRIMIDO]</span>';
-                }
-            } else if (isRechazado) {
-                msg = `❌ RECHAZADO <span class="font-bold">${alertData.direction}</span> | ${alertData.rechazos[0]}`;
-            } else if (isCB) {
-                msg = `🔒 CIRCUIT BREAKER | ${alertData.rechazos[0]}`;
-            } else if (isNeutralGrid) {
-                msg = `💠 GRID NEUTRAL ACTIVADO | El bot asume control lateral`;
-            } else {
-                msg = `Estado: ${alertData.tipo}`;
-            }
+                if (alertData.params && alertData.params.auto_compressed) msg += ' <span class="text-yellow-400">[AUTO-COMPRIMIDO]</span>';
+            } else if (isRechazado) { msg = `❌ RECHAZADO <span class="font-bold">${alertData.direction}</span> | ${alertData.rechazos[0]}`; }
+            else if (isCB) { msg = `🔒 CIRCUIT BREAKER | ${alertData.rechazos[0]}`; }
+            else if (isNeutralGrid) { msg = `💠 GRID NEUTRAL ACTIVADO | El bot asume control lateral`; }
+            else if (isAnomalia) { msg = `⚠️ ANOMALÍA | ${alertData.rechazos[0]}`; }
+            else { msg = `Estado: ${alertData.tipo}`; }
 
             const div = document.createElement('div');
             div.className = `text-sm p-2 rounded border ${borderColor} ${bgColor} shrink-0`;
@@ -1640,33 +1967,23 @@ async function fetchGridNeutral(symbol) {
                     Grid: ${alertData.params.grid_count} líneas | ${alertData.params.direction} | L:${alertData.params.lower_limit} U:${alertData.params.upper_limit}
                 </div>` : ''}
             `;
-
             container.insertBefore(div, container.firstChild);
             while (container.children.length > MAX_ALERTS) container.removeChild(container.lastChild);
         }
 
         function logAlert(data) {
             const alertObj = {
-                symbol: data.symbol,
-                tipo: data.tipo,
-                direction: data.direction,
-                score: data.score,
-                rechazos: data.rechazos || [],
-                params: data.params,
-                time: new Date().toLocaleTimeString()
+                symbol: data.symbol, tipo: data.tipo, direction: data.direction,
+                score: data.score, rechazos: data.rechazos || [],
+                params: data.params, time: new Date().toLocaleTimeString()
             };
-
             const alerts = loadAlerts();
             alerts.unshift(alertObj);
             saveAlerts(alerts);
             appendAlertHTML(alertObj);
             showToast(alertObj);
-
             const dropdown = document.getElementById('alert-dropdown');
-            if (dropdown.classList.contains('hidden')) {
-                unreadAlerts++;
-                updateBadge();
-            }
+            if (dropdown.classList.contains('hidden')) { unreadAlerts++; updateBadge(); }
         }
 
         // ============================================
@@ -1674,30 +1991,21 @@ async function fetchGridNeutral(symbol) {
         // ============================================
         function toggleCoin(symbol, event) {
             if (event) event.stopPropagation();
-
             const isActive = coinConfig[symbol] ? coinConfig[symbol].active : true;
             const newState = !isActive;
-
             if (!coinConfig[symbol]) coinConfig[symbol] = {};
             coinConfig[symbol].active = newState;
-
             updateCoinToggleUI(symbol, newState);
-
             fetch('/api/toggle-coin', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ symbol: symbol, active: newState })
             }).catch(e => console.error('[TOGGLE] Error:', e));
-
             if (activeSymbol === symbol && !newState) {
-                candleSeries.setData([]);
-                emaSeries.setData([]);
-                ema200Series.setData([]);
+                candleSeries.setData([]); emaSeries.setData([]); ema200Series.setData([]);
                 document.getElementById('active-coin-title').innerText = 'SELECCIONA MONEDA';
                 document.getElementById('active-coin-price').innerText = '--.----';
                 activeSymbol = null;
             }
-
             filterCoinList();
         }
 
@@ -1705,33 +2013,20 @@ async function fetchGridNeutral(symbol) {
             const item = document.getElementById(`coin-${symbol}`);
             const toggle = document.getElementById(`toggle-${symbol}`);
             if (item) {
-                if (isActive) {
-                    item.classList.remove('disabled');
-                } else {
-                    item.classList.add('disabled');
-                }
+                item.classList.remove('disabled', 'inactive-selected');
+                if (!isActive) item.classList.add('disabled');
             }
             if (toggle) {
-                if (isActive) {
-                    toggle.classList.add('active');
-                } else {
-                    toggle.classList.remove('active');
-                }
+                toggle.classList.toggle('active', isActive);
             }
         }
 
         function toggleAllCoins(state) {
-            Object.keys(coinConfig).forEach(sym => {
-                coinConfig[sym].active = state;
-                updateCoinToggleUI(sym, state);
-            });
-
+            Object.keys(coinConfig).forEach(sym => { coinConfig[sym].active = state; updateCoinToggleUI(sym, state); });
             fetch('/api/toggle-all-coins', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ active: state })
             }).catch(e => console.error('[TOGGLE ALL] Error:', e));
-
             filterCoinList();
         }
 
@@ -1744,14 +2039,15 @@ async function fetchGridNeutral(symbol) {
                 const data = marketData[symbol];
                 let visible = true;
 
-                if (textFilter && !symbol.toLowerCase().includes(textFilter)) {
-                    visible = false;
-                }
+                if (textFilter && !symbol.toLowerCase().includes(textFilter)) visible = false;
 
                 if (stateFilter === 'active') {
                     if (!coinConfig[symbol] || !coinConfig[symbol].active) visible = false;
                 } else if (stateFilter === 'paused') {
                     if (coinConfig[symbol] && coinConfig[symbol].active) visible = false;
+                } else if (stateFilter === 'inactive') {
+                    if (coinConfig[symbol] && coinConfig[symbol].active) visible = false;
+                    if (!data) visible = false;
                 } else if (stateFilter !== 'all') {
                     if (!data || data.estado !== stateFilter) visible = false;
                 }
@@ -1769,18 +2065,11 @@ async function fetchGridNeutral(symbol) {
                 const res = await fetch('/api/snapshot');
                 const data = await res.json();
 
-                if (!data.snapshot) {
-                    console.warn('[SNAPSHOT] Respuesta vacia del servidor');
-                    return;
-                }
-
-                if (data.coin_config) {
-                    coinConfig = data.coin_config;
-                }
+                if (!data.snapshot) { console.warn('[SNAPSHOT] Respuesta vacia del servidor'); return; }
+                if (data.coin_config) coinConfig = data.coin_config;
 
                 for (const [sym, symData] of Object.entries(data.snapshot)) {
                     if (!marketData[sym]) marketData[sym] = {};
-
                     if (symData.precio != null) marketData[sym].price = symData.precio;
 
                     if (symData.estado) {
@@ -1797,44 +2086,38 @@ async function fetchGridNeutral(symbol) {
                     if (symData.indicadores_1m) {
                         const p = symData.indicadores_1m;
                         Object.assign(marketData[sym], {
-                            rsi_7: p.rsi_7, ema_300: p.ema_300,
-                            wick_upper: p.wick_upper_pct, wick_lower: p.wick_lower_pct,
+                            rsi_7: p.rsi_7, ema_300: p.ema_300, wick_upper: p.wick_upper_pct, wick_lower: p.wick_lower_pct,
                             body_dir: p.body_direction, close: p.close, high: p.high, low: p.low,
-                            atr_1m: p.atr_1m, mecha_valida_short: p.mecha_valida_short,
-                            mecha_valida_long: p.mecha_valida_long,
-                            ema300_distancia_pct: p.ema300_distancia_pct,
-                            volume: p.volume, volume_sma20: p.volume_sma20,
+                            atr_1m: p.atr_1m, mecha_valida_short: p.mecha_valida_short, mecha_valida_long: p.mecha_valida_long,
+                            ema300_distancia_pct: p.ema300_distancia_pct, volume: p.volume, volume_sma20: p.volume_sma20,
                         });
                     }
-
                     if (symData.indicadores_15m) {
                         const p = symData.indicadores_15m;
                         Object.assign(marketData[sym], {
                             rsi_15m: p.rsi, adx: p.adx, macd: p.macd_hist, atr: p.atr,
-                            ema200_15m: p.ema200_15m, volume: p.volume,
-                            volume_sma20: p.volume_sma20,
+                            ema200_15m: p.ema200_15m, volume: p.volume, volume_sma20: p.volume_sma20,
                             recent_high: p.recent_high, recent_low: p.recent_low,
                         });
                     }
-
                     if (symData.indicadores_4h) {
                         marketData[sym].ema200_4h = symData.indicadores_4h.ema200_4h;
                         marketData[sym].close_4h = symData.indicadores_4h.close;
                     }
-
-                    if (!document.getElementById(`coin-${sym}`)) {
-                        createCoinListItem(sym);
-                    }
+                    if (!document.getElementById(`coin-${sym}`)) createCoinListItem(sym);
                     updateCoinListItem(sym);
                 }
 
+                // V6.2: También crear items para monedas inactivas del registro
+                for (const [sym, cfg] of Object.entries(coinConfig)) {
+                    if (!document.getElementById(`coin-${sym}`)) createCoinListItem(sym);
+                }
+
                 const savedSymbol = sessionStorage.getItem('activeSymbol');
-                if (savedSymbol && marketData[savedSymbol] && coinConfig[savedSymbol] && coinConfig[savedSymbol].active) {
+                if (savedSymbol && marketData[savedSymbol]) {
                     selectCoin(savedSymbol);
                 } else if (!activeSymbol && Object.keys(marketData).length > 0) {
-                    const firstActive = Object.keys(marketData).find(s => 
-                        coinConfig[s] && coinConfig[s].active
-                    );
+                    const firstActive = Object.keys(marketData).find(s => coinConfig[s] && coinConfig[s].active);
                     selectCoin(firstActive || Object.keys(marketData)[0]);
                 } else if (activeSymbol && marketData[activeSymbol]) {
                     updateIndicatorsUI(marketData[activeSymbol]);
@@ -1842,12 +2125,8 @@ async function fetchGridNeutral(symbol) {
 
                 updateCoinCount();
                 console.log(`[SNAPSHOT] Estado reconstruido para ${Object.keys(data.snapshot).length} simbolos`);
-
                 populateAnalysisFilters();
-
-            } catch (e) {
-                console.error('[SNAPSHOT] Error cargando snapshot:', e);
-            }
+            } catch (e) { console.error('[SNAPSHOT] Error cargando snapshot:', e); }
         }
 
         function populateAnalysisFilters() {
@@ -1878,51 +2157,25 @@ async function fetchGridNeutral(symbol) {
                     let chartData = data.velas
                         .filter(v => v.time != null && v.open != null && v.high != null && v.low != null && v.close != null)
                         .filter(v => !isNaN(v.time) && !isNaN(v.open) && !isNaN(v.high) && !isNaN(v.low) && !isNaN(v.close))
-                        .map(v => ({
-                            time: Math.floor(v.time),
-                            open: parseFloat(v.open),
-                            high: parseFloat(v.high),
-                            low: parseFloat(v.low),
-                            close: parseFloat(v.close)
-                        }));
+                        .map(v => ({ time: Math.floor(v.time), open: parseFloat(v.open), high: parseFloat(v.high), low: parseFloat(v.low), close: parseFloat(v.close) }));
                     chartData.sort((a, b) => a.time - b.time);
-                    if (chartData.length > 2000) {
-                        chartData = chartData.slice(-2000);
-                    }
-                    if (chartData.length > 0) {
-                        candleSeries.setData(chartData);
-                    }
+                    if (chartData.length > 2000) chartData = chartData.slice(-2000);
+                    if (chartData.length > 0) candleSeries.setData(chartData);
 
                     if (tf === '1m' && chartData.length >= 300) {
                         const emaData = calcularEMA300(chartData);
-                        if (emaData.length > 0) {
-                            emaSeries.setData(emaData);
-                            emaSeries.applyOptions({ visible: true });
-                        }
-                    } else {
-                        emaSeries.setData([]);
-                        emaSeries.applyOptions({ visible: false });
-                    }
+                        if (emaData.length > 0) { emaSeries.setData(emaData); emaSeries.applyOptions({ visible: true }); }
+                    } else { emaSeries.setData([]); emaSeries.applyOptions({ visible: false }); }
 
                     if (tf === '15m' && marketData[symbol] && marketData[symbol].ema200_15m != null && !isNaN(marketData[symbol].ema200_15m)) {
                         const emaVal = parseFloat(marketData[symbol].ema200_15m);
-                        const emaData = chartData.map(v => ({
-                            time: v.time, value: emaVal
-                        })).filter(v => v.time != null && !isNaN(v.value));
-                        if (emaData.length > 0) {
-                            ema200Series.setData(emaData);
-                            ema200Series.applyOptions({ visible: true });
-                        }
-                    } else {
-                        ema200Series.setData([]);
-                        ema200Series.applyOptions({ visible: false });
-                    }
+                        const emaData = chartData.map(v => ({ time: v.time, value: emaVal })).filter(v => v.time != null && !isNaN(v.value));
+                        if (emaData.length > 0) { ema200Series.setData(emaData); ema200Series.applyOptions({ visible: true }); }
+                    } else { ema200Series.setData([]); ema200Series.applyOptions({ visible: false }); }
 
                     chart.timeScale().fitContent();
                     document.getElementById('chart-info').innerText = `${chartData.length} velas | tf=${tf}`;
-                } else {
-                    document.getElementById('chart-info').innerText = `0 velas | tf=${tf}`;
-                }
+                } else { document.getElementById('chart-info').innerText = `0 velas | tf=${tf}`; }
             } catch (e) { console.error("[CHART] Error cargando velas:", e); }
         }
 
@@ -1930,33 +2183,38 @@ async function fetchGridNeutral(symbol) {
             activeTimeframe = tf;
             ['1m','15m','4h'].forEach(t => {
                 const btn = document.getElementById(`btn-${t}`);
-                if (t === tf) {
-                    btn.className = 'px-3 py-1 text-xs font-bold rounded bg-blue-600 text-white';
-                } else {
-                    btn.className = 'px-3 py-1 text-xs font-bold rounded bg-gray-700 text-gray-400 hover:bg-gray-600';
-                }
+                if (t === tf) btn.className = 'px-3 py-1 text-xs font-bold rounded bg-blue-600 text-white';
+                else btn.className = 'px-3 py-1 text-xs font-bold rounded bg-gray-700 text-gray-400 hover:bg-gray-600';
             });
             if (activeSymbol) loadChartData(activeSymbol, tf);
+            savePreferences();
         }
 
+        // V6.2: FIX selectCoin - permite monedas inactivas con warning
         function selectCoin(symbol) {
             if (!symbol) return;
-
-            if (coinConfig[symbol] && !coinConfig[symbol].active) {
-                return;
-            }
-
             activeSymbol = symbol;
             sessionStorage.setItem('activeSymbol', symbol);
             document.getElementById('active-coin-title').innerText = symbol;
             document.getElementById('mobile-coin-title').innerText = symbol;
 
             document.querySelectorAll('.coin-item').forEach(el => {
-                el.classList.remove('active');
+                el.classList.remove('active', 'inactive-selected');
             });
             const activeEl = document.getElementById(`coin-${symbol}`);
             if (activeEl) {
-                activeEl.classList.add('active');
+                const isActive = coinConfig[symbol] && coinConfig[symbol].active;
+                activeEl.classList.add(isActive ? 'active' : 'inactive-selected');
+            }
+
+            // Warning visual para monedas inactivas
+            const inactiveBadge = document.getElementById('active-coin-inactive');
+            if (inactiveBadge) {
+                if (coinConfig[symbol] && !coinConfig[symbol].active) {
+                    inactiveBadge.classList.remove('hidden');
+                } else {
+                    inactiveBadge.classList.add('hidden');
+                }
             }
 
             if (marketData[symbol]) {
@@ -1965,6 +2223,7 @@ async function fetchGridNeutral(symbol) {
             }
             loadChartData(symbol, activeTimeframe);
             fetchGridNeutral(symbol);
+            savePreferences();
         }
 
         // ============================================
@@ -2010,11 +2269,7 @@ async function fetchGridNeutral(symbol) {
         // ACTUALIZAR UI DE INDICADORES
         // ============================================
         function updateIndicatorsUI(data) {
-            if (!data) {
-                console.warn('[UI] updateIndicatorsUI: data es null');
-                return;
-            }
-
+            if (!data) { console.warn('[UI] updateIndicatorsUI: data es null'); return; }
             if (data.price != null && !isNaN(data.price)) {
                 const el = document.getElementById('active-coin-price');
                 if (el) el.innerText = `$${parseFloat(data.price).toFixed(4)}`;
@@ -2033,22 +2288,18 @@ async function fetchGridNeutral(symbol) {
                 const el = document.getElementById('ind-rsi-15m');
                 if (el) el.innerText = parseFloat(data.rsi_15m).toFixed(1);
             }
-
             if (data.adx != null && !isNaN(data.adx)) {
                 const el = document.getElementById('ind-adx');
                 if (el) el.innerText = parseFloat(data.adx).toFixed(1);
             }
-
             if (data.wick_upper != null && !isNaN(data.wick_upper)) {
                 const el = document.getElementById('ind-wick');
                 if (el) el.innerText = parseFloat(data.wick_upper).toFixed(2) + '%';
             }
-
             if (data.ema_300 != null && !isNaN(data.ema_300)) {
                 const el = document.getElementById('ind-ema300');
                 if (el) el.innerText = parseFloat(data.ema_300).toFixed(4);
             }
-
             if (data.ema300_distancia_pct != null && !isNaN(data.ema300_distancia_pct)) {
                 const dist = parseFloat(data.ema300_distancia_pct);
                 const el = document.getElementById('ind-ema-dist');
@@ -2059,7 +2310,6 @@ async function fetchGridNeutral(symbol) {
                     else el.className = 'font-bold font-mono text-sm text-gray-300';
                 }
             }
-
             if (data.atr_1m != null && !isNaN(data.atr_1m)) {
                 const el = document.getElementById('ind-atr-1m');
                 if (el) el.innerText = parseFloat(data.atr_1m).toFixed(4);
@@ -2070,45 +2320,27 @@ async function fetchGridNeutral(symbol) {
                 estadoEl.innerText = data.estado;
                 estadoEl.className = `text-xs font-bold px-2 py-1 rounded ${getStateColor(data.estado, data.circuit_breaker)}`;
             }
-
             const dirEl = document.getElementById('active-coin-dir');
             if (dirEl) {
                 if (data.direccion_filtro) {
                     dirEl.innerText = data.direccion_filtro;
                     dirEl.className = `text-[10px] font-bold px-1.5 py-0.5 rounded ${data.direccion_filtro === 'LONG' ? 'bg-green-900 text-green-400' : 'bg-red-900 text-red-400'}`;
                     dirEl.classList.remove('hidden');
-                } else {
-                    dirEl.classList.add('hidden');
-                }
+                } else { dirEl.classList.add('hidden'); }
             }
-
             const cbEl = document.getElementById('active-coin-cb');
             if (cbEl) {
-                if (data.circuit_breaker) {
-                    cbEl.classList.remove('hidden');
-                } else {
-                    cbEl.classList.add('hidden');
-                }
+                if (data.circuit_breaker) cbEl.classList.remove('hidden');
+                else cbEl.classList.add('hidden');
             }
-
             const macroEl = document.getElementById('ind-macro');
             const price = data.price, ema4h = data.ema200_4h;
             if (macroEl && ema4h != null && price != null && !isNaN(ema4h) && !isNaN(price) && ema4h > 0 && price > 0) {
                 const diff = ((price - ema4h) / ema4h) * 100;
-                if (diff > 2) {
-                    macroEl.innerText = 'LONG';
-                    macroEl.className = 'font-bold text-sm mt-1 px-2 py-0.5 rounded bg-green-900/50 text-green-400 border border-green-700';
-                } else if (diff < -2) {
-                    macroEl.innerText = 'SHORT';
-                    macroEl.className = 'font-bold text-sm mt-1 px-2 py-0.5 rounded bg-red-900/50 text-red-400 border border-red-700';
-                } else {
-                    macroEl.innerText = 'NEUTRAL';
-                    macroEl.className = 'font-bold text-sm mt-1 px-2 py-0.5 rounded bg-gray-700 text-gray-400 border border-gray-600';
-                }
-            } else if (macroEl) {
-                macroEl.innerText = 'SIN 4H';
-                macroEl.className = 'font-bold text-sm mt-1 px-2 py-0.5 rounded bg-gray-700 text-gray-500 border border-transparent';
-            }
+                if (diff > 2) { macroEl.innerText = 'LONG'; macroEl.className = 'font-bold text-sm mt-1 px-2 py-0.5 rounded bg-green-900/50 text-green-400 border border-green-700'; }
+                else if (diff < -2) { macroEl.innerText = 'SHORT'; macroEl.className = 'font-bold text-sm mt-1 px-2 py-0.5 rounded bg-red-900/50 text-red-400 border border-red-700'; }
+                else { macroEl.innerText = 'NEUTRAL'; macroEl.className = 'font-bold text-sm mt-1 px-2 py-0.5 rounded bg-gray-700 text-gray-400 border border-gray-600'; }
+            } else if (macroEl) { macroEl.innerText = 'SIN 4H'; macroEl.className = 'font-bold text-sm mt-1 px-2 py-0.5 rounded bg-gray-700 text-gray-500 border border-transparent'; }
         }
 
         function updateConnectionQuality() {
@@ -2116,18 +2348,10 @@ async function fetchGridNeutral(symbol) {
             const latency = now - lastPing;
             const el = document.getElementById('conn-quality');
             if (!el) return;
-            if (latency < 1000) {
-                el.innerText = `${latency}ms`;
-                el.className = 'text-[9px] text-green-500 font-mono';
-            } else if (latency < 5000) {
-                el.innerText = `${latency}ms`;
-                el.className = 'text-[9px] text-yellow-500 font-mono';
-            } else {
-                el.innerText = `${latency}ms`;
-                el.className = 'text-[9px] text-red-500 font-mono';
-            }
+            if (latency < 1000) { el.innerText = `${latency}ms`; el.className = 'text-[9px] text-green-500 font-mono'; }
+            else if (latency < 5000) { el.innerText = `${latency}ms`; el.className = 'text-[9px] text-yellow-500 font-mono'; }
+            else { el.innerText = `${latency}ms`; el.className = 'text-[9px] text-red-500 font-mono'; }
         }
-
         setInterval(updateConnectionQuality, 5000);
 
         // ============================================
@@ -2139,8 +2363,7 @@ async function fetchGridNeutral(symbol) {
             const attempts = document.getElementById('conn-attempts');
             if (connected) {
                 dot.className = 'w-3 h-3 rounded-full bg-green-500 pulse-dot';
-                badge.innerText = 'Online';
-                badge.className = 'text-xs text-green-400 font-mono';
+                badge.innerText = 'Online'; badge.className = 'text-xs text-green-400 font-mono';
                 attempts.classList.add('hidden');
                 reconnectDelay = 3000;
             } else {
@@ -2157,8 +2380,7 @@ async function fetchGridNeutral(symbol) {
             let seconds = Math.ceil(reconnectDelay / 1000);
             timer.innerText = seconds;
             const interval = setInterval(() => {
-                seconds--;
-                timer.innerText = seconds;
+                seconds--; timer.innerText = seconds;
                 if (seconds <= 0) clearInterval(interval);
             }, 1000);
         }
@@ -2182,67 +2404,45 @@ async function fetchGridNeutral(symbol) {
 
         function connectWebSocket() {
             if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
-                console.log('[WS] Ya conectado o conectando, skip');
-                return;
+                console.log('[WS] Ya conectado o conectando, skip'); return;
             }
             console.log(`[WS] Intentando conectar a ws://${window.location.host}/ws`);
             try {
                 ws = new WebSocket(`ws://${window.location.host}/ws`);
                 ws.onopen = () => {
                     console.log('[WS] Conectado exitosamente');
-                    setStatus(true);
-                    lastPing = Date.now();
-                    reconnectDelay = 3000;
-
-                    if (isFirstConnect) {
-                        isFirstConnect = false;
-                        document.getElementById('coin-list').innerHTML = '';
-                        marketData = {};
-                    }
+                    setStatus(true); lastPing = Date.now(); reconnectDelay = 3000;
+                    if (isFirstConnect) { isFirstConnect = false; document.getElementById('coin-list').innerHTML = ''; marketData = {}; }
                     loadSnapshot();
                 };
                 ws.onmessage = (event) => {
-                    try {
-                        const data = JSON.parse(event.data);
-                        handleMessage(data);
-                    } catch (e) {
-                        console.error('[WS] Error parseando mensaje:', e, 'Raw:', event.data.substring(0, 200));
-                    }
+                    try { const data = JSON.parse(event.data); handleMessage(data); }
+                    catch (e) { console.error('[WS] Error parseando mensaje:', e, 'Raw:', event.data.substring(0, 200)); }
                 };
                 ws.onclose = (event) => {
                     console.warn(`[WS] Cerrado. Codigo: ${event.code}, Razon: ${event.reason || 'N/A'}`);
-                    setStatus(false, 'Desconectado');
-                    startReconnectCountdown();
+                    setStatus(false, 'Desconectado'); startReconnectCountdown();
                     reconnectDelay = Math.min(reconnectDelay * 1.5, 30000);
                     reconnectTimer = setTimeout(connectWebSocket, reconnectDelay);
                 };
-                ws.onerror = (err) => {
-                    console.error('[WS] Error:', err);
-                    setStatus(false, 'Error WS');
-                };
+                ws.onerror = (err) => { console.error('[WS] Error:', err); setStatus(false, 'Error WS'); };
             } catch (e) {
-                console.error('[WS] Error creando conexion:', e);
-                setStatus(false, 'Error de Red');
-                startReconnectCountdown();
-                reconnectTimer = setTimeout(connectWebSocket, reconnectDelay);
+                console.error('[WS] Error creando conexion:', e); setStatus(false, 'Error de Red');
+                startReconnectCountdown(); reconnectTimer = setTimeout(connectWebSocket, reconnectDelay);
             }
         }
 
         setInterval(() => {
             const now = Date.now();
             const timeSinceLastPing = now - lastPing;
-
             if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ action: "ping" }));
                 if (timeSinceLastPing > 45000) {
                     console.warn(`[WS] Zombie connection detectada (${timeSinceLastPing}ms sin pong). Forzando reconexion...`);
-                    ws.close();
-                    ws = null;
-                    setTimeout(connectWebSocket, 1000);
+                    ws.close(); ws = null; setTimeout(connectWebSocket, 1000);
                 }
             } else if (!ws || ws.readyState === WebSocket.CLOSED) {
-                console.log('[WS] No conectado, intentando reconexion...');
-                connectWebSocket();
+                console.log('[WS] No conectado, intentando reconexion...'); connectWebSocket();
             }
         }, 20000);
 
@@ -2251,62 +2451,37 @@ async function fetchGridNeutral(symbol) {
         // ============================================
         function handleMessage(data) {
             try {
-                if (!data) {
-                    console.warn('[WS] Mensaje vacio recibido');
-                    return;
-                }
-
-                if (data.msg_type === 'pong') {
-                    lastPing = Date.now();
-                    console.log('[WS] Pong recibido');
-                    return;
-                }
-
-                if (!data.symbol) {
-                    console.warn('[WS] Mensaje sin symbol:', data.msg_type);
-                    return;
-                }
+                if (!data) { console.warn('[WS] Mensaje vacio recibido'); return; }
+                if (data.msg_type === 'pong') { lastPing = Date.now(); console.log('[WS] Pong recibido'); return; }
+                if (!data.symbol) { console.warn('[WS] Mensaje sin symbol:', data.msg_type); return; }
 
                 const sym = data.symbol;
-
-                if (!marketData[sym]) {
-                    marketData[sym] = {};
-                    createCoinListItem(sym);
-                    if (!activeSymbol) selectCoin(sym);
-                }
+                if (!marketData[sym]) { marketData[sym] = {}; createCoinListItem(sym); if (!activeSymbol) selectCoin(sym); }
 
                 if (data.msg_type === 'snapshot' && data.payload) {
                     const p = data.payload;
                     if (p.precio != null) marketData[sym].price = p.precio;
-
                     if (p.indicadores_1m) {
                         const i1m = p.indicadores_1m;
                         Object.assign(marketData[sym], {
-                            rsi_7: i1m.rsi_7, ema_300: i1m.ema_300,
-                            wick_upper: i1m.wick_upper_pct, wick_lower: i1m.wick_lower_pct,
+                            rsi_7: i1m.rsi_7, ema_300: i1m.ema_300, wick_upper: i1m.wick_upper_pct, wick_lower: i1m.wick_lower_pct,
                             body_dir: i1m.body_direction, close: i1m.close, high: i1m.high, low: i1m.low,
-                            atr_1m: i1m.atr_1m, mecha_valida_short: i1m.mecha_valida_short,
-                            mecha_valida_long: i1m.mecha_valida_long,
-                            ema300_distancia_pct: i1m.ema300_distancia_pct,
-                            volume: i1m.volume, volume_sma20: i1m.volume_sma20,
+                            atr_1m: i1m.atr_1m, mecha_valida_short: i1m.mecha_valida_short, mecha_valida_long: i1m.mecha_valida_long,
+                            ema300_distancia_pct: i1m.ema300_distancia_pct, volume: i1m.volume, volume_sma20: i1m.volume_sma20,
                         });
                     }
-
                     if (p.indicadores_15m) {
                         const i15m = p.indicadores_15m;
                         Object.assign(marketData[sym], {
                             rsi_15m: i15m.rsi, adx: i15m.adx, macd: i15m.macd_hist, atr: i15m.atr,
-                            ema200_15m: i15m.ema200_15m, volume: i15m.volume,
-                            volume_sma20: i15m.volume_sma20,
+                            ema200_15m: i15m.ema200_15m, volume: i15m.volume, volume_sma20: i15m.volume_sma20,
                             recent_high: i15m.recent_high, recent_low: i15m.recent_low,
                         });
                     }
-
                     if (p.indicadores_4h) {
                         marketData[sym].ema200_4h = p.indicadores_4h.ema200_4h;
                         marketData[sym].close_4h = p.indicadores_4h.close;
                     }
-
                     if (p.estado) {
                         const prevEstado = marketData[sym].estado;
                         marketData[sym].estado = p.estado.estado;
@@ -2317,20 +2492,15 @@ async function fetchGridNeutral(symbol) {
                         marketData[sym].circuit_breaker = p.estado.circuit_breaker_activo;
                         marketData[sym].moneda_pausada = p.estado.moneda_pausada;
                         marketData[sym].moneda_pausada_manual = p.estado.moneda_pausada_manual;
-
                         updateCoinListItem(sym);
 
                         if (p.estado.estado === 'FIRE' && prevEstado !== 'FIRE') {
                             showToast({ symbol: sym, tipo: 'FIRE', direction: p.estado.direccion, score: p.estado.score });
                         }
-
                         if (p.estado.estado === 'NEUTRAL_GRID' && prevEstado !== 'NEUTRAL_GRID') {
                             showToast({ symbol: sym, tipo: 'NEUTRAL_GRID', direction: 'NEUTRAL', score: 0 });
                         }
-
-                        if (p.estado.estado === 'NEUTRAL_GRID' && sym === activeSymbol) {
-                            fetchGridNeutral(sym);
-                        }
+                        if (p.estado.estado === 'NEUTRAL_GRID' && sym === activeSymbol) fetchGridNeutral(sym);
                         if (prevEstado === 'NEUTRAL_GRID' && p.estado.estado !== 'NEUTRAL_GRID' && sym === activeSymbol) {
                             const gridInfo = document.getElementById('grid-info');
                             const gridStats = document.getElementById('grid-stats');
@@ -2340,11 +2510,7 @@ async function fetchGridNeutral(symbol) {
                             if (gridBadge) gridBadge.classList.add('hidden');
                         }
                     }
-
-                    if (sym === activeSymbol) {
-                        updateIndicatorsUI(marketData[sym]);
-                        updatePauseButton();
-                    }
+                    if (sym === activeSymbol) { updateIndicatorsUI(marketData[sym]); updatePauseButton(); }
                     document.getElementById('last-update').innerText = new Date().toLocaleTimeString();
                     return;
                 }
@@ -2353,29 +2519,19 @@ async function fetchGridNeutral(symbol) {
                     marketData[sym].price = data.price;
                     const priceEl = document.getElementById(`list-price-${sym}`);
                     if (priceEl) priceEl.innerText = parseFloat(data.price).toFixed(4);
-
                 } else if (data.msg_type === 'alerta' && data.payload) {
                     logAlert(data.payload);
                 } else if (data.msg_type === 'coin_config_update') {
                     if (data.coin_config) {
                         coinConfig = { ...coinConfig, ...data.coin_config };
-                        Object.keys(data.coin_config).forEach(s => {
-                            updateCoinToggleUI(s, data.coin_config[s].active);
-                        });
+                        Object.keys(data.coin_config).forEach(s => updateCoinToggleUI(s, data.coin_config[s].active));
                         filterCoinList();
                     }
-                } else {
-                    console.log('[WS] Tipo no manejado:', data.msg_type);
-                }
+                } else { console.log('[WS] Tipo no manejado:', data.msg_type); }
 
-                if (sym === activeSymbol) {
-                    updateIndicatorsUI(marketData[sym]);
-                    updatePauseButton();
-                }
+                if (sym === activeSymbol) { updateIndicatorsUI(marketData[sym]); updatePauseButton(); }
                 document.getElementById('last-update').innerText = new Date().toLocaleTimeString();
-            } catch (err) {
-                console.error('[WS] ERROR en handleMessage:', err, 'Data:', data);
-            }
+            } catch (err) { console.error('[WS] ERROR en handleMessage:', err, 'Data:', data); }
         }
 
         // ============================================
@@ -2384,8 +2540,8 @@ async function fetchGridNeutral(symbol) {
         function createCoinListItem(symbol) {
             const list = document.getElementById('coin-list');
             if (list.innerHTML.includes('Esperando datos')) list.innerHTML = '';
-
             const isActive = coinConfig[symbol] ? coinConfig[symbol].active : true;
+            const isInactive = !isActive;
 
             const html = `
                 <div id="coin-${symbol}" data-symbol="${symbol}" 
@@ -2414,11 +2570,9 @@ async function fetchGridNeutral(symbol) {
         function updateCoinListItem(symbol) {
             const data = marketData[symbol];
             if (!data) return;
-
             const stateEl = document.getElementById(`list-state-${symbol}`);
             const dirEl = document.getElementById(`list-dir-${symbol}`);
             const cb = data.circuit_breaker || false;
-
             if (stateEl) {
                 stateEl.innerText = data.estado || 'MONITOREO';
                 stateEl.className = `state-badge w-fit mt-0.5 ${getStateBadgeClass(data.estado, cb)}`;
@@ -2443,10 +2597,9 @@ async function fetchGridNeutral(symbol) {
             renderAlertsFromStorage();
             window.dispatchEvent(new Event('resize'));
             const savedSymbol = sessionStorage.getItem('activeSymbol');
-            if (savedSymbol) {
-                activeSymbol = savedSymbol;
-            }
+            if (savedSymbol) activeSymbol = savedSymbol;
             loadSnapshot().then(() => {
+                loadPreferences();
                 connectWebSocket();
             });
         });
