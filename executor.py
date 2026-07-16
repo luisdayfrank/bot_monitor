@@ -323,10 +323,79 @@ class GridExecutor:
         self._grid_creation_locks: Dict[str, asyncio.Lock] = {}
         # V7.1 FASE 4: Debounce interno para evitar spam de CREAR_GRID
         self._grid_pending_creation: Dict[str, float] = {}
+        # HEDGE MODE: Detección y helpers
+        self._hedge_mode: bool = False  # Se detecta al arrancar
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # LOOP PRINCIPAL
     # ═══════════════════════════════════════════════════════════════════════════════
+
+    async def _detectar_modo_posicion(self):
+        """Detecta si la cuenta está en HEDGE MODE o ONE-WAY."""
+        try:
+            # Método 1: Intentar obtener position mode
+            try:
+                res = await self._api_call(asyncio.to_thread(
+                    self.client.futures_get_position_mode
+                ))
+                # FIX: Binance devuelve 'true'/'false' como STRING, no bool.
+                # res.get(...) directo evaluaría 'false' como truthy → detección errónea.
+                self._hedge_mode = str(res.get('dualSidePosition', 'false')).lower() == 'true'
+            except Exception as e:
+                print(f"  ⚠️ [HEDGE] No se pudo obtener position mode: {e}")
+                # Fallback: intentar crear una orden de prueba con positionSide
+                self._hedge_mode = False
+
+            modo_str = "HEDGE" if self._hedge_mode else "ONE-WAY"
+            print(f"  [EXECUTOR] Modo de posición detectado: {modo_str}")
+
+            if self._hedge_mode:
+                print(f"  [HEDGE] Grids direccionales usarán positionSide LONG/SHORT")
+                print(f"  [HEDGE] Grid neutral habilitado")
+            else:
+                print(f"  [HEDGE] Modo ONE-WAY detectado. Grid neutral NO funcionará.")
+
+        except Exception as e:
+            print(f"  ⚠️ [HEDGE] Error detectando modo de posición: {e}")
+            self._hedge_mode = False
+
+    def _get_position_amt_hedge(self, position_list: list, side: str) -> Decimal:
+        """
+        En HEDGE MODE, retorna la posición del lado específico.
+        En ONE-WAY, retorna positionAmt del primer elemento.
+        """
+        if not position_list:
+            return Decimal('0')
+        # FIX: filtrar por lado SOLO si realmente estamos en HEDGE MODE.
+        # En ONE-WAY Binance también incluye positionSide='BOTH' en la respuesta;
+        # filtrar por 'LONG'/'SHORT' ahí devolvería 0 siempre (bug del plan original).
+        if self._hedge_mode:
+            for p in position_list:
+                if p.get('positionSide') == side:
+                    return Decimal(str(p.get('positionAmt', 0)))
+            return Decimal('0')
+        # ONE-WAY: positionAmt es la posición neta
+        return Decimal(str(position_list[0].get('positionAmt', 0)))
+
+    def _get_position_neta_hedge(self, position_list: list) -> Decimal:
+        """
+        NEUTRAL en HEDGE MODE: posición neta = pierna LONG + pierna SHORT.
+        (En hedge, positionAmt de la pierna SHORT viene negativo, así que la suma
+        directa da la neta correcta: +0.5 LONG y -0.3 SHORT → +0.2 neto.)
+        En ONE-WAY devuelve position[0] igual que antes.
+        """
+        if not position_list:
+            return Decimal('0')
+        if self._hedge_mode:
+            long_amt, short_amt = Decimal('0'), Decimal('0')
+            for p in position_list:
+                ps = p.get('positionSide')
+                if ps == 'LONG':
+                    long_amt = Decimal(str(p.get('positionAmt', 0)))
+                elif ps == 'SHORT':
+                    short_amt = Decimal(str(p.get('positionAmt', 0)))
+            return long_amt + short_amt
+        return Decimal(str(position_list[0].get('positionAmt', 0)))
 
     async def run(self):
         """Loop principal del executor."""
@@ -334,6 +403,7 @@ class GridExecutor:
         print(f"  [EXECUTOR] Modo: {CONFIG.trading_mode} | Capital: ${CONFIG.trading_capital_max_usdt}")
 
         await self._cargar_exchange_info()
+        await self._detectar_modo_posicion()  # ← FASE A
         await self._recuperar_grids_activos()
 
         # Tarea de monitoreo periódico
@@ -907,11 +977,13 @@ class GridExecutor:
         # Auto-emparejar inmediatamente si hay par posible
         await self._emparejar_posiciones(state, timestamp)
         
+        # FIX FASE 1: pos no definida cuando pos_existente es True
+        # Usar pos_id que se definió en ambas ramas (if/else)
         print(f"  [EXECUTOR] {state.symbol} {side} real registrado @ ${price:.4f} | "
-              f"Pos: {pos.id} | Qty: {qty} | Fee: ${fee:.4f} | "
+              f"Pos: {pos_id} | Qty: {qty} | Fee: ${fee:.4f} | "
               f"Posiciones abiertas: {n_abiertas}")
         
-        return pos.id
+        return pos_id
 
     async def _evaluar_kill_switch(self, state: GridExecutionState,
                              precio_actual: float, timestamp: int) -> List[dict]:
@@ -1165,6 +1237,8 @@ class GridExecutor:
             'ultimo_tick_segundos_ago': int(time.time()) - int(state.timestamp_inicio),
             'timestamp_inicio': int(state.timestamp_inicio),
             'posicion_neta': float(state.posicion_neta),
+            'hedge_mode': self._hedge_mode,
+            'posicion_lado': state.grid_mode if self._hedge_mode else 'NETA',
             'ordenes_tp_pendientes': len([o for o in state.ordenes.values() if o.get('tipo') == 'TAKE_PROFIT']),
             'grid_mode': state.grid_mode,
         }
@@ -1282,7 +1356,7 @@ class GridExecutor:
                     continue  # Saltar este nivel, no abortar todo el grid
                 
                 client_order_id = f"CM{grid_id}_{idx}_{timestamp}"
-                ordenes.append({
+                orden = {
                     'symbol': symbol,
                     'side': side,
                     'type': 'LIMIT',
@@ -1290,7 +1364,11 @@ class GridExecutor:
                     'price': str(precio_validado),
                     'timeInForce': 'GTC',
                     'newClientOrderId': client_order_id
-                })
+                }
+                # FASE B: HEDGE MODE requiere positionSide en direccionales
+                if self._hedge_mode:
+                    orden['positionSide'] = direction  # 'LONG' o 'SHORT'
+                ordenes.append(orden)
 
             # 7. Enviar en batches (V7.1 FASE 2: atómico con rollback)
             order_ids_guardados = await self._enviar_ordenes_batch(symbol, ordenes, grid_id)
@@ -1440,21 +1518,29 @@ class GridExecutor:
                 if precio_validado is None:
                     continue  # Saltar este nivel, no abortar todo el grid
                 
-                ordenes.append({
+                orden_buy = {
                     'symbol': symbol, 'side': 'BUY', 'type': 'LIMIT',
                     'quantity': str(qty), 'price': str(precio_validado),
                     'timeInForce': 'GTC', 'newClientOrderId': f"CM{grid_id}_BUY_{idx}_{timestamp}"
-                })
+                }
+                # FASE B.2 (complemento): HEDGE MODE — BUY abre/cierra lado LONG
+                if self._hedge_mode:
+                    orden_buy['positionSide'] = 'LONG'
+                ordenes.append(orden_buy)
             for idx, nivel in enumerate(niveles_sell):
                 precio_validado = self._validar_y_redondear_precio(nivel, symbol)
                 if precio_validado is None:
                     continue  # Saltar este nivel, no abortar todo el grid
-                
-                ordenes.append({
+
+                orden_sell = {
                     'symbol': symbol, 'side': 'SELL', 'type': 'LIMIT',
                     'quantity': str(qty), 'price': str(precio_validado),
                     'timeInForce': 'GTC', 'newClientOrderId': f"CM{grid_id}_SELL_{idx}_{timestamp}"
-                })
+                }
+                # FASE B.2 (complemento): HEDGE MODE — SELL abre/cierra lado SHORT
+                if self._hedge_mode:
+                    orden_sell['positionSide'] = 'SHORT'
+                ordenes.append(orden_sell)
 
             # 11. Enviar batches (V7.1 FASE 2: atómico con rollback)
             order_ids_guardados = await self._enviar_ordenes_batch(symbol, ordenes, grid_id)
@@ -1500,7 +1586,19 @@ class GridExecutor:
                     st = self._grids[symbol]
                     if st.activa and not st.cerrando:
                         # FASE 3 FIX: Auto-cleanup si grid terminó naturalmente
-                        if float(st.posicion_neta) == 0 and len(st.pares_abiertos) == 0:
+                        # FASE E.3: En HEDGE MODE, verificar posición del lado específico
+                        pos_actual = float(st.posicion_neta)
+                        if self._hedge_mode and st.grid_mode in ('LONG', 'SHORT'):
+                            try:
+                                position = await self._api_call(asyncio.to_thread(
+                                    self.client.futures_position_information,  # typo del plan corregido
+                                    symbol=symbol
+                                ))
+                                pos_actual = float(self._get_position_amt_hedge(position, st.grid_mode))
+                            except Exception:
+                                pass  # Fallback a posicion_neta
+
+                        if pos_actual == 0 and len(st.pares_abiertos) == 0:
                             open_orders = await self._api_call(asyncio.to_thread(
                                 self.client.futures_get_open_orders, symbol=symbol
                             ))
@@ -1558,7 +1656,12 @@ class GridExecutor:
                 position = await self._api_call(asyncio.to_thread(
                     self.client.futures_position_information, symbol=symbol
                 ))
-                pos_amt = Decimal(str(position[0].get('positionAmt', 0))) if position else Decimal('0')
+                # FIX HEDGE-NET: leer pierna correcta (direccional) o neta de ambas
+                # piernas (neutral). Antes position[0] podía dar falso "grid fantasma".
+                if self._hedge_mode and state.grid_mode in ('LONG', 'SHORT'):
+                    pos_amt = self._get_position_amt_hedge(position, state.grid_mode)
+                else:
+                    pos_amt = self._get_position_neta_hedge(position)
                 if abs(pos_amt) < Decimal('0.0001'):
                     print(f"  🚨 [V7.1] {symbol} Grid fantasma detectado (0 órdenes, 0 posición). Marcando cerrado.")
                     await actualizar_grid_ejecucion_cierre(
@@ -1688,17 +1791,27 @@ class GridExecutor:
                         orderId=int(order_id)
                     ))
                     if order_info and order_info.get('orderId'):
-                        await guardar_orden_ejecucion(
-                            grid_ejecucion_id=state.grid_id,
-                            binance_order_id=str(order_info['orderId']),
-                            client_order_id=order_info.get('clientOrderId', f"SYNC_{order_id}"),
-                            symbol=symbol,
-                            side=order_info['side'],
-                            tipo_orden='ENTRY',
-                            price=float(order_info.get('price', 0)),
-                            quantity=float(order_info.get('origQty', 0))
-                        )
-                        print(f"  [CR16] {symbol} Orden {order_id} sincronizada desde Binance. Se procesará en siguiente ciclo.")
+                        sync_coid = order_info.get('clientOrderId', f"SYNC_{order_id}")
+                        # FIX FASE 2: Verificar si ya existe para evitar UNIQUE constraint
+                        existe = any(str(o.get('client_order_id')) == sync_coid for o in db_ordenes)
+                        if not existe:
+                            await guardar_orden_ejecucion(
+                                grid_ejecucion_id=state.grid_id,
+                                binance_order_id=str(order_info['orderId']),
+                                client_order_id=sync_coid,
+                                symbol=symbol,
+                                side=order_info['side'],
+                                tipo_orden='ENTRY',
+                                price=float(order_info.get('price', 0)),
+                                quantity=float(order_info.get('origQty', 0))
+                            )
+                            # FIX FASE 2: Agregar al set para que fills parciales de la misma orden no re-intenten
+                            ordenes_ids.add(order_id)
+                            print(f"  [CR16] {symbol} Orden {order_id} sincronizada desde Binance. Se procesará en siguiente ciclo.")
+                        else:
+                            print(f"  [CR16] {symbol} Orden {order_id} ya existe en DB, skip sincronización.")
+                            # FIX FASE 2: Aún así agregar al set para evitar re-intentos
+                            ordenes_ids.add(order_id)
                         nuevos_fills.append({
                             'tipo': 'NUEVO_FILL',
                             'trade': trade,
@@ -1814,11 +1927,27 @@ class GridExecutor:
                 # ─── PASO 3: Side-effects secundarios (fallan → log, no se repiten) ───
                 try:
                     if orden['tipo_orden'] == 'ENTRY':
-                        if state.grid_mode == 'NEUTRAL' and state.grid_state and pos_id:
+                        # FIX FASE 5: Verificar que la posición sigue ABIERTA antes de colocar TP
+                        # (puede haber sido cerrada por emparejamiento FIFO en _on_fill_real)
+                        posicion_aun_abierta = False
+                        if state.grid_mode == 'NEUTRAL' and state.grid_state:
+                            posicion_aun_abierta = any(
+                                p.id == pos_id and p.estado == 'ABIERTA'
+                                for p in state.grid_state.posiciones
+                            )
+                        elif state.grid_mode in ('LONG', 'SHORT') and hasattr(state, 'posiciones_direccionales'):
+                            posicion_aun_abierta = any(
+                                p.id == pos_id and p.estado == 'ABIERTA'
+                                for p in state.posiciones_direccionales
+                            )
+
+                        if state.grid_mode == 'NEUTRAL' and state.grid_state and pos_id and posicion_aun_abierta:
                             await self._colocar_take_profit_neutral(symbol, state, orden, fill, side, pos_id)
-                        elif state.grid_mode in ('LONG', 'SHORT'):
+                        elif state.grid_mode in ('LONG', 'SHORT') and posicion_aun_abierta:
                             fill['pos_id'] = pos_id
                             await self._colocar_take_profit(symbol, state, orden, fill)
+                        else:
+                            print(f"  [FASE 5] {symbol} Pos {pos_id} ya cerrada, skip TP.")
 
                     tipo_evento = 'FILL_ENTRADA' if orden['tipo_orden'] == 'ENTRY' else 'FILL_SALIDA' if orden['tipo_orden'] == 'TAKE_PROFIT' else 'FILL_DESCONOCIDO'
                     await self._procesar_trade_con_pnl(state, fill, tipo_evento)
@@ -2039,17 +2168,26 @@ class GridExecutor:
             for o in (open_orders or []):
                 oid = str(o.get('orderId', ''))
                 if oid and oid not in db_order_ids and o.get('clientOrderId', '').startswith('CM'):
-                    print(f"  [SYNC] {symbol} Orden huérfana en Binance sincronizada: {oid}")
-                    await guardar_orden_ejecucion(
-                        grid_ejecucion_id=state.grid_id,
-                        binance_order_id=oid,
-                        client_order_id=o.get('clientOrderId', f"SYNC_{oid}"),
-                        symbol=symbol,
-                        side=o['side'],
-                        tipo_orden='ENTRY',
-                        price=float(o.get('price', 0)),
-                        quantity=float(o.get('origQty', 0))
-                    )
+                    sync_coid = o.get('clientOrderId', f"SYNC_{oid}")
+                    # FIX FASE 4: Verificar client_order_id contra DB para evitar UNIQUE constraint
+                    # (db_order_ids es dict key=binance_order_id; el UNIQUE está en client_order_id)
+                    existe_coid = any(str(db_o.get('client_order_id')) == sync_coid for db_o in db_ordenes)
+                    if not existe_coid:
+                        await guardar_orden_ejecucion(
+                            grid_ejecucion_id=state.grid_id,
+                            binance_order_id=oid,
+                            client_order_id=sync_coid,
+                            symbol=symbol,
+                            side=o['side'],
+                            tipo_orden='ENTRY',
+                            price=float(o.get('price', 0)),
+                            quantity=float(o.get('origQty', 0))
+                        )
+                        # FIX FASE 4: Registrar en el dict para no re-sincronizar en este ciclo
+                        db_order_ids[oid] = o
+                        print(f"  [SYNC] {symbol} Orden huérfana {oid} sincronizada.")
+                    else:
+                        print(f"  [SYNC] {symbol} Orden {oid} ya en DB (client_order_id={sync_coid}), skip.")
         except Exception as e_sync:
             print(f"  ⚠️ [SYNC] {symbol} Error sincronizando órdenes: {e_sync}")
             
@@ -2063,7 +2201,13 @@ class GridExecutor:
                 symbol=symbol
             ))
             if position and len(position) > 0:
-                pos_amt_real = Decimal(str(position[0].get('positionAmt', 0)))
+                # FIX HEDGE-NET: leer la posición correcta según modo y tipo de grid.
+                # Antes position[0] leía solo UNA pierna en HEDGE → falsas divergencias
+                # y reseteo de posicion_neta en grids SHORT direccionales y NEUTRAL.
+                if self._hedge_mode and state.grid_mode in ('LONG', 'SHORT'):
+                    pos_amt_real = self._get_position_amt_hedge(position, state.grid_mode)
+                else:
+                    pos_amt_real = self._get_position_neta_hedge(position)
                 pos_amt_interno = state.posicion_neta
                 if pos_amt_real != 0 and abs(pos_amt_interno) > Decimal('0.0001'):
                     divergencia_pct = abs((pos_amt_real - pos_amt_interno) / pos_amt_real) * 100
@@ -2201,7 +2345,20 @@ class GridExecutor:
         tiempo_vida = int(time.time()) - int(state.timestamp_inicio)
         timeout_grid = getattr(CONFIG, 'grid_direccional_timeout_min', 120) * 60  # default 2h
         
-        if tiempo_vida > timeout_grid and float(state.posicion_neta) != 0:
+        # FASE E.2: En HEDGE MODE, leer posición del lado específico
+        if self._hedge_mode and state.grid_mode in ('LONG', 'SHORT'):
+            try:
+                position = await self._api_call(asyncio.to_thread(
+                    self.client.futures_position_information,
+                    symbol=symbol
+                ))
+                pos_actual = float(self._get_position_amt_hedge(position, state.grid_mode))
+            except Exception:
+                pos_actual = float(state.posicion_neta)
+        else:
+            pos_actual = float(state.posicion_neta)
+
+        if tiempo_vida > timeout_grid and pos_actual != 0:
             print(f"  🛑 [EXECUTOR] {symbol} Grid {state.grid_mode} vencido: {tiempo_vida}s > {timeout_grid}s")
             await self._abortar_grid(symbol, f'timeout_direccional_{tiempo_vida}s')
             return
@@ -2228,7 +2385,12 @@ class GridExecutor:
                 symbol=state.symbol
             ))
 
-            pos_amt_real = Decimal(str(position[0].get('positionAmt', 0))) if position else Decimal('0')
+            # FASE E.1: Usar helper HEDGE para leer posición del lado correcto
+            # FIX HEDGE-NET: NEUTRAL en hedge debe sumar AMBAS piernas, no position[0]
+            if self._hedge_mode and state.grid_mode in ('LONG', 'SHORT'):
+                pos_amt_real = self._get_position_amt_hedge(position, state.grid_mode)
+            else:
+                pos_amt_real = self._get_position_neta_hedge(position)
             pos_amt_interno = state.posicion_neta
 
             # 2. Trades recientes (últimos 5 minutos) para detectar fills perdidos
@@ -2558,12 +2720,22 @@ class GridExecutor:
         client_order_id = f"CM{state.grid_id}_TP_{binance_order_id}_{int(time.time()*1000)}"
 
         try:
+            orden_tp = {
+                'symbol': symbol,
+                'side': side,
+                'type': 'LIMIT',
+                'quantity': qty_total,
+                'price': tp_price,
+                'timeInForce': 'GTC',
+                'newClientOrderId': client_order_id,
+                'reduceOnly': True
+            }
+            # FASE C.1: HEDGE MODE requiere positionSide en TP
+            if self._hedge_mode:
+                orden_tp['positionSide'] = state.direction  # 'LONG' o 'SHORT'
             res = await self._api_call(asyncio.to_thread(
                 self.client.futures_create_order,
-                symbol=symbol, side=side, type='LIMIT',
-                quantity=qty_total, price=tp_price,
-                timeInForce='GTC', newClientOrderId=client_order_id,
-                reduceOnly=True  # ← E.3 FIX
+                **orden_tp
             ))
 
             await guardar_orden_ejecucion(
@@ -2668,12 +2840,38 @@ class GridExecutor:
         client_id = f"CM{state.grid_id}_TP_{int(time.time()*1000)}"
 
         try:
+            # FIX FASE 3: Verificar si hay posición abierta del lado correcto antes de reduceOnly
+            # En modo ONE-WAY, reduceOnly falla si no hay posición abierta para reducir.
+            puede_reduce = False
+            if state.grid_state:
+                pos_abierta = next((p for p in state.grid_state.posiciones
+                                    if p.estado == 'ABIERTA' and p.tipo == ('LONG' if tp_side == 'SELL' else 'SHORT')), None)
+                if pos_abierta:
+                    puede_reduce = True
+                else:
+                    print(f"  [E.2] {symbol} No hay posición {'LONG' if tp_side == 'SELL' else 'SHORT'} abierta para TP {tp_side}. Skip.")
+
+            if not puede_reduce:
+                print(f"  ⚠️ [FASE 3] {symbol} TP {tp_side} @ ${tp_price} omitido: sin posición abierta")
+                return
+
+            orden_tp = {
+                'symbol': symbol,
+                'side': tp_side,
+                'type': 'LIMIT',
+                'quantity': qty,
+                'price': tp_price,
+                'timeInForce': 'GTC',
+                'newClientOrderId': client_id,
+                'reduceOnly': True
+            }
+            # FASE C.2: HEDGE MODE — el TP cierra la posición del lado opuesto
+            # Si tp_side es SELL, cerramos LONG. Si BUY, cerramos SHORT.
+            if self._hedge_mode:
+                orden_tp['positionSide'] = 'LONG' if tp_side == 'SELL' else 'SHORT'
             res = await self._api_call(asyncio.to_thread(
                 self.client.futures_create_order,
-                symbol=symbol, side=tp_side, type='LIMIT',
-                quantity=qty, price=tp_price,
-                timeInForce='GTC', newClientOrderId=client_id,
-                reduceOnly=True  # ← E.2 FIX
+                **orden_tp
             ))
 
             tp_order_id = str(res['orderId'])
@@ -2733,10 +2931,19 @@ class GridExecutor:
         order_id = None
 
         try:
+            orden_cierre = {
+                'symbol': symbol,
+                'side': side_cierre,
+                'type': 'MARKET',
+                'quantity': float(qty),
+                'reduceOnly': True
+            }
+            # FASE D.1: HEDGE MODE — cerrar posición del lado específico
+            if self._hedge_mode:
+                orden_cierre['positionSide'] = pos_tipo  # 'LONG' o 'SHORT'
             res = await self._api_call(asyncio.to_thread(
                 self.client.futures_create_order,
-                symbol=symbol, side=side_cierre, type='MARKET',
-                quantity=float(qty), reduceOnly=True
+                **orden_cierre
             ))
             order_id = str(res.get('orderId', ''))
             print(f"  ✅ [CIERRE] Kill Switch ejecutado: {side_cierre} {qty} | Order:{order_id}")
@@ -2939,27 +3146,50 @@ class GridExecutor:
                     print(f"  ✅ [CIERRE] {cierre.symbol} Sin posición que cerrar")
                     cierre.avanzar('POSICION_CERRADA')
                     return
-                
-                pos_amt = Decimal(str(position[0].get('positionAmt', 0)))
-                
+
+                # FASE D.3 (corregida): leer posición del lado correcto según modo.
+                # El plan original usaba `side` antes de definirla (NameError).
+                # Se deriva el lado desde state.grid_mode; en NEUTRAL+HEDGE se toma
+                # el lado con mayor posición (el otro se cierra en la siguiente iteración).
+                if self._hedge_mode:
+                    if state.grid_mode in ('LONG', 'SHORT'):
+                        pos_amt = self._get_position_amt_hedge(position, state.grid_mode)
+                    else:
+                        amt_long = self._get_position_amt_hedge(position, 'LONG')
+                        amt_short = self._get_position_amt_hedge(position, 'SHORT')
+                        if abs(amt_long) >= abs(amt_short):
+                            pos_amt = abs(amt_long)   # positivo → LONG
+                        else:
+                            pos_amt = -abs(amt_short)  # negativo → SHORT
+                else:
+                    pos_amt = Decimal(str(position[0].get('positionAmt', 0)))
+
                 if abs(pos_amt) < Decimal('0.0001'):
                     cierre.posicion_cerrada = True
                     print(f"  ✅ [CIERRE] {cierre.symbol} Posición ya es 0")
                     cierre.avanzar('POSICION_CERRADA')
                     return
-                
+
                 # Calcular lado y cantidad
                 side = 'SELL' if pos_amt > 0 else 'BUY'
                 qty = float(abs(pos_amt))
-                
+
                 # Enviar orden MARKET con reduceOnly
+                orden_cierre = {
+                    'symbol': cierre.symbol,
+                    'side': side,
+                    'type': 'MARKET',
+                    'quantity': qty,
+                    'reduceOnly': True
+                }
+                # FASE D.2: HEDGE MODE — determinar lado de la posición a cerrar
+                if self._hedge_mode:
+                    # side=SELL cierra LONG, side=BUY cierra SHORT
+                    pos_side = 'LONG' if side == 'SELL' else 'SHORT'
+                    orden_cierre['positionSide'] = pos_side
                 res_cierre = await self._api_call(asyncio.to_thread(
                     self.client.futures_create_order,
-                    symbol=cierre.symbol,
-                    side=side,
-                    type='MARKET',
-                    quantity=qty,
-                    reduceOnly=True
+                    **orden_cierre
                 ))
                 
                 cierre.posicion_cierre_order_id = str(res_cierre.get('orderId', ''))
@@ -2994,6 +3224,24 @@ class GridExecutor:
 
                         print(f"  ✅ [CIERRE] {cierre.symbol} Posición cerrada @ ${avg_price:.4f} | "
                               f"PnL: {total_pnl:+.4f} | Fee: {total_commission:.4f}")
+
+                        # FASE D.3 (complemento NEUTRAL+HEDGE): un grid neutral puede tener
+                        # posición en AMBOS lados. Si el otro lado sigue abierto, continuar
+                        # el bucle para cerrarlo en la siguiente iteración.
+                        if self._hedge_mode and state.grid_mode not in ('LONG', 'SHORT'):
+                            try:
+                                position_recheck = await self._api_call(asyncio.to_thread(
+                                    self.client.futures_position_information,
+                                    symbol=cierre.symbol
+                                ))
+                                rest_long = abs(self._get_position_amt_hedge(position_recheck, 'LONG'))
+                                rest_short = abs(self._get_position_amt_hedge(position_recheck, 'SHORT'))
+                                if rest_long > Decimal('0.0001') or rest_short > Decimal('0.0001'):
+                                    print(f"  [CIERRE] {cierre.symbol} HEDGE+NEUTRAL: queda otro lado abierto "
+                                          f"(LONG:{float(rest_long):.4f} SHORT:{float(rest_short):.4f}). Cerrando...")
+                                    continue
+                            except Exception as e_re:
+                                print(f"  ⚠️ [CIERRE] {cierre.symbol} Error re-chequeando lados HEDGE: {e_re}")
 
                         cierre.posicion_cerrada = True
                         cierre.avanzar('POSICION_CERRADA')
@@ -3262,7 +3510,12 @@ class GridExecutor:
                     symbol=symbol
                 ))
                 
-                pos_amt = Decimal(str(position[0].get('positionAmt', 0))) if position else Decimal('0')
+                # FASE F.1: Usar helper HEDGE para leer posición del lado correcto
+                # FIX HEDGE-NET: NEUTRAL en hedge recupera neta de AMBAS piernas
+                if self._hedge_mode and grid['direction'] in ('LONG', 'SHORT'):
+                    pos_amt = self._get_position_amt_hedge(position, grid['direction'])
+                else:
+                    pos_amt = self._get_position_neta_hedge(position)
                 tiene_posicion = abs(pos_amt) > Decimal('0.0001')
                 tiene_ordenes = len(open_orders) > 0
                 
@@ -3336,7 +3589,8 @@ class GridExecutor:
                 
                 # Sincronizar posición real
                 state.posicion_neta = pos_amt
-                print(f"  [EXECUTOR] {symbol} Posición recuperada: {float(pos_amt):.4f}")
+                # FASE F.2: En HEDGE, la posición neta es la del lado específico
+                print(f"  [EXECUTOR] {symbol} Posición recuperada: {float(pos_amt):.4f} (lado: {grid['direction']})")
 
                 db_ordenes = await cargar_ordenes_por_grid(grid['id'])
                 for orden in db_ordenes:
