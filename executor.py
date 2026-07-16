@@ -760,15 +760,23 @@ class GridExecutor:
 
         for idx, ord in enumerate(ordenes):
             try:
+                # FIX HEDGE-BATCH: pasar positionSide si la orden lo trae.
+                # El parche hedge lo añadía al dict pero aquí se reconstruía la
+                # llamada con kwargs explícitos y se perdía → error -4061 en hedge.
+                kwargs_orden = {
+                    'symbol': ord['symbol'],
+                    'side': ord['side'],
+                    'type': ord['type'],
+                    'quantity': ord['quantity'],
+                    'price': ord['price'],
+                    'timeInForce': ord['timeInForce'],
+                    'newClientOrderId': ord['newClientOrderId']
+                }
+                if 'positionSide' in ord:
+                    kwargs_orden['positionSide'] = ord['positionSide']
                 res = await self._api_call(asyncio.to_thread(
                     self.client.futures_create_order,
-                    symbol=ord['symbol'],
-                    side=ord['side'],
-                    type=ord['type'],
-                    quantity=ord['quantity'],
-                    price=ord['price'],
-                    timeInForce=ord['timeInForce'],
-                    newClientOrderId=ord['newClientOrderId']
+                    **kwargs_orden
                 ))
 
                 if 'orderId' not in res:
