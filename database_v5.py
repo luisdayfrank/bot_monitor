@@ -1402,12 +1402,14 @@ async def calcular_pnl_acumulado(grid_ejecucion_id: int) -> dict:
         """, (grid_ejecucion_id,))
         row = await cursor.fetchone()
 
+        # FIX: SUM() sobre conjunto vacío devuelve NULL en SQLite (grid sin trades).
+        # Los COALESCE del SQL no cubren los CASE. Normalizar aquí.
         return {
-            'pnl_real': float(row[0]),
-            'fees_real': float(row[1]),
-            'total_trades': int(row[2]),
-            'trades_ganadores': int(row[3]),
-            'trades_perdedores': int(row[4])
+            'pnl_real': float(row[0] or 0),
+            'fees_real': float(row[1] or 0),
+            'total_trades': int(row[2] or 0),
+            'trades_ganadores': int(row[3] or 0),
+            'trades_perdedores': int(row[4] or 0)
         }
 
 
