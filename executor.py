@@ -570,20 +570,50 @@ class GridExecutor:
             print(f"  ⚠️ [V7.1] {symbol} Error verificando órdenes huérfanas: {e}")
             return False
 
-    async def _cancelar_ordenes_huérfanas(self, symbol: str, huérfanas: List[dict]):
-        """V7.1 FASE 1: Cancela órdenes huérfanas detectadas antes de crear nuevo grid."""
+    async def _cancelar_ordenes_huérfanas(self, symbol: str, huérfanas: List[dict]) -> bool:
+        """
+        V7.1 FASE 1 + PARCHE B: Cancela órdenes huérfanas y verifica éxito.
+        Retorna True solo si TODAS fueron canceladas y Binance confirma 0 restantes.
+        Retorna False si persiste alguna → el llamador debe abortar creación.
+        """
         print(f"  [V7.1] {symbol} Cancelando {len(huérfanas)} órdenes huérfanas...")
+        fallos = 0
         for o in huérfanas:
+            oid = o.get('orderId')
+            if not oid:
+                print(f"  ⚠️ [V7.1] {symbol} Orden huérfana sin orderId, ignorando")
+                continue
             try:
                 await self._api_call(asyncio.to_thread(
                     self.client.futures_cancel_order,
                     symbol=symbol,
-                    orderId=o['orderId']
+                    orderId=oid
                 ))
-                print(f"  [V7.1] {symbol} Orden huérfana {o['orderId']} cancelada")
+                print(f"  [V7.1] {symbol} Orden huérfana {oid} cancelada")
             except Exception as e:
-                print(f"  ⚠️ [V7.1] {symbol} No se pudo cancelar orden {o['orderId']}: {e}")
-        await asyncio.sleep(0.5)  # Esperar propagación
+                fallos += 1
+                print(f"  ⚠️ [V7.1] {symbol} No se pudo cancelar orden {oid}: {e}")
+
+        # Si hubo fallos, verificar post-cancelación antes de declarar éxito
+        if fallos > 0:
+            print(f"  [V7.1] {symbol} {fallos} cancelación(es) fallaron. Verificando estado...")
+            await asyncio.sleep(1.0)  # Más tiempo para propagación
+            try:
+                open_orders = await self._api_call(asyncio.to_thread(
+                    self.client.futures_get_open_orders, symbol=symbol
+                ))
+                restantes = [o for o in (open_orders or []) if o.get('clientOrderId', '').startswith('CM')]
+                if restantes:
+                    print(f"  🚨 [V7.1] {symbol} {len(restantes)} órdenes huérfanas PERSISTEN tras cancelación.")
+                    return False
+                print(f"  [V7.1] {symbol} Verificación OK: 0 órdenes huérfanas restantes.")
+            except Exception as e_ver:
+                print(f"  ⚠️ [V7.1] {symbol} Error verificando post-cancelación: {e_ver}")
+                return False  # Si no podemos verificar, asumimos lo peor
+        else:
+            await asyncio.sleep(0.5)  # Espera original si todo fue limpio
+
+        return True
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # V7.1 FASE 3: VALIDACIÓN DEFENSIVA DE INTEGRIDAD DE NIVELES
@@ -639,7 +669,23 @@ class GridExecutor:
         if not ordenes:
             return []
 
-        enviadas = []  # Lista de dicts {'orderId': str, 'clientOrderId': str}
+        # E.1 FIX: Deduplicar por (side, price) antes de enviar
+        ordenes_unicas = []
+        vistas = {}  # (side, price) -> orden
+        descartadas = 0
+        for o in ordenes:
+            key = (o['side'], Decimal(str(o['price'])))
+            if key in vistas:
+                descartadas += 1
+                continue
+            vistas[key] = o
+            ordenes_unicas.append(o)
+
+        if descartadas > 0:
+            print(f"  [E.1] {symbol} {descartadas} orden(es) duplicadas descartadas antes de envío")
+
+        ordenes = ordenes_unicas
+        enviadas = []  # Lista of dicts  # Lista de dicts {'orderId': str, 'clientOrderId': str}
         order_ids_guardados = []
 
         for idx, ord in enumerate(ordenes):
@@ -705,7 +751,7 @@ class GridExecutor:
     # FASE 2 PLAN 6.3: LÓGICA OPERATIVA INTERNA (Emparejamiento FIFO autónomo)
     # ═══════════════════════════════════════════════════════════════════════════════
 
-    def _emparejar_posiciones(self, state: GridExecutionState, timestamp: int):
+    async def _emparejar_posiciones(self, state: GridExecutionState, timestamp: int):
         """
         FASE 2.1: Emparejamiento FIFO de posiciones LONG y SHORT.
         El LONG más antiguo se empareja primero con el SHORT más antiguo
@@ -752,31 +798,32 @@ class GridExecutor:
                     gs.trades_completados += 1
                     
                     # Cancelar órdenes de take-profit pendientes si existen
-                    self._cancelar_tp_si_existe(state, long_pos)
-                    self._cancelar_tp_si_existe(state, short_pos)
+                    await self._cancelar_tp_si_existe(state, long_pos)
+                    await self._cancelar_tp_si_existe(state, short_pos)
                     
                     print(f"  [EXECUTOR] {state.symbol} PAR CERRADO FIFO | "
                           f"LONG ${float(long_pos.nivel_precio):.4f} → SELL ${float(short_pos.nivel_precio):.4f} | "
                           f"Diff: {float(diferencia_niveles):.4f} | PnL: {float(pnl_neto):+.4f}")
                     break  # Solo emparejar una vez por LONG
 
-    def _cancelar_tp_si_existe(self, state: GridExecutionState, pos: PosicionReal):
+    async def _cancelar_tp_si_existe(self, state: GridExecutionState, pos: PosicionReal):
         """Cancela la orden de take-profit de una posición si aún está pendiente."""
         if pos.orden_cierre_id and state.grid_state:
             try:
-                self._api_call(asyncio.to_thread(
+                await self._api_call(asyncio.to_thread(
                     self.client.futures_cancel_order,
                     symbol=state.symbol,
                     orderId=pos.orden_cierre_id
                 ))
-                print(f"  [EXECUTOR] {state.symbol} TP cancelado para pos {pos.id}")
+                print(f"  [EXECUTOR] {state.symbol} TP {pos.orden_cierre_id} cancelado")
             except Exception as e:
                 print(f"  ⚠️ [EXECUTOR] Error cancelando TP {pos.orden_cierre_id}: {e}")
-            # Limpiar del tracking
-            if pos.id in state.grid_state.ordenes_tp_pendientes:
-                del state.grid_state.ordenes_tp_pendientes[pos.id]
+            finally:
+                # Limpiar tracking SIEMPRE, incluso si la cancelación falla
+                if pos.id in state.grid_state.ordenes_tp_pendientes:
+                    del state.grid_state.ordenes_tp_pendientes[pos.id]
 
-    def _on_fill_real(self, state: GridExecutionState, side: str, price: float,
+    async def _on_fill_real(self, state: GridExecutionState, side: str, price: float,
                       qty: float, fee: float, timestamp: int,
                       binance_order_id: str, binance_trade_id: str = None) -> str:
         """
@@ -794,35 +841,69 @@ class GridExecutor:
         fee_d = Decimal(str(fee))
         notional = qty_d * precio_d
         
-        pos = PosicionReal(
-            tipo='LONG' if side == 'BUY' else 'SHORT',
-            nivel_precio=float(price),
-            precio_ejecucion=float(price),
-            qty=float(qty),
-            fee_pagada=float(fee),
-            timestamp_apertura=timestamp,
-            binance_order_id=binance_order_id,
-            filled_qty=float(qty)
-        )
-        
-        gs.posiciones.append(pos)
+        # E.5 FIX: Verificar si ya existe posición para este binance_order_id (fills parciales)
+        pos_existente = None
+        if binance_order_id and gs.posiciones:
+            for p in gs.posiciones:
+                if p.binance_order_id == binance_order_id and p.estado == 'ABIERTA':
+                    pos_existente = p
+                    break
+
+        if pos_existente:
+            # E.5: Acumular fill parcial en posición existente
+            pos_existente.qty += qty_d
+            pos_existente.filled_qty += qty_d
+            pos_existente.fee_pagada += fee_d
+            pos_id = pos_existente.id
+            print(f"  [E.5] {state.symbol} Fill parcial acumulado en {pos_id} | "
+                  f"Qty total: {float(pos_existente.qty):.4f} | Nuevo fill: {float(qty_d):.4f}")
+
+            # E.5: Actualizar TP existente (cancelar + recrear con qty total)
+            if pos_existente.orden_cierre_id:
+                try:
+                    await self._api_call(asyncio.to_thread(
+                        self.client.futures_cancel_order,
+                        symbol=state.symbol,
+                        orderId=pos_existente.orden_cierre_id
+                    ))
+                    print(f"  [E.5] {state.symbol} TP anterior cancelado para recrear con qty acumulada")
+                    if pos_existente.id in gs.ordenes_tp_pendientes:
+                        del gs.ordenes_tp_pendientes[pos_existente.id]
+                except Exception as e:
+                    print(f"  ⚠️ [E.5] {state.symbol} Error cancelando TP anterior: {e}")
+        else:
+            # Crear nueva posición (fill completo o primera parte parcial)
+            pos = PosicionReal(
+                tipo='LONG' if side == 'BUY' else 'SHORT',
+                nivel_precio=float(price),
+                precio_ejecucion=float(price),
+                qty=float(qty),
+                fee_pagada=float(fee),
+                timestamp_apertura=timestamp,
+                binance_order_id=binance_order_id,
+                filled_qty=float(qty)
+            )
+
+            gs.posiciones.append(pos)
+            pos_id = pos.id
+
         gs.fees_totales += fee_d
-        
+
         # Actualizar posicion_neta del executor (para compatibilidad con código existente)
         if side == 'BUY':
             state.posicion_neta += qty_d
         else:
             state.posicion_neta -= qty_d
-        
+
         n_abiertas = gs.contar_posiciones_abiertas()
         gs.max_posiciones_simultaneas = max(gs.max_posiciones_simultaneas, n_abiertas)
         gs.precio_referencia = precio_d
-        
+
         # MEJORA 3: Registrar mapeo de orden real a posición
-        gs.ordenes_reales[binance_order_id] = pos.id
-        
+        gs.ordenes_reales[binance_order_id] = pos_id
+
         # Auto-emparejar inmediatamente si hay par posible
-        self._emparejar_posiciones(state, timestamp)
+        await self._emparejar_posiciones(state, timestamp)
         
         print(f"  [EXECUTOR] {state.symbol} {side} real registrado @ ${price:.4f} | "
               f"Pos: {pos.id} | Qty: {qty} | Fee: ${fee:.4f} | "
@@ -830,7 +911,7 @@ class GridExecutor:
         
         return pos.id
 
-    def _evaluar_kill_switch(self, state: GridExecutionState,
+    async def _evaluar_kill_switch(self, state: GridExecutionState,
                              precio_actual: float, timestamp: int) -> List[dict]:
         """
         FASE 2.3: El executor evalúa condiciones de kill switch directamente.
@@ -843,7 +924,7 @@ class GridExecutor:
         acciones = []
         
         # 1. Emparejar posiciones FIFO primero (si hay LONG + SHORT abiertas)
-        self._emparejar_posiciones(state, timestamp)
+        await self._emparejar_posiciones(state, timestamp)
         
         # 2. Verificar timeout de posiciones abiertas
         timeout_seg = CONFIG.grid_neutral_posicion_timeout_min * 60
@@ -940,7 +1021,7 @@ class GridExecutor:
         print(f"  [EXECUTOR] {state.symbol} Pos {pos_id} no encontrada para cierre")
         return False
 
-    def _cerrar_grid_total(self, state: GridExecutionState, precio_final: float) -> dict:
+    async def _cerrar_grid_total(self, state: GridExecutionState, precio_final: float) -> dict:
         """
         FASE 2.5: El executor cierra todo el grid y retorna resumen.
         Reemplaza a GridSimulator.close_sim_state().
@@ -977,7 +1058,7 @@ class GridExecutor:
         # Cancelar todas las órdenes de take-profit pendientes
         for pos_id, tp_order_id in list(gs.ordenes_tp_pendientes.items()):
             try:
-                self._api_call(asyncio.to_thread(
+                await self._api_call(asyncio.to_thread(
                     self.client.futures_cancel_order,
                     symbol=state.symbol,
                     orderId=tp_order_id
@@ -1115,9 +1196,12 @@ class GridExecutor:
                     open_orders = await self._api_call(asyncio.to_thread(
                         self.client.futures_get_open_orders, symbol=symbol
                     ))
-                    huerfanas = [o for o in open_orders if o.get('clientOrderId', '').startswith('CM')]
+                    huerfanas = [o for o in (open_orders or []) if o.get('clientOrderId', '').startswith('CM')]
                     if huerfanas:
-                        await self._cancelar_ordenes_huérfanas(symbol, huerfanas)
+                        limpieza_ok = await self._cancelar_ordenes_huérfanas(symbol, huerfanas)
+                        if not limpieza_ok:
+                            print(f"  🚨 [V7.1] {symbol} CREACIÓN ABORTADA: huérfanas persistentes tras limpieza.")
+                            return
                 except Exception as e:
                     print(f"  ⚠️ [V7.1] {symbol} Error limpiando huérfanas: {e}")
                     return
@@ -1227,9 +1311,6 @@ class GridExecutor:
             )
             self._grids[symbol] = state
 
-            # V7.1 FASE 4: Registrar timestamp de creación exitosa para debounce
-            self._grid_pending_creation[symbol] = time.time()
-
             print(f"  ✅ [EXECUTOR] {symbol} Grid {direction} creado | ID:{grid_id} | "
                   f"Leverage:{leverage}x | Órdenes:{len(order_ids_guardados)}")
 
@@ -1259,9 +1340,12 @@ class GridExecutor:
                     open_orders = await self._api_call(asyncio.to_thread(
                         self.client.futures_get_open_orders, symbol=symbol
                     ))
-                    huerfanas = [o for o in open_orders if o.get('clientOrderId', '').startswith('CM')]
+                    huerfanas = [o for o in (open_orders or []) if o.get('clientOrderId', '').startswith('CM')]
                     if huerfanas:
-                        await self._cancelar_ordenes_huérfanas(symbol, huerfanas)
+                        limpieza_ok = await self._cancelar_ordenes_huérfanas(symbol, huerfanas)
+                        if not limpieza_ok:
+                            print(f"  🚨 [V7.1] {symbol} CREACIÓN NEUTRAL ABORTADA: huérfanas persistentes.")
+                            return
                 except Exception as e:
                     print(f"  ⚠️ [V7.1] {symbol} Error limpiando huérfanas: {e}")
                     return
@@ -1391,9 +1475,6 @@ class GridExecutor:
 
             self._grids[symbol] = state
 
-            # V7.1 FASE 4: Registrar timestamp de creación exitosa
-            self._grid_pending_creation[symbol] = time.time()
-
             print(f"  ✅ [EXECUTOR] {symbol} Grid NEUTRAL creado | BUY:{len(niveles_buy)} SELL:{len(niveles_sell)} | Órdenes:{len(order_ids_guardados)}")
 
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -1497,13 +1578,17 @@ class GridExecutor:
                 print(f"  🚨 [V7.1] {symbol} Detectadas {len(ordenes_otros_cm)} órdenes de OTROS grids CM. Posible duplicación.")
                 # Cancelar órdenes ajenas para evitar interferencia
                 for o in ordenes_otros_cm:
+                    oid = o.get('orderId')
+                    if not oid:
+                        print(f"  ⚠️ [V7.1] {symbol} Orden ajena sin orderId, ignorando")
+                        continue
                     try:
                         await self._api_call(asyncio.to_thread(
                             self.client.futures_cancel_order,
                             symbol=symbol,
-                            orderId=o['orderId']
+                            orderId=oid
                         ))
-                        print(f"  [V7.1] {symbol} Orden ajena {o['orderId']} cancelada")
+                        print(f"  [V7.1] {symbol} Orden ajena {oid} cancelada")
                     except Exception as e:
                         print(f"  ⚠️ [V7.1] No se pudo cancelar orden ajena {o['orderId']}: {e}")
 
@@ -1658,13 +1743,17 @@ class GridExecutor:
                 price = fill['price']
                 qty = fill['qty']
                 commission = fill['commission']
-                ts = fill['timestamp_ms'] // 1000
+                ts_raw = fill.get('timestamp_ms')
+                if ts_raw is None:
+                    ts = int(fill.get('timestamp_ms') or 0) // 1000
+                else:
+                    ts = int(ts_raw) // 1000
 
                 # ─── PASO 1: Actualizar estado RAM (fuente de verdad operativa) ───
                 # Este paso es crítico: si falla, NO marcamos el fill para que se reintente
                 pos_id = None
                 if state.grid_mode == 'NEUTRAL' and state.grid_state:
-                    pos_id = self._on_fill_real(
+                    pos_id = await self._on_fill_real(
                         state=state,
                         side=side,
                         price=price,
@@ -1675,7 +1764,7 @@ class GridExecutor:
                         binance_trade_id=fill['binance_trade_id']
                     )
                 else:
-                    await self._procesar_fill_direccional(state, fill, orden)
+                    pos_id = await self._procesar_fill_direccional(state, fill, orden)
 
                 # ─── PASO 2: MARCAR COMO PROCESADO (garantía anti-bucle infinito) ───
                 # Una vez que el estado RAM refleja el fill, MARCAMOS INMEDIATAMENTE.
@@ -1687,9 +1776,10 @@ class GridExecutor:
                     # 3a. Colocar take-profit si es entrada
                     if orden['tipo_orden'] == 'ENTRY':
                         if state.grid_mode == 'NEUTRAL' and state.grid_state and pos_id:
-                            await self._colocar_take_profit_neutral(symbol, state, orden, side, pos_id)
+                            await self._colocar_take_profit_neutral(symbol, state, orden, fill, side, pos_id)
                         elif state.grid_mode in ('LONG', 'SHORT'):
-                            await self._colocar_take_profit(symbol, state, orden)
+                            fill['pos_id'] = pos_id  # E.4: Asociar TP a posición
+                            await self._colocar_take_profit(symbol, state, orden, fill)
 
                     # 3b. Procesar PnL
                     tipo_evento = 'FILL_ENTRADA' if orden['tipo_orden'] == 'ENTRY' else 'FILL_SALIDA' if orden['tipo_orden'] == 'TAKE_PROFIT' else 'FILL_DESCONOCIDO'
@@ -1724,9 +1814,10 @@ class GridExecutor:
     # FASE 2: PROCESAMIENTO DE FILLS DIRECCIONALES
     # ═══════════════════════════════════════════════════════════════════════════════
 
-    async def _procesar_fill_direccional(self, state: GridExecutionState, fill: dict, orden: dict):
+    async def _procesar_fill_direccional(self, state: GridExecutionState, fill: dict, orden: dict) -> str:
         """
-        FASE 2.1: Procesa un fill para grid LONG/SHORT actualizando posición neta y PnL real.
+        E.4 FIX: Procesa un fill para grid LONG/SHORT actualizando posición neta y PnL real.
+        Crea PosicionReal para tracking de TP. Retorna pos_id.
         Usa realized_pnl de Binance (ya calculado por reducción de posición).
         """
         side = fill['side']
@@ -1747,6 +1838,22 @@ class GridExecutor:
         if realized_pnl != 0:
             state.pnl_real += Decimal(str(realized_pnl))
 
+        # E.4 FIX: Crear PosicionReal para tracking de TP
+        pos = PosicionReal(
+            tipo='LONG' if side == 'BUY' else 'SHORT',
+            nivel_precio=price,
+            precio_ejecucion=price,
+            qty=qty,
+            fee_pagada=commission,
+            timestamp_apertura=ts,
+            binance_order_id=str(fill.get('binance_order_id', '')),
+            filled_qty=qty
+        )
+
+        if not hasattr(state, 'posiciones_direccionales'):
+            state.posiciones_direccionales = []
+        state.posiciones_direccionales.append(pos)
+
         # Tracking en memoria para referencia rápida
         state.ordenes[fill['binance_order_id']] = {
             'side': side,
@@ -1754,12 +1861,14 @@ class GridExecutor:
             'qty': qty,
             'filled': True,
             'realized_pnl': realized_pnl,
-            'timestamp': ts
+            'timestamp': ts,
+            'pos_id': pos.id  # ← E.4 FIX
         }
 
         print(f"  [EXECUTOR] {state.symbol} Fill {state.grid_mode}: {side} {qty} @ ${price:.4f} | "
-              f"Pos neta: {float(state.posicion_neta):+.4f} | PnL: {realized_pnl:+.4f} | Fee: {commission:.4f}")
+              f"Pos: {pos.id} | Pos neta: {float(state.posicion_neta):+.4f}")
 
+        return pos.id  # ← E.4 FIX
 
     async def _monitorear_ordenes_abiertas(self, symbol: str, state: GridExecutionState):
         """
@@ -1780,7 +1889,11 @@ class GridExecutor:
             if orden['status'] != 'NEW':
                 continue  # Ya procesada
 
-            orden_id = str(orden['binance_order_id'])
+            orden_id_raw = orden.get('binance_order_id')
+            if not orden_id_raw or str(orden_id_raw).lower() == 'none':
+                print(f"  ⚠️ [CR16] {symbol} Orden DB {orden['id']} sin binance_order_id válido, saltando")
+                continue
+            orden_id = str(orden_id_raw)
 
             if orden_id not in open_ids:
                 # La orden desapareció de abiertas → puede estar FILLED o CANCELED
@@ -1922,7 +2035,7 @@ class GridExecutor:
         if state.grid_mode == 'NEUTRAL' and state.grid_state:
             precio_actual = self.precios_vivo.get(symbol, 0)
             if precio_actual > 0:
-                acciones = self._evaluar_kill_switch(
+                acciones = await self._evaluar_kill_switch(
                     state=state,
                     precio_actual=precio_actual,
                     timestamp=int(time.time())
@@ -1946,6 +2059,60 @@ class GridExecutor:
         # CR2 PASO 6: RECONCILIAR PnL CON DB
         # ═══════════════════════════════════════════════════════════════════
         await self._reconciliar_pnl(state)
+
+        # E.6 FIX: Fallback — verificar que cada posición abierta tenga TP
+        if state.grid_mode == 'NEUTRAL' and state.grid_state:
+            for pos in state.grid_state.posiciones:
+                if pos.estado == 'ABIERTA' and not pos.orden_cierre_id:
+                    print(f"  🚨 [E.6] {symbol} Pos {pos.id} ABIERTA sin TP. Intentando recrear...")
+                    try:
+                        db = await _get_db()
+                        async with _db_lock:
+                            cursor = await db.execute(
+                                "SELECT * FROM fills_tracking WHERE binance_order_id = ? AND procesado = 1 LIMIT 1",
+                                (pos.binance_order_id,)
+                            )
+                            row = await cursor.fetchone()
+                            if row:
+                                fill_fallback = dict(row)
+                                ordenes_db = await cargar_ordenes_por_grid(state.grid_id)
+                                orden_padre = next((
+                                    o for o in ordenes_db
+                                    if str(o['binance_order_id']) == pos.binance_order_id
+                                ), None)
+                                if orden_padre:
+                                    await self._colocar_take_profit_neutral(
+                                        symbol, state, orden_padre, fill_fallback,
+                                        'BUY' if pos.tipo == 'LONG' else 'SELL',
+                                        pos.id
+                                    )
+                    except Exception as e:
+                        print(f"  ⚠️ [E.6] {symbol} Error fallback TP para {pos.id}: {e}")
+
+        elif state.grid_mode in ('LONG', 'SHORT') and hasattr(state, 'posiciones_direccionales'):
+            for pos in state.posiciones_direccionales:
+                if pos.estado == 'ABIERTA' and not pos.orden_cierre_id:
+                    print(f"  🚨 [E.6] {symbol} Pos direccional {pos.id} ABIERTA sin TP. Intentando recrear...")
+                    try:
+                        db = await _get_db()
+                        async with _db_lock:
+                            cursor = await db.execute(
+                                "SELECT * FROM fills_tracking WHERE binance_order_id = ? AND procesado = 1 LIMIT 1",
+                                (pos.binance_order_id,)
+                            )
+                            row = await cursor.fetchone()
+                            if row:
+                                fill_fallback = dict(row)
+                                ordenes_db = await cargar_ordenes_por_grid(state.grid_id)
+                                orden_padre = next((
+                                    o for o in ordenes_db
+                                    if str(o['binance_order_id']) == pos.binance_order_id
+                                ), None)
+                                if orden_padre:
+                                    fill_fallback['pos_id'] = pos.id
+                                    await self._colocar_take_profit(symbol, state, orden_padre, fill_fallback)
+                    except Exception as e:
+                        print(f"  ⚠️ [E.6] {symbol} Error fallback TP para {pos.id}: {e}")
 
 
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -2045,21 +2212,59 @@ class GridExecutor:
                 self.client.futures_get_open_orders,
                 symbol=state.symbol
             ))
+            open_orders = open_orders or []  # ← PARCHE C: Guarda defensiva
+
+            # PARCHE C: Construir set de TODAS nuestras órdenes (entrada + TP) por prefix
+            prefix = f"CM{state.grid_id}"
+            nuestras_ordenes_ids = set()
+            for o in open_orders:
+                cid = o.get('clientOrderId', '')
+                if cid.startswith(prefix):
+                    nuestras_ordenes_ids.add(str(o['orderId']))
 
             # FASE 5: Reconciliación de órdenes solo para NEUTRAL (tiene tracking de TP)
             if state.grid_mode == 'NEUTRAL' and state.grid_state:
                 open_ids_binance = {str(o['orderId']) for o in open_orders}
                 open_ids_interno = set(state.grid_state.ordenes_tp_pendientes.values())
 
-                # Órdenes en Binance que no tenemos trackeadas
+                # PARCHE C: Solo reportar/logs si la orden NO es nuestra (ni entrada ni TP)
                 for oid in open_ids_binance - open_ids_interno:
-                    print(f"  🚨 [CR16] {state.symbol} Orden huérfana en Binance: {oid}")
+                    if oid not in nuestras_ordenes_ids:
+                        # Es una orden que no reconocemos como nuestra → posible huérfana ajena
+                        print(f"  🚨 [CR16] {state.symbol} Orden ajena/huérfana en Binance: {oid}")
+                    # Si ES nuestra orden de entrada, NO reportar (no es huérfana, es normal)
 
                 # Órdenes que creímos abiertas pero Binance no las tiene
                 for pos_id, oid in list(state.grid_state.ordenes_tp_pendientes.items()):
                     if oid not in open_ids_binance:
                         print(f"  ⚠️ [CR16] {state.symbol} TP {oid} desaparecido, limpiando tracking")
                         del state.grid_state.ordenes_tp_pendientes[pos_id]
+
+                # PARCHE C.2: Cancelar órdenes ajenas con prefix CM detectadas en reconciliación
+                for oid in open_ids_binance - open_ids_interno:
+                    if oid not in nuestras_ordenes_ids:
+                        # Buscar la orden en open_orders para verificar su origen
+                        orden_ajena = next(
+                            (o for o in open_orders if str(o.get('orderId')) == oid), None
+                        )
+                        if orden_ajena:
+                            cid = orden_ajena.get('clientOrderId', '')
+                            # Solo actuar si es una orden de OTRO grid (prefix CM pero no CM{grid_id})
+                            if cid.startswith('CM') and not cid.startswith(prefix):
+                                print(f"  🚨 [CR16] {state.symbol} Orden ajena {oid} ({cid}) detectada. Cancelando...")
+                                try:
+                                    await self._api_call(asyncio.to_thread(
+                                        self.client.futures_cancel_order,
+                                        symbol=state.symbol,
+                                        orderId=oid
+                                    ))
+                                    print(f"  ✅ [CR16] {state.symbol} Orden ajena {oid} cancelada desde reconciliación")
+                                except Exception as e:
+                                    # Si falla (ej: ya fue cancelada por otro grid), no propagar
+                                    print(f"  ⚠️ [CR16] {state.symbol} No se pudo cancelar orden ajena {oid}: {e}")
+                            elif not cid.startswith('CM'):
+                                # Orden de origen externo (no del bot) — solo log silencioso
+                                print(f"  [CR16] {state.symbol} Orden externa no-CM: {oid}")
 
         except Exception as e:
             print(f"  ⚠️ [CR16] Error en reconciliación: {e}")
@@ -2210,116 +2415,187 @@ class GridExecutor:
     # ═══════════════════════════════════════════════════════════════════════════════
 
     async def _colocar_take_profit(self, symbol: str, state: GridExecutionState,
-                                    orden_entry: dict):
-        """Coloca take-profit para un fill de entrada (LONG o SHORT). FASE 3: Tracking de TP.
-        FASE 5: Defensiva — verifica niveles disponibles y protege contra errores de API.
+                                orden_entry: dict, fill: dict):
+        """Coloca take-profit para un fill de entrada (LONG o SHORT).
+        E.3 FIX: Recibe fill para usar qty real y precio de ejecución, reduceOnly.
         """
-        # FASE 5: Verificar que hay niveles disponibles para calcular TP
         if not state.niveles:
-            print(f"  ⚠️ [FASE 5] {symbol} Sin niveles disponibles, no se puede colocar TP")
+            print(f"  ⚠️ [E.3] {symbol} Sin niveles disponibles, no se puede colocar TP")
             return
 
         info = self._get_symbol_info(symbol)
         tick_size = Decimal(str(info['tickSize']))
 
-        entry_price = Decimal(str(orden_entry['price']))
+        entry_price = Decimal(str(fill.get('price', orden_entry['price'])))
+        fill_qty = float(fill.get('qty', orden_entry.get('quantity', 0)))
+        if fill_qty <= 0:
+            print(f"  ⚠️ [E.3] {symbol} Fill qty inválido ({fill_qty}), abortando TP")
+            return
+
+        binance_order_id = str(fill.get('binance_order_id', orden_entry.get('binance_order_id', '')))
 
         if state.direction == 'LONG':
-            # Encontrar nivel superior para LONG
             siguiente_nivel = None
             for nivel in state.niveles:
                 if Decimal(str(nivel)) > entry_price * Decimal('1.0001'):
                     siguiente_nivel = nivel
                     break
             if not siguiente_nivel:
+                print(f"  ⚠️ [E.3] {symbol} LONG: No hay nivel superior a {float(entry_price):.4f} para TP. "
+                      f"Niveles: {[float(n) for n in state.niveles]}")
                 return
             side = 'SELL'
-        else:  # SHORT
-            # Encontrar nivel inferior para SHORT
+        else:
             siguiente_nivel = None
             for nivel in reversed(state.niveles):
                 if Decimal(str(nivel)) < entry_price * Decimal('0.9999'):
                     siguiente_nivel = nivel
                     break
             if not siguiente_nivel:
+                print(f"  ⚠️ [E.3] {symbol} SHORT: No hay nivel inferior a {float(entry_price):.4f} para TP. "
+                      f"Niveles: {[float(n) for n in state.niveles]}")
                 return
             side = 'BUY'
 
         ticks = int(Decimal(str(siguiente_nivel)) / tick_size)
         tp_price = float(ticks * tick_size)
-        qty = orden_entry['quantity']
 
-        client_order_id = f"CM{state.grid_id}_TP_{int(time.time()*1000)}"
+        # E.3 FIX: Verificar si ya existe TP para este orden (fills parciales)
+        qty_total = fill_qty
+        tp_previo = None
+        if binance_order_id:
+            for cid, meta in list(state.ordenes.items()):
+                if (meta.get('tipo') == 'TAKE_PROFIT' and
+                    meta.get('orden_padre') == binance_order_id):
+                    tp_previo = meta
+                    break
+
+            if tp_previo:
+                print(f"  [E.3] {symbol} TP existente para orden {binance_order_id}. "
+                      f"Actualizando qty: {tp_previo.get('qty', 0)} + {fill_qty}")
+                try:
+                    await self._api_call(asyncio.to_thread(
+                        self.client.futures_cancel_order,
+                        symbol=symbol,
+                        orderId=tp_previo['binance_order_id']
+                    ))
+                    print(f"  [E.3] {symbol} TP anterior cancelado para recrear con qty acumulada")
+                    for k in list(state.ordenes.keys()):
+                        if state.ordenes[k].get('binance_order_id') == tp_previo['binance_order_id']:
+                            del state.ordenes[k]
+                except Exception as e:
+                    print(f"  ⚠️ [E.3] {symbol} Error cancelando TP anterior: {e}")
+                qty_total = float(tp_previo.get('qty', 0)) + fill_qty
+
+        client_order_id = f"CM{state.grid_id}_TP_{binance_order_id}_{int(time.time()*1000)}"
 
         try:
             res = await self._api_call(asyncio.to_thread(
                 self.client.futures_create_order,
                 symbol=symbol, side=side, type='LIMIT',
-                quantity=qty, price=tp_price,
-                timeInForce='GTC', newClientOrderId=client_order_id
+                quantity=qty_total, price=tp_price,
+                timeInForce='GTC', newClientOrderId=client_order_id,
+                reduceOnly=True  # ← E.3 FIX
             ))
-            # FASE 5: Guardar en DB ANTES de añadir a estado interno
+
             await guardar_orden_ejecucion(
                 grid_ejecucion_id=state.grid_id,
                 binance_order_id=str(res['orderId']),
                 client_order_id=client_order_id,
                 symbol=symbol, side=side, tipo_orden='TAKE_PROFIT',
-                price=tp_price, quantity=qty
+                price=tp_price, quantity=qty_total
             )
-            # FASE 3: Tracking de TP pendiente para direccionales
-            state.ordenes[client_order_id] = {
-                'side': side, 'price': tp_price, 'qty': qty,
-                'tipo': 'TAKE_PROFIT', 'binance_order_id': str(res['orderId'])
-            }
-            print(f"  ✅ [EXECUTOR] {symbol} Take-profit {side} colocado @ ${tp_price} | Qty:{qty}")
-        except Exception as e:
-            # FASE 5: No propagar excepción — el TP puede reintentarse vía monitoreo reactivo
-            print(f"  ⚠️ [FASE 5] {symbol} Error colocando take-profit {side} @ ${tp_price}: {e}")
 
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # TAKE-PROFIT NEUTRAL Y KILL SWITCH (FASE 3 — Autónomo)
-    # ═══════════════════════════════════════════════════════════════════════════════
+            state.ordenes[client_order_id] = {
+                'side': side, 'price': tp_price, 'qty': qty_total,
+                'tipo': 'TAKE_PROFIT', 'binance_order_id': str(res['orderId']),
+                'orden_padre': binance_order_id
+            }
+
+            # E.3 FIX: Asociar TP a posición si se pasó pos_id
+            pos_id = fill.get('pos_id')
+            if pos_id and hasattr(state, 'posiciones_direccionales'):
+                for pos in state.posiciones_direccionales:
+                    if pos.id == pos_id and pos.estado == 'ABIERTA':
+                        pos.orden_cierre_id = str(res['orderId'])
+                        print(f"  [E.3] {symbol} TP asociado a posición {pos_id}")
+                        break
+
+            print(f"  ✅ [E.3] {symbol} TP {side} reduceOnly @ ${tp_price} | Qty:{qty_total} | Origen:{binance_order_id}")
+
+        except Exception as e:
+            print(f"  ⚠️ [E.3] {symbol} Error colocando TP {side} @ ${tp_price}: {e}")
 
     async def _colocar_take_profit_neutral(self, symbol: str, state: GridExecutionState,
-                                            orden_entry: dict, side_filled: str, pos_id: str):
+                                            orden_entry: dict, fill: dict, side_filled: str, pos_id: str):
         """Cuando se ejecuta un BUY, coloca SELL take-profit. Cuando SELL, coloca BUY.
-        FASE 5: Defensiva — verifica grid_state y niveles, guarda DB antes de RAM.
+        E.2 FIX: reduceOnly, cancela orden de entrada conflictiva, usa qty del fill.
         """
-        # FASE 5: Verificar grid_state disponible
         gs = state.grid_state if state else None
         if not gs:
-            print(f"  ⚠️ [FASE 5] {symbol} Sin grid_state, no se puede colocar TP neutral")
+            print(f"  ⚠️ [E.2] {symbol} Sin grid_state, no se puede colocar TP neutral")
             return
 
         info = self._get_symbol_info(symbol)
         tick_size = Decimal(str(info['tickSize']))
-        precio_entry = Decimal(str(orden_entry['price']))
+        precio_entry = Decimal(str(fill.get('price', orden_entry['price'])))
 
         if side_filled == 'BUY':
-            # Colocar SELL en el siguiente nivel superior (de niveles_sell)
             if not gs.niveles_sell:
-                print(f"  ⚠️ [FASE 5] {symbol} Sin niveles_sell, no se puede colocar TP")
+                print(f"  ⚠️ [E.2] {symbol} Sin niveles_sell, no se puede colocar TP")
                 return
             candidatos = [n for n in gs.niveles_sell if n > precio_entry * Decimal('1.0001')]
             if not candidatos:
+                print(f"  ⚠️ [E.2] {symbol} No hay nivel sell superior a {float(precio_entry):.4f} para TP de LONG")
                 return
             siguiente = min(candidatos)
             tp_side = 'SELL'
         else:
-            # Colocar BUY en el siguiente nivel inferior (de niveles_buy)
             if not gs.niveles_buy:
-                print(f"  ⚠️ [FASE 5] {symbol} Sin niveles_buy, no se puede colocar TP")
+                print(f"  ⚠️ [E.2] {symbol} Sin niveles_buy, no se puede colocar TP")
                 return
             candidatos = [n for n in gs.niveles_buy if n < precio_entry * Decimal('0.9999')]
             if not candidatos:
+                print(f"  ⚠️ [E.2] {symbol} No hay nivel buy inferior a {float(precio_entry):.4f} para TP de SHORT")
                 return
             siguiente = max(candidatos)
             tp_side = 'BUY'
 
-        # Redondear a tick_size
         ticks = int(siguiente / tick_size)
         tp_price = float(ticks * tick_size)
-        qty = orden_entry['quantity']
+        qty = float(fill.get('qty', orden_entry.get('quantity', 0)))
+        if qty <= 0:
+            print(f"  ⚠️ [E.2] {symbol} qty inválida ({qty}), abortando TP")
+            return
+
+        # E.2 FIX: Cancelar orden de entrada conflictiva en ese precio+side
+        prefix = f"CM{state.grid_id}"
+        try:
+            open_orders = await self._api_call(asyncio.to_thread(
+                self.client.futures_get_open_orders, symbol=symbol
+            ))
+            open_orders = open_orders or []
+            conflicto = next((
+                o for o in open_orders
+                if o.get('side') == tp_side
+                and abs(float(o.get('price', 0)) - tp_price) < float(tick_size) * 0.5
+                and o.get('clientOrderId', '').startswith(prefix)
+                and '_TP_' not in o.get('clientOrderId', '')
+            ), None)
+            if conflicto:
+                print(f"  [E.2] {symbol} Cancelando orden de entrada {conflicto['side']} @ ${tp_price} "
+                      f"(conflicto con TP) | ID: {conflicto['orderId']}")
+                await self._api_call(asyncio.to_thread(
+                    self.client.futures_cancel_order,
+                    symbol=symbol,
+                    orderId=conflicto['orderId']
+                ))
+                for cid, meta in list(state.ordenes.items()):
+                    if meta.get('binance_order_id') == str(conflicto['orderId']):
+                        del state.ordenes[cid]
+                        break
+        except Exception as e:
+            print(f"  ⚠️ [E.2] {symbol} Error buscando/cancelando orden conflictiva: {e}")
 
         client_id = f"CM{state.grid_id}_TP_{int(time.time()*1000)}"
 
@@ -2328,10 +2604,10 @@ class GridExecutor:
                 self.client.futures_create_order,
                 symbol=symbol, side=tp_side, type='LIMIT',
                 quantity=qty, price=tp_price,
-                timeInForce='GTC', newClientOrderId=client_id
+                timeInForce='GTC', newClientOrderId=client_id,
+                reduceOnly=True  # ← E.2 FIX
             ))
 
-            # FASE 5: Guardar en DB ANTES de modificar estado interno
             tp_order_id = str(res['orderId'])
             await guardar_orden_ejecucion(
                 grid_ejecucion_id=state.grid_id,
@@ -2341,19 +2617,16 @@ class GridExecutor:
                 price=tp_price, quantity=qty
             )
 
-            # FASE 3: Trackear orden TP en el estado propio (después de DB)
             gs.ordenes_tp_pendientes[pos_id] = tp_order_id
 
-            # Actualizar PosicionReal con el ID de cierre
             for pos in gs.posiciones:
                 if pos.id == pos_id:
                     pos.orden_cierre_id = tp_order_id
                     break
 
-            print(f"  ✅ [EXECUTOR] {symbol} TP {tp_side} @ ${tp_price} (respuesta a {side_filled}) | Pos: {pos_id}")
+            print(f"  ✅ [E.2] {symbol} TP {tp_side} reduceOnly @ ${tp_price} | Qty:{qty} | Pos:{pos_id}")
         except Exception as e:
-            # FASE 5: No propagar — TP puede reintentarse vía monitoreo reactivo
-            print(f"  ⚠️ [FASE 5] {symbol} Error TP neutral {tp_side} @ ${tp_price}: {e}")
+            print(f"  ⚠️ [E.2] {symbol} Error TP neutral {tp_side} reduceOnly @ ${tp_price}: {e}")
 
     async def _ejecutar_kill_switch_real(self, symbol: str, state: GridExecutionState,
                                           pos_id: str, pos_tipo: str, qty: float, 
@@ -2752,7 +3025,7 @@ class GridExecutor:
         # Cerrar GridState interno
         precio_actual = self.precios_vivo.get(cierre.symbol, 0)
         if state.grid_state and precio_actual > 0:
-            resumen = self._cerrar_grid_total(state, precio_actual)
+            resumen = await self._cerrar_grid_total(state, precio_actual)
             
             pnl_real = float(state.pnl_real)
             pnl_interno = resumen.get('pnl_neto', 0)
@@ -3024,12 +3297,15 @@ class GridExecutor:
             direction = msg.get('direction')
             symbol = msg.get('symbol')
 
-            # V7.1 FASE 4: Debounce interno — ignorar si se creó hace menos de 60s
-            if symbol and symbol in self._grid_pending_creation:
-                tiempo_desde_ultimo = time.time() - self._grid_pending_creation[symbol]
-                if tiempo_desde_ultimo < 60:
-                    print(f"  ⚠️ [V7.1] {symbol} Debounce activo: {tiempo_desde_ultimo:.0f}s < 60s. Ignorando CREAR_GRID.")
-                    return
+            # V7.1 FASE 4: Debounce SIMÉTRICO — registrar ANTES de cualquier operación
+            if symbol:
+                ahora = time.time()
+                if symbol in self._grid_pending_creation:
+                    tiempo_desde_ultimo = ahora - self._grid_pending_creation[symbol]
+                    if tiempo_desde_ultimo < 60:
+                        print(f"  ⚠️ [V7.1] {symbol} Debounce activo: {tiempo_desde_ultimo:.0f}s < 60s. Ignorando CREAR_GRID.")
+                        return
+                self._grid_pending_creation[symbol] = ahora   # ← REGISTRADO AQUÍ
 
             if direction == 'LONG':
                 await self._crear_grid_long(
