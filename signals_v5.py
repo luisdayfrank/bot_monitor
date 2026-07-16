@@ -54,7 +54,8 @@ class SignalState:
         self.grid_params_neutral = None  # Parámetros del grid neutral activo
         # FASE 2.3: Contador de velas consecutivas para aborto de NEUTRAL_GRID
         self.neutral_grid_dir_consec = 0
-        self.neutral_grid_dir_previa = 'NEUTRAL'        
+        self.neutral_grid_dir_previa = 'NEUTRAL'
+        self.neutral_grid_last_rechazo_ts = 0  # Cooldown para rechazos de grid neutral
 
         # FASE 1.2: Debounce de abortos al executor
         self._aborto_enviado_ts = 0
@@ -862,7 +863,16 @@ class SignalGenerator:
             if cb_bloquea_grid:
                 print(f"  [NEUTRAL_GRID] {symbol} Grid neutral BLOQUEADO por Circuit Breaker activo")
             else:
+                # Cooldown de 5 minutos para rechazos de grid neutral (evita spam de logs)
+                ahora_ts = int(datetime.now(pytz.UTC).timestamp())
+                if state.neutral_grid_last_rechazo_ts > 0 and (ahora_ts - state.neutral_grid_last_rechazo_ts) < 300:
+                    return False
+
                 entrar_grid, razon_grid = self.evaluar_grid_neutro(symbol, i15)
+                if not entrar_grid:
+                    state.neutral_grid_last_rechazo_ts = ahora_ts
+                    return False
+
                 if entrar_grid and state.estado != 'NEUTRAL_GRID':
                     # ═════════════════════════════════════════════════════════════════
                     # FIX V6.1: Eliminado fallback tóxico. Si el motor rechaza, respetamos.
@@ -1030,8 +1040,7 @@ class SignalGenerator:
             else:
                 print(f"  [NEUTRAL_GRID] {symbol} Dir {direction} ({state.neutral_grid_dir_consec}/2 velas)")
 
-        return entro_neutral_grid
-    
+        return entro_neutral_grid    
     # ═══════════════════════════════════════════════════════════════════════════════
     # CR1 FASE 1: DIRECCIÓN CON FALLBACK PROGRESIVO (desacoplada de 4h)
     # ═══════════════════════════════════════════════════════════════════════════════

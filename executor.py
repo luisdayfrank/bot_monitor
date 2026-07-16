@@ -833,6 +833,8 @@ class GridExecutor:
         if not state.grid_state or not state.grid_state.activa:
             print(f"  ⚠️ [EXECUTOR] {state.symbol} Fill ignorado: grid no activo")
             return None
+        if timestamp is None:
+            timestamp = int(time.time())
         
         gs = state.grid_state
         
@@ -1677,8 +1679,35 @@ class GridExecutor:
             )
 
             if order_id not in ordenes_ids:
-                # Fill de una orden que NO tenemos trackeada → anomalía
-                print(f"  🚨 [CR16] {symbol} Fill de orden desconocida: {order_id}")
+                # Fill de una orden que NO tenemos trackeada → intentar sincronizar desde Binance
+                print(f"  🚨 [CR16] {symbol} Fill de orden desconocida: {order_id}. Intentando sincronizar...")
+                try:
+                    order_info = await self._api_call(asyncio.to_thread(
+                        self.client.futures_get_order,
+                        symbol=symbol,
+                        orderId=int(order_id)
+                    ))
+                    if order_info and order_info.get('orderId'):
+                        await guardar_orden_ejecucion(
+                            grid_ejecucion_id=state.grid_id,
+                            binance_order_id=str(order_info['orderId']),
+                            client_order_id=order_info.get('clientOrderId', f"SYNC_{order_id}"),
+                            symbol=symbol,
+                            side=order_info['side'],
+                            tipo_orden='ENTRY',
+                            price=float(order_info.get('price', 0)),
+                            quantity=float(order_info.get('origQty', 0))
+                        )
+                        print(f"  [CR16] {symbol} Orden {order_id} sincronizada desde Binance. Se procesará en siguiente ciclo.")
+                        nuevos_fills.append({
+                            'tipo': 'NUEVO_FILL',
+                            'trade': trade,
+                            'order_id': order_id
+                        })
+                        continue
+                except Exception as e_sync:
+                    print(f"  ⚠️ [CR16] {symbol} No se pudo sincronizar orden {order_id}: {e_sync}")
+
                 nuevos_fills.append({
                     'tipo': 'ANOMALIA',
                     'trade': trade,
@@ -1726,31 +1755,43 @@ class GridExecutor:
 
         for fill in fills:
             fill_id = fill['id']
+            procesado_ok = False
             try:
+                # ─── VALIDACIÓN DEFENSIVA DE CAMPOS CRÍTICOS ───
+                ts_raw = fill.get('timestamp_ms')
+                try:
+                    ts = int(ts_raw or 0) // 1000
+                except (TypeError, ValueError):
+                    ts = 0
+
+                price = fill.get('price')
+                qty = fill.get('qty')
+                commission = fill.get('commission')
+                side = fill.get('side')
+                binance_order_id = fill.get('binance_order_id')
+                binance_trade_id = fill.get('binance_trade_id')
+
+                if any(v is None for v in [price, qty, commission, side, binance_order_id, binance_trade_id]):
+                    print(f"  ⚠️ [FASE 3] {symbol} Fill {fill_id} con datos faltantes, marcando como ERROR")
+                    await marcar_fill_procesado(fill_id, 'DATOS_FALTANTES')
+                    procesado_ok = True
+                    continue
+
                 # ─── PASO 0: Identificar orden ───
-                orden = next((o for o in db_ordenes if str(o['binance_order_id']) == fill['binance_order_id']), None)
+                orden = next((o for o in db_ordenes if str(o['binance_order_id']) == str(binance_order_id)), None)
 
                 if not orden:
-                    print(f"  ⚠️ [CR16] Fill {fill_id} sin orden en DB, saltando")
+                    print(f"  ⚠️ [CR16] Fill {fill_id} sin orden en DB (order_id={binance_order_id}), marcando como SIN_ORDEN")
                     await marcar_fill_procesado(fill_id, 'SIN_ORDEN')
+                    procesado_ok = True
                     continue
 
                 if orden['status'] == 'FILLED':
                     await marcar_fill_procesado(fill_id, 'YA_PROCESADO')
+                    procesado_ok = True
                     continue
 
-                side = fill['side']
-                price = fill['price']
-                qty = fill['qty']
-                commission = fill['commission']
-                ts_raw = fill.get('timestamp_ms')
-                if ts_raw is None:
-                    ts = int(fill.get('timestamp_ms') or 0) // 1000
-                else:
-                    ts = int(ts_raw) // 1000
-
-                # ─── PASO 1: Actualizar estado RAM (fuente de verdad operativa) ───
-                # Este paso es crítico: si falla, NO marcamos el fill para que se reintente
+                # ─── PASO 1: Actualizar estado RAM ───
                 pos_id = None
                 if state.grid_mode == 'NEUTRAL' and state.grid_state:
                     pos_id = await self._on_fill_real(
@@ -1760,55 +1801,53 @@ class GridExecutor:
                         qty=qty,
                         fee=commission,
                         timestamp=ts,
-                        binance_order_id=fill['binance_order_id'],
-                        binance_trade_id=fill['binance_trade_id']
+                        binance_order_id=str(binance_order_id),
+                        binance_trade_id=str(binance_trade_id)
                     )
                 else:
                     pos_id = await self._procesar_fill_direccional(state, fill, orden)
 
                 # ─── PASO 2: MARCAR COMO PROCESADO (garantía anti-bucle infinito) ───
-                # Una vez que el estado RAM refleja el fill, MARCAMOS INMEDIATAMENTE.
-                # Si los pasos siguientes (TP, PnL) fallan, el fill NO se reprocesará.
                 await marcar_fill_procesado(fill_id, 'PROCESADO')
+                procesado_ok = True
 
                 # ─── PASO 3: Side-effects secundarios (fallan → log, no se repiten) ───
                 try:
-                    # 3a. Colocar take-profit si es entrada
                     if orden['tipo_orden'] == 'ENTRY':
                         if state.grid_mode == 'NEUTRAL' and state.grid_state and pos_id:
                             await self._colocar_take_profit_neutral(symbol, state, orden, fill, side, pos_id)
                         elif state.grid_mode in ('LONG', 'SHORT'):
-                            fill['pos_id'] = pos_id  # E.4: Asociar TP a posición
+                            fill['pos_id'] = pos_id
                             await self._colocar_take_profit(symbol, state, orden, fill)
 
-                    # 3b. Procesar PnL
                     tipo_evento = 'FILL_ENTRADA' if orden['tipo_orden'] == 'ENTRY' else 'FILL_SALIDA' if orden['tipo_orden'] == 'TAKE_PROFIT' else 'FILL_DESCONOCIDO'
                     await self._procesar_trade_con_pnl(state, fill, tipo_evento)
 
-                    # 3c. Actualizar orden en DB
                     await actualizar_orden_fill(
                         orden_id=orden['id'],
-                        binance_trade_id=fill['binance_trade_id'],
+                        binance_trade_id=str(binance_trade_id),
                         price=price,
                         qty=qty,
                         commission=commission,
-                        commission_asset=fill['commission_asset'],
-                        realized_pnl=fill['realized_pnl'],
-                        timestamp=datetime.fromtimestamp(ts).isoformat()
+                        commission_asset=fill.get('commission_asset', ''),
+                        realized_pnl=float(fill.get('realized_pnl', 0)),
+                        timestamp=datetime.fromtimestamp(ts).isoformat() if ts > 0 else datetime.utcnow().isoformat()
                     )
                 except Exception as e_side:
-                    # Side-effect falló pero fill YA está marcado → no se repite
-                    print(f"  ⚠️ [FASE 3] {symbol} Fill {fill_id} side-effect falló "
-                          f"(TP/PnL/orden) pero YA MARCADO como procesado: {e_side}")
+                    print(f"  ⚠️ [FASE 3] {symbol} Fill {fill_id} side-effect falló (TP/PnL/orden) pero YA MARCADO como procesado: {e_side}")
 
-                print(f"  [CR16] {symbol} Fill procesado: {side} @ ${price:.4f} | "
-                      f"Modo: {state.grid_mode} | Qty: {qty}")
+                print(f"  [CR16] {symbol} Fill procesado: {side} @ ${price:.4f} | Modo: {state.grid_mode} | Qty: {qty}")
 
             except Exception as e:
-                # Error en paso 1 (estado RAM) → NO marcar, se reintentará en siguiente ciclo
-                print(f"  ❌ [FASE 3] {symbol} Error procesando fill {fill_id}: {e}. "
-                      f"NO se marcó como procesado — se reintentará en próximo ciclo.")
-
+                print(f"  ❌ [FASE 3] {symbol} Error procesando fill {fill_id}: {e}")
+            finally:
+                # CRÍTICO: Si no se marcó como procesado, marcarlo como ERROR para romper loop infinito
+                if not procesado_ok:
+                    try:
+                        await marcar_fill_procesado(fill_id, 'ERROR_LOOP')
+                        print(f"  [FASE 3] {symbol} Fill {fill_id} marcado como ERROR_LOOP para evitar reintento infinito")
+                    except Exception as e2:
+                        print(f"  🚨 [FASE 3] {symbol} CRÍTICO: No se pudo marcar fill {fill_id} como ERROR_LOOP: {e2}")
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # FASE 2: PROCESAMIENTO DE FILLS DIRECCIONALES
@@ -1825,7 +1864,11 @@ class GridExecutor:
         qty = float(fill['qty'])
         commission = float(fill['commission'])
         realized_pnl = float(fill.get('realized_pnl', 0))
-        ts = fill['timestamp_ms'] // 1000
+        ts_raw = fill.get('timestamp_ms')
+        try:
+            ts = int(ts_raw or 0) // 1000
+        except (TypeError, ValueError):
+            ts = 0
 
         # Actualizar posición neta (modelo acumulativo de Binance Futures)
         if side == 'BUY':
@@ -1985,6 +2028,31 @@ class GridExecutor:
         if state.cerrando:
             return
 
+        # ─── SYNC: Sincronizar órdenes abiertas de Binance con DB local ───
+        try:
+            open_orders = await self._api_call(asyncio.to_thread(
+                self.client.futures_get_open_orders, symbol=symbol
+            ))
+            db_ordenes = await cargar_ordenes_por_grid(state.grid_id)
+            db_order_ids = {str(o['binance_order_id']): o for o in db_ordenes if o.get('binance_order_id')}
+
+            for o in (open_orders or []):
+                oid = str(o.get('orderId', ''))
+                if oid and oid not in db_order_ids and o.get('clientOrderId', '').startswith('CM'):
+                    print(f"  [SYNC] {symbol} Orden huérfana en Binance sincronizada: {oid}")
+                    await guardar_orden_ejecucion(
+                        grid_ejecucion_id=state.grid_id,
+                        binance_order_id=oid,
+                        client_order_id=o.get('clientOrderId', f"SYNC_{oid}"),
+                        symbol=symbol,
+                        side=o['side'],
+                        tipo_orden='ENTRY',
+                        price=float(o.get('price', 0)),
+                        quantity=float(o.get('origQty', 0))
+                    )
+        except Exception as e_sync:
+            print(f"  ⚠️ [SYNC] {symbol} Error sincronizando órdenes: {e_sync}")
+            
         # ═══════════════════════════════════════════════════════════════════
         # FASE 6: RECONCILIACIÓN RÁPIDA DE POSICIÓN NETA vs BINANCE
         # Se ejecuta cada ciclo de monitoreo. Si diverge >1%, fuerza sync.
