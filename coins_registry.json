@@ -312,7 +312,7 @@
     "grid_timeout": 20
   },
   "DASHUSDT": {
-    "active": 0,
+    "active": 1,
     "category": "clasica_privacidad",
     "volume_threshold": 0.4,
     "adx_reject": 50.0,
