@@ -1779,16 +1779,32 @@ class GridExecutor:
         # 1. Obtener timestamp del último trade conocido
         ultimo_ts = await obtener_ultimo_trade_timestamp(symbol)
 
+        # P2-A FIX: piso temporal = nacimiento del grid (en ms).
+        # Ningún fill anterior al grid puede pertenecerle. Sin este piso, el primer
+        # poll adoptaba trades de grids anteriores (incidente ARBUSDT 2026-07-17).
+        # Los fills perdidos por downtime se recuperan por la vía reactiva
+        # (_monitorear_ordenes_abiertas), no por este poll.
+        grid_inicio_ms = int(getattr(state, 'timestamp_inicio', 0) or 0) * 1000
+
         # 2. Consultar trades recientes en Binance
         try:
-            # Si hay último timestamp, pedir desde ahí. Si no, últimos 100 trades.
+            # Si hay último timestamp, pedir desde ahí. Si no, desde el nacimiento del grid.
             if ultimo_ts > 0:
-                # Convertir ms a hora aproximada para startTime
-                start_time = ultimo_ts + 1  # +1ms para no repetir
+                # +1ms para no repetir; nunca por debajo del nacimiento del grid
+                start_time = max(ultimo_ts + 1, grid_inicio_ms)
                 trades = await self._api_call(asyncio.to_thread(
                     self.client.futures_account_trades,
                     symbol=symbol,
                     startTime=start_time,
+                    limit=100
+                ))
+            elif grid_inicio_ms > 0:
+                # P2-A: sin watermark previo → arrancar desde el nacimiento del grid,
+                # no desde el historial completo de la cuenta
+                trades = await self._api_call(asyncio.to_thread(
+                    self.client.futures_account_trades,
+                    symbol=symbol,
+                    startTime=grid_inicio_ms,
                     limit=100
                 ))
             else:
@@ -1840,6 +1856,19 @@ class GridExecutor:
                     ))
                     if order_info and order_info.get('orderId'):
                         sync_coid = order_info.get('clientOrderId', f"SYNC_{order_id}")
+                        # P2-A FIX: solo adoptar órdenes con prefijo propio ('CM').
+                        # Órdenes ajenas (manuales, otro bot) no se adoptan al grid:
+                        # se reportan como ANOMALIA y el fill queda SIN_ORDEN en el
+                        # procesamiento posterior (no reintenta, no contamina estado).
+                        if not str(sync_coid).startswith('CM'):
+                            print(f"  ⚠️ [CR16] {symbol} Orden {order_id} ajena "
+                                  f"(clientOrderId='{sync_coid}'). No se adopta.")
+                            nuevos_fills.append({
+                                'tipo': 'ANOMALIA',
+                                'trade': trade,
+                                'razon': 'orden_ajena_sin_prefijo'
+                            })
+                            continue
                         # FIX FASE 2: Verificar si ya existe para evitar UNIQUE constraint
                         existe = any(str(o.get('client_order_id')) == sync_coid for o in db_ordenes)
                         if not existe:
@@ -2442,11 +2471,14 @@ class GridExecutor:
             pos_amt_interno = state.posicion_neta
 
             # 2. Trades recientes (últimos 5 minutos) para detectar fills perdidos
+            # P2-A FIX: nunca por debajo del nacimiento del grid
             cinco_min_atras = int((time.time() - 300) * 1000)
+            grid_inicio_ms_rec = int(getattr(state, 'timestamp_inicio', 0) or 0) * 1000
+            start_time_rec = max(cinco_min_atras, grid_inicio_ms_rec) if grid_inicio_ms_rec > 0 else cinco_min_atras
             trades_recientes = await self._api_call(asyncio.to_thread(
                 self.client.futures_account_trades,
                 symbol=state.symbol,
-                startTime=cinco_min_atras
+                startTime=start_time_rec
             ))
 
             # Guardar todos los trades recientes en tracking
@@ -2775,12 +2807,15 @@ class GridExecutor:
                 'quantity': qty_total,
                 'price': tp_price,
                 'timeInForce': 'GTC',
-                'newClientOrderId': client_order_id,
-                'reduceOnly': True
+                'newClientOrderId': client_order_id
             }
             # FASE C.1: HEDGE MODE requiere positionSide en TP
+            # P1-A FIX: en HEDGE MODE Binance rechaza reduceOnly (-1106).
+            # Hedge → solo positionSide; ONE-WAY → solo reduceOnly.
             if self._hedge_mode:
                 orden_tp['positionSide'] = state.direction  # 'LONG' o 'SHORT'
+            else:
+                orden_tp['reduceOnly'] = True
             res = await self._api_call(asyncio.to_thread(
                 self.client.futures_create_order,
                 **orden_tp
@@ -2910,13 +2945,15 @@ class GridExecutor:
                 'quantity': qty,
                 'price': tp_price,
                 'timeInForce': 'GTC',
-                'newClientOrderId': client_id,
-                'reduceOnly': True
+                'newClientOrderId': client_id
             }
             # FASE C.2: HEDGE MODE — el TP cierra la posición del lado opuesto
             # Si tp_side es SELL, cerramos LONG. Si BUY, cerramos SHORT.
+            # P1-A FIX: en HEDGE MODE Binance rechaza reduceOnly (-1106).
             if self._hedge_mode:
                 orden_tp['positionSide'] = 'LONG' if tp_side == 'SELL' else 'SHORT'
+            else:
+                orden_tp['reduceOnly'] = True
             res = await self._api_call(asyncio.to_thread(
                 self.client.futures_create_order,
                 **orden_tp
@@ -2944,9 +2981,12 @@ class GridExecutor:
 
     async def _ejecutar_kill_switch_real(self, symbol: str, state: GridExecutionState,
                                           pos_id: str, pos_tipo: str, qty: float, 
-                                          razon: str, binance_order_id: str = None):
+                                          razon: str, binance_order_id: str = None,
+                                          tipo: str = None):
         """
         CR3 FIX: Kill switch que garantiza cierre completo.
+        P1-C FIX: acepta 'tipo' (la acción KILL_SWITCH lo incluye); sin él el
+        llamador con **accion lanzaba TypeError y abortaba todo el monitoreo.
         
         Si la razón implica cierre total del grid, delega al proceso atómico.
         Si es cierre de posición individual, ejecuta MARKET con verificación.
@@ -2983,12 +3023,14 @@ class GridExecutor:
                 'symbol': symbol,
                 'side': side_cierre,
                 'type': 'MARKET',
-                'quantity': float(qty),
-                'reduceOnly': True
+                'quantity': float(qty)
             }
             # FASE D.1: HEDGE MODE — cerrar posición del lado específico
+            # P1-A FIX: en HEDGE MODE Binance rechaza reduceOnly (-1106).
             if self._hedge_mode:
                 orden_cierre['positionSide'] = pos_tipo  # 'LONG' o 'SHORT'
+            else:
+                orden_cierre['reduceOnly'] = True
             res = await self._api_call(asyncio.to_thread(
                 self.client.futures_create_order,
                 **orden_cierre
@@ -3222,19 +3264,21 @@ class GridExecutor:
                 side = 'SELL' if pos_amt > 0 else 'BUY'
                 qty = float(abs(pos_amt))
 
-                # Enviar orden MARKET con reduceOnly
+                # Enviar orden MARKET de cierre
                 orden_cierre = {
                     'symbol': cierre.symbol,
                     'side': side,
                     'type': 'MARKET',
-                    'quantity': qty,
-                    'reduceOnly': True
+                    'quantity': qty
                 }
                 # FASE D.2: HEDGE MODE — determinar lado de la posición a cerrar
+                # P1-A FIX: en HEDGE MODE Binance rechaza reduceOnly (-1106).
                 if self._hedge_mode:
                     # side=SELL cierra LONG, side=BUY cierra SHORT
                     pos_side = 'LONG' if side == 'SELL' else 'SHORT'
                     orden_cierre['positionSide'] = pos_side
+                else:
+                    orden_cierre['reduceOnly'] = True
                 res_cierre = await self._api_call(asyncio.to_thread(
                     self.client.futures_create_order,
                     **orden_cierre
@@ -3325,7 +3369,14 @@ class GridExecutor:
                     print(f"  ✅ [CIERRE] {cierre.symbol} Posición verificada: 0")
                     return
                 
-                pos_amt_check = Decimal(str(position[0].get('positionAmt', 0)))
+                # P1-B FIX HEDGE: leer la pierna correcta según el modo del grid;
+                # position[0] a ciegas puede ser la pierna equivocada en HEDGE MODE.
+                if self._hedge_mode and state.grid_mode in ('LONG', 'SHORT'):
+                    pos_amt_check = self._get_position_amt_hedge(position, state.grid_mode)
+                elif self._hedge_mode:
+                    pos_amt_check = self._get_position_neta_hedge(position)
+                else:
+                    pos_amt_check = Decimal(str(position[0].get('positionAmt', 0)))
                 cierre.posicion_final = float(pos_amt_check)
                 
                 if abs(pos_amt_check) < Decimal('0.0001'):
