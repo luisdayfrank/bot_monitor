@@ -397,6 +397,40 @@ class GridExecutor:
             return long_amt + short_amt
         return Decimal(str(position_list[0].get('positionAmt', 0)))
 
+    def _sincronizar_signal_grid_neutral_activo(self, symbol: str):
+        """
+        SYNC FIX: Alinear la máquina de señales cuando el executor tiene un grid
+        NEUTRAL activo creado por una vía que la bypassa (force_fire) o
+        recuperado post-reinicio. Idempotente: si ya está en NEUTRAL_GRID no toca nada.
+        """
+        st = self.signal_states.get(symbol)
+        if st is None:
+            return
+        if st.estado != 'NEUTRAL_GRID':
+            st._prev_estado = st.estado
+            st.estado = 'NEUTRAL_GRID'
+            st.neutral_grid_timestamp = int(time.time())
+            print(f"  🔄 [SYNC] {symbol} SignalState -> NEUTRAL_GRID (executor tiene grid activo)")
+
+    def _sincronizar_signal_grid_neutral_cerrado(self, symbol: str):
+        """
+        SYNC FIX: Liberar la máquina de señales cuando un grid NEUTRAL se cierra
+        desde el executor (kill switch, límite de pérdida, aborto, fantasma).
+        Idempotente: no pisa el reset propio de signals (que ya pone MONITOREO
+        antes de enviar ABORTAR_GRID).
+        """
+        st = self.signal_states.get(symbol)
+        if st is None:
+            return
+        if st.estado == 'NEUTRAL_GRID':
+            st._prev_estado = 'NEUTRAL_GRID'
+            st.estado = 'MONITOREO'
+            st.neutral_grid_timestamp = 0
+            st.grid_params_neutral = None
+            st.filtro_macro_aprobado = False
+            st.direccion_filtro = None
+            print(f"  🔄 [SYNC] {symbol} SignalState -> MONITOREO (grid neutral cerrado por executor)")
+
     async def run(self):
         """Loop principal del executor."""
         print("  [EXECUTOR] Iniciando GridExecutor...")
@@ -1570,6 +1604,8 @@ class GridExecutor:
                 return
 
             self._grids[symbol] = state
+            # SYNC FIX: alinear máquina de señales (force_fire la bypassa)
+            self._sincronizar_signal_grid_neutral_activo(symbol)
 
             print(f"  ✅ [EXECUTOR] {symbol} Grid NEUTRAL creado | BUY:{len(niveles_buy)} SELL:{len(niveles_sell)} | Órdenes:{len(order_ids_guardados)}")
 
