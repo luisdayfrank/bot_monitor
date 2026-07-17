@@ -3428,6 +3428,10 @@ class GridExecutor:
         if cierre.symbol in self._grids:
             del self._grids[cierre.symbol]
         
+        # SYNC FIX: liberar máquina de señales si el grid cerrado era neutral
+        if state.grid_mode == 'NEUTRAL':
+            self._sincronizar_signal_grid_neutral_cerrado(cierre.symbol)
+        
         cierre.completar()
 
     async def _manejar_cierre_fallido(self, state: GridExecutionState, cierre: CierreState):
@@ -3648,6 +3652,9 @@ class GridExecutor:
                 self._symbol_leverage[symbol] = grid['apalancamiento_usado']
                 print(f"  ✅ [EXECUTOR] {symbol} Recuperado | {len(state.ordenes)} órdenes activas | "
                       f"Posición: {float(state.posicion_neta):.4f}")
+                # SYNC FIX: post-reinicio la máquina vuelve a MONITOREO; realinear si es neutral
+                if grid['direction'] == 'NEUTRAL':
+                    self._sincronizar_signal_grid_neutral_activo(symbol)
 
             except Exception as e:
                 print(f"  ❌ [EXECUTOR] Error recuperando {symbol}: {e}")
