@@ -325,6 +325,10 @@ class GridExecutor:
         self._grid_pending_creation: Dict[str, float] = {}
         # HEDGE MODE: Detección y helpers
         self._hedge_mode: bool = False  # Se detecta al arrancar
+        # P5 FIX: Órdenes que el propio bot canceló (E.2/E.3/E.5/kill switch).
+        # El monitor reactivo las reconoce y deja de reportarlas como
+        # "cancelada externamente" (ruido que ensuciaba el log y la auditoría).
+        self._cancelaciones_propias: Set[str] = set()
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # LOOP PRINCIPAL
@@ -918,10 +922,23 @@ class GridExecutor:
                           f"Diff: {float(diferencia_niveles):.4f} | PnL: {float(pnl_neto):+.4f}")
                     break  # Solo emparejar una vez por LONG
 
+    def _registrar_cancelacion_propia(self, order_id):
+        """P5: Marca una orden como cancelada por el propio bot (anti falsos 'cancelada externamente')."""
+        try:
+            if order_id is None:
+                return
+            # Cota de seguridad para que el set no crezca sin límite en sesiones largas
+            if len(self._cancelaciones_propias) > 2000:
+                self._cancelaciones_propias.clear()
+            self._cancelaciones_propias.add(str(order_id))
+        except Exception:
+            pass  # Nunca romper el flujo por telemetría
+
     async def _cancelar_tp_si_existe(self, state: GridExecutionState, pos: PosicionReal):
         """Cancela la orden de take-profit de una posición si aún está pendiente."""
         if pos.orden_cierre_id and state.grid_state:
             try:
+                self._registrar_cancelacion_propia(pos.orden_cierre_id)  # P5
                 await self._api_call(asyncio.to_thread(
                     self.client.futures_cancel_order,
                     symbol=state.symbol,
@@ -972,19 +989,11 @@ class GridExecutor:
             print(f"  [E.5] {state.symbol} Fill parcial acumulado en {pos_id} | "
                   f"Qty total: {float(pos_existente.qty):.4f} | Nuevo fill: {float(qty_d):.4f}")
 
-            # E.5: Actualizar TP existente (cancelar + recrear con qty total)
-            if pos_existente.orden_cierre_id:
-                try:
-                    await self._api_call(asyncio.to_thread(
-                        self.client.futures_cancel_order,
-                        symbol=state.symbol,
-                        orderId=pos_existente.orden_cierre_id
-                    ))
-                    print(f"  [E.5] {state.symbol} TP anterior cancelado para recrear con qty acumulada")
-                    if pos_existente.id in gs.ordenes_tp_pendientes:
-                        del gs.ordenes_tp_pendientes[pos_existente.id]
-                except Exception as e:
-                    print(f"  ⚠️ [E.5] {state.symbol} Error cancelando TP anterior: {e}")
+            # P5 FIX: Ya NO se cancela el TP en cada fill parcial. Antes se cancelaba
+            # y recreaba hasta 20 veces por orden (churn de API, ventanas sin
+            # protección, errores -2011 y falsos "cancelada externamente"). Ahora el
+            # TP se recrea UNA sola vez, con qty acumulada completa (P1), desde
+            # _procesar_fills_pendientes cuando la orden de entrada termina de llenarse.
         else:
             # Crear nueva posición (fill completo o primera parte parcial)
             pos = PosicionReal(
@@ -1026,6 +1035,92 @@ class GridExecutor:
               f"Posiciones abiertas: {n_abiertas}")
         
         return pos_id
+
+    async def _on_fill_cierre_neutral(self, state: GridExecutionState, side: str, price: float,
+                                      qty: float, fee: float, timestamp: int,
+                                      binance_order_id: str) -> Optional[str]:
+        """
+        P2 FIX: Procesa el fill de una orden de CIERRE (TAKE_PROFIT neutral / CIERRE)
+        SIN crear una posición nueva. Antes, todo fill NEUTRAL pasaba por _on_fill_real
+        y el fill del TP creaba una PosicionReal fantasma (ej: pos_006 BUY 81.9 cuando
+        en realidad era el TP cerrando pos_005), corrompiendo toda la contabilidad.
+
+        Lógica:
+        1. Localiza la posición que la orden estaba cerrando (match exacto por
+           orden_cierre_id; fallback: la ABIERTA más antigua del lado contrario).
+        2. Ajusta posicion_neta y fees SIEMPRE (Binance ya reflejó el cierre).
+        3. Reduce la posición; si queda en cero la marca CERRADA y contabiliza PnL.
+           Soporta fills parciales del TP (la posición queda ABIERTA con qty menor).
+        """
+        gs = state.grid_state
+        if not gs:
+            return None
+        if timestamp is None:
+            timestamp = int(time.time())
+
+        qty_d = Decimal(str(qty))
+        fee_d = Decimal(str(fee))
+        precio_d = Decimal(str(price))
+
+        # 1. Localizar posición objetivo
+        pos = None
+        for p in gs.posiciones:
+            if (p.estado == 'ABIERTA' and p.orden_cierre_id
+                    and str(p.orden_cierre_id) == str(binance_order_id)):
+                pos = p
+                break
+        if pos is None:
+            # Fallback: la posición ABIERTA más antigua del lado que este fill cierra
+            tipo_objetivo = 'SHORT' if side == 'BUY' else 'LONG'
+            candidatas = [p for p in gs.posiciones
+                          if p.estado == 'ABIERTA' and p.tipo == tipo_objetivo]
+            candidatas.sort(key=lambda p: p.timestamp_apertura)
+            if candidatas:
+                pos = candidatas[0]
+
+        # 2. Ajustar neta y fees SIEMPRE (el cierre ya ocurrió en Binance)
+        if side == 'BUY':
+            state.posicion_neta += qty_d
+        else:
+            state.posicion_neta -= qty_d
+        gs.fees_totales += fee_d
+
+        if pos is None:
+            # No hay posición interna que matchear (ej: ya cerrada por emparejamiento).
+            # Solo ajustamos la neta para no divergir de Binance.
+            print(f"  [P2] {state.symbol} Fill de cierre {side} @ ${price:.4f} sin posición "
+                  f"ABIERTA que matchear (orden {binance_order_id}). Solo ajuste de neta.")
+            return None
+
+        # 3. Reducir posición y contabilizar PnL del tramo cerrado
+        if pos.tipo == 'SHORT':
+            pnl_tramo = (pos.precio_ejecucion - precio_d) * qty_d
+        else:
+            pnl_tramo = (precio_d - pos.precio_ejecucion) * qty_d
+        gs.pnl_bruto += pnl_tramo
+        gs.pnl_neto = gs.pnl_bruto - gs.fees_totales
+        pos.pnl_cierre += pnl_tramo - fee_d
+
+        pos.qty -= qty_d
+        pos.fee_pagada += fee_d
+        gs.ordenes_reales[str(binance_order_id)] = pos.id
+
+        if pos.qty <= Decimal('0.00000001'):
+            pos.qty = Decimal('0')
+            pos.estado = 'CERRADA'
+            # Limpiar tracking del TP consumido
+            if (pos.id in gs.ordenes_tp_pendientes
+                    and gs.ordenes_tp_pendientes[pos.id] == str(binance_order_id)):
+                del gs.ordenes_tp_pendientes[pos.id]
+            pos.orden_cierre_id = None
+            gs.trades_completados += 1
+            print(f"  ✅ [P2] {state.symbol} Pos {pos.id} CERRADA por fill {side} @ ${price:.4f} | "
+                  f"Qty: {qty} | PnL tramo: {float(pnl_tramo):+.4f} | Fee: ${fee:.4f}")
+        else:
+            print(f"  [P2] {state.symbol} Pos {pos.id} reducida por fill {side} @ ${price:.4f} | "
+                  f"Qty restante: {float(pos.qty):.4f} | PnL tramo: {float(pnl_tramo):+.4f}")
+
+        return pos.id
 
     async def _evaluar_kill_switch(self, state: GridExecutionState,
                              precio_actual: float, timestamp: int) -> List[dict]:
@@ -1984,16 +2079,30 @@ class GridExecutor:
                 # ─── PASO 1: Actualizar estado RAM ───
                 pos_id = None
                 if state.grid_mode == 'NEUTRAL' and state.grid_state:
-                    pos_id = await self._on_fill_real(
-                        state=state,
-                        side=side,
-                        price=price,
-                        qty=qty,
-                        fee=commission,
-                        timestamp=ts,
-                        binance_order_id=str(binance_order_id),
-                        binance_trade_id=str(binance_trade_id)
-                    )
+                    # P2 FIX: Solo los fills de ENTRY crean/acumulan posiciones.
+                    # Los fills de TAKE_PROFIT/CIERRE reducen o cierran la posición
+                    # que estaban cerrando — nunca crean posiciones fantasma.
+                    if orden['tipo_orden'] == 'ENTRY':
+                        pos_id = await self._on_fill_real(
+                            state=state,
+                            side=side,
+                            price=price,
+                            qty=qty,
+                            fee=commission,
+                            timestamp=ts,
+                            binance_order_id=str(binance_order_id),
+                            binance_trade_id=str(binance_trade_id)
+                        )
+                    else:
+                        pos_id = await self._on_fill_cierre_neutral(
+                            state=state,
+                            side=side,
+                            price=price,
+                            qty=qty,
+                            fee=commission,
+                            timestamp=ts,
+                            binance_order_id=str(binance_order_id)
+                        )
                 else:
                     pos_id = await self._procesar_fill_direccional(state, fill, orden)
 
@@ -2019,14 +2128,33 @@ class GridExecutor:
                             )
 
                         if state.grid_mode == 'NEUTRAL' and state.grid_state and pos_id and posicion_aun_abierta:
-                            await self._colocar_take_profit_neutral(symbol, state, orden, fill, side, pos_id)
+                            # P5 FIX: No cancelar/recrear el TP en cada fill parcial.
+                            # Solo (a) colocarlo si la posición aún no tiene, o
+                            # (b) recrearlo con qty acumulada completa (P1) cuando la
+                            # orden de entrada terminó de llenarse (o casi: >=99.9%).
+                            pos_p5 = next((p for p in state.grid_state.posiciones
+                                           if p.id == pos_id and p.estado == 'ABIERTA'), None)
+                            qty_orden_p5 = Decimal(str(orden.get('quantity', 0) or 0))
+                            orden_completa_p5 = bool(
+                                pos_p5 is not None and qty_orden_p5 > 0
+                                and pos_p5.qty >= qty_orden_p5 * Decimal('0.999')
+                            )
+                            if pos_p5 is not None and pos_p5.orden_cierre_id and not orden_completa_p5:
+                                print(f"  [P5] {symbol} Fill parcial: TP existente de {pos_id} se mantiene "
+                                      f"(qty {float(pos_p5.qty):.4f}/{float(qty_orden_p5):.4f})")
+                            else:
+                                if pos_p5 is not None and pos_p5.orden_cierre_id:
+                                    # Recrear con qty completa → cancelar TP viejo primero
+                                    await self._cancelar_tp_si_existe(state, pos_p5)
+                                    pos_p5.orden_cierre_id = None  # Si el recreate falla, E.6 lo detecta
+                                await self._colocar_take_profit_neutral(symbol, state, orden, fill, side, pos_id)
                         elif state.grid_mode in ('LONG', 'SHORT') and posicion_aun_abierta:
                             fill['pos_id'] = pos_id
                             await self._colocar_take_profit(symbol, state, orden, fill)
                         else:
                             print(f"  [FASE 5] {symbol} Pos {pos_id} ya cerrada, skip TP.")
 
-                    tipo_evento = 'FILL_ENTRADA' if orden['tipo_orden'] == 'ENTRY' else 'FILL_SALIDA' if orden['tipo_orden'] == 'TAKE_PROFIT' else 'FILL_DESCONOCIDO'
+                    tipo_evento = 'FILL_ENTRADA' if orden['tipo_orden'] == 'ENTRY' else 'FILL_SALIDA' if orden['tipo_orden'] in ('TAKE_PROFIT', 'CIERRE') else 'FILL_DESCONOCIDO'
                     await self._procesar_trade_con_pnl(state, fill, tipo_evento)
 
                     await actualizar_orden_fill(
@@ -2165,7 +2293,13 @@ class GridExecutor:
                         await self._procesar_fill_desde_orden_info(state, order_info)
 
                     elif order_info['status'] == 'CANCELED':
-                        print(f"  [CR16] {symbol} Orden {orden_id} cancelada externamente")
+                        # P5 FIX: si la canceló el propio bot (E.2/E.3/E.5/kill switch),
+                        # no es una anomalía — log suave y limpieza del registro.
+                        if orden_id in self._cancelaciones_propias:
+                            print(f"  [P5] {symbol} Orden {orden_id} cancelada por el bot (propia, ignorada)")
+                            self._cancelaciones_propias.discard(orden_id)
+                        else:
+                            print(f"  [CR16] {symbol} Orden {orden_id} cancelada externamente")
                         # Actualizar DB
                         await _execute_with_retry(
                             "UPDATE grid_ejecucion_ordenes SET status = 'CANCELED' WHERE id = ?",
@@ -2273,31 +2407,43 @@ class GridExecutor:
         # Se ejecuta cada ciclo de monitoreo. Si diverge >1%, fuerza sync.
         # ═══════════════════════════════════════════════════════════════════
         try:
-            position = await self._api_call(asyncio.to_thread(
-                self.client.futures_position_information,
-                symbol=symbol
-            ))
-            if position and len(position) > 0:
-                # FIX HEDGE-NET: leer la posición correcta según modo y tipo de grid.
-                # Antes position[0] leía solo UNA pierna en HEDGE → falsas divergencias
-                # y reseteo de posicion_neta en grids SHORT direccionales y NEUTRAL.
-                if self._hedge_mode and state.grid_mode in ('LONG', 'SHORT'):
-                    pos_amt_real = self._get_position_amt_hedge(position, state.grid_mode)
-                else:
-                    pos_amt_real = self._get_position_neta_hedge(position)
-                pos_amt_interno = state.posicion_neta
-                if pos_amt_real != 0 and abs(pos_amt_interno) > Decimal('0.0001'):
-                    divergencia_pct = abs((pos_amt_real - pos_amt_interno) / pos_amt_real) * 100
-                    if divergencia_pct > Decimal('1.0'):
-                        print(f"  🚨 [FASE 6] {symbol} DIVERGENCIA POSICIÓN: "
-                              f"Binance={float(pos_amt_real):.4f} vs "
-                              f"Interno={float(pos_amt_interno):.4f} "
-                              f"({float(divergencia_pct):.2f}%). Forzando sync...")
-                        state.posicion_neta = pos_amt_real
-                elif pos_amt_real == 0 and abs(pos_amt_interno) > Decimal('0.0001'):
-                    print(f"  🚨 [FASE 6] {symbol} Posición real=0 pero interno={float(pos_amt_interno):.4f}. "
-                          f"Forzando sync a 0.")
-                    state.posicion_neta = Decimal('0')
+            # P3 FIX: Si hay fills pendientes de procesar, Binance ya los refleja
+            # pero el estado interno aún no. Forzar sync aquí y luego aplicar esos
+            # fills en el pipeline CR16 (corre justo después) produce DOBLE CONTEO
+            # (caso real: ARB sync a -2252.2 + fill re-procesado = -3378.3, que
+            # gatilló un aborto de emergencia con pérdida real). Omitir el sync
+            # este ciclo: el pipeline deja la neta correcta y el próximo ciclo
+            # la reconciliación corre limpia.
+            fills_pend_sync = await cargar_fills_sin_procesar(state.grid_id)
+            if fills_pend_sync:
+                print(f"  [P3] {symbol} Sync FASE 6 omitido: {len(fills_pend_sync)} "
+                      f"fills pendientes de procesar (anti doble conteo)")
+            else:
+                position = await self._api_call(asyncio.to_thread(
+                    self.client.futures_position_information,
+                    symbol=symbol
+                ))
+                if position and len(position) > 0:
+                    # FIX HEDGE-NET: leer la posición correcta según modo y tipo de grid.
+                    # Antes position[0] leía solo UNA pierna en HEDGE → falsas divergencias
+                    # y reseteo de posicion_neta en grids SHORT direccionales y NEUTRAL.
+                    if self._hedge_mode and state.grid_mode in ('LONG', 'SHORT'):
+                        pos_amt_real = self._get_position_amt_hedge(position, state.grid_mode)
+                    else:
+                        pos_amt_real = self._get_position_neta_hedge(position)
+                    pos_amt_interno = state.posicion_neta
+                    if pos_amt_real != 0 and abs(pos_amt_interno) > Decimal('0.0001'):
+                        divergencia_pct = abs((pos_amt_real - pos_amt_interno) / pos_amt_real) * 100
+                        if divergencia_pct > Decimal('1.0'):
+                            print(f"  🚨 [FASE 6] {symbol} DIVERGENCIA POSICIÓN: "
+                                  f"Binance={float(pos_amt_real):.4f} vs "
+                                  f"Interno={float(pos_amt_interno):.4f} "
+                                  f"({float(divergencia_pct):.2f}%). Forzando sync...")
+                            state.posicion_neta = pos_amt_real
+                    elif pos_amt_real == 0 and abs(pos_amt_interno) > Decimal('0.0001'):
+                        print(f"  🚨 [FASE 6] {symbol} Posición real=0 pero interno={float(pos_amt_interno):.4f}. "
+                              f"Forzando sync a 0.")
+                        state.posicion_neta = Decimal('0')
         except Exception as e_rec:
             # FASE 6: No bloquear monitoreo si reconciliación falla
             print(f"  ⚠️ [FASE 6] {symbol} Error reconciliando posición: {e_rec}")
@@ -2784,6 +2930,7 @@ class GridExecutor:
                 print(f"  [E.3] {symbol} TP existente para orden {binance_order_id}. "
                       f"Actualizando qty: {tp_previo.get('qty', 0)} + {fill_qty}")
                 try:
+                    self._registrar_cancelacion_propia(tp_previo['binance_order_id'])  # P5
                     await self._api_call(asyncio.to_thread(
                         self.client.futures_cancel_order,
                         symbol=symbol,
@@ -2886,7 +3033,18 @@ class GridExecutor:
 
         ticks = int(siguiente / tick_size)
         tp_price = float(ticks * tick_size)
-        qty = float(fill.get('qty', orden_entry.get('quantity', 0)))
+        # P1 FIX: El TP debe cubrir la posición ACUMULADA completa, no solo el
+        # último fill parcial. Antes: qty = fill['qty'] → con 20 fills parciales
+        # el TP quedaba de ~1/20 de la posición real (pos_004 ARB: LONG 1122.2
+        # con TP de 39.8). Buscar la posición por pos_id y usar su qty total.
+        qty = 0.0
+        if pos_id and gs:
+            pos_p1 = next((p for p in gs.posiciones if p.id == pos_id), None)
+            if pos_p1 is not None and pos_p1.qty > 0:
+                qty = float(pos_p1.qty)
+        if qty <= 0:
+            # Fallback: comportamiento original (qty del fill o de la orden)
+            qty = float(fill.get('qty', orden_entry.get('quantity', 0)))
         if qty <= 0:
             print(f"  ⚠️ [E.2] {symbol} qty inválida ({qty}), abortando TP")
             return
@@ -2908,6 +3066,7 @@ class GridExecutor:
             if conflicto:
                 print(f"  [E.2] {symbol} Cancelando orden de entrada {conflicto['side']} @ ${tp_price} "
                       f"(conflicto con TP) | ID: {conflicto['orderId']}")
+                self._registrar_cancelacion_propia(conflicto['orderId'])  # P5
                 await self._api_call(asyncio.to_thread(
                     self.client.futures_cancel_order,
                     symbol=symbol,
@@ -3005,6 +3164,7 @@ class GridExecutor:
             for pos in state.grid_state.posiciones:
                 if pos.id == pos_id and pos.orden_cierre_id:
                     try:
+                        self._registrar_cancelacion_propia(pos.orden_cierre_id)  # P5
                         await self._api_call(asyncio.to_thread(
                             self.client.futures_cancel_order,
                             symbol=symbol, orderId=pos.orden_cierre_id
@@ -3065,6 +3225,29 @@ class GridExecutor:
                         fee_cierre=total_commission,
                         binance_order_id=order_id
                     )
+
+                    # P4 FIX: Registrar la orden de cierre en DB y marcarla FILLED.
+                    # Antes no se guardaba → CR16 detectaba el fill como SIN_ORDEN
+                    # y la auditoría/reconciliación de PnL quedaba coja. Al marcarla
+                    # FILLED de inmediato, el pipeline la ignora (YA_PROCESADO) porque
+                    # el kill switch ya procesó trades, PnL y cierre de posición aquí.
+                    try:
+                        await guardar_orden_ejecucion(
+                            grid_ejecucion_id=state.grid_id,
+                            binance_order_id=order_id,
+                            client_order_id=f"CM{state.grid_id}_KS_{pos_id}_{int(time.time()*1000)}",
+                            symbol=symbol,
+                            side=side_cierre,
+                            tipo_orden='CIERRE',
+                            price=avg_price,
+                            quantity=float(qty)
+                        )
+                        await _execute_with_retry(
+                            "UPDATE grid_ejecucion_ordenes SET status = 'FILLED', quantity_filled = ? WHERE binance_order_id = ?",
+                            (float(total_qty), order_id)
+                        )
+                    except Exception as e_p4:
+                        print(f"  ⚠️ [P4] {symbol} No se pudo registrar orden de kill switch en DB: {e_p4}")
 
                     # CR2: PnL y fees ya actualizados por _procesar_trade_con_pnl
 
