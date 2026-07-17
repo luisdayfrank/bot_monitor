@@ -1657,6 +1657,8 @@ class GridExecutor:
                                 )
                                 st.activa = False
                                 del self._grids[symbol]
+                                if st.grid_mode == 'NEUTRAL':
+                                    self._sincronizar_signal_grid_neutral_cerrado(symbol)
                                 continue
 
                         print(f"  [EXECUTOR] {symbol} Monitoreo | Pos: {float(st.posicion_neta):.4f} | PnL: {float(st.pnl_real):+.4f} | Fees: {float(st.fees_real):.4f}")
@@ -1718,6 +1720,8 @@ class GridExecutor:
                     state.activa = False
                     if symbol in self._grids:
                         del self._grids[symbol]
+                    if state.grid_mode == 'NEUTRAL':
+                        self._sincronizar_signal_grid_neutral_cerrado(symbol)
                     return
 
             # 4. Duplicación detectada: más órdenes de las esperadas
