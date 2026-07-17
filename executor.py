@@ -1715,55 +1715,66 @@ class GridExecutor:
             await asyncio.sleep(CONFIG.trading_polling_interval_seg)
             ciclo += 1
 
-            # FASE 3: Verificar límite de pérdida diaria
-            await self._verificar_limite_perdida()
+            # P6 FIX: armadura por ciclo — NINGUNA excepción debe matar esta tarea:
+            # es la única que pollea fills, gestiona TPs y evalúa kill switches.
+            try:
+                # FASE 3: Verificar límite de pérdida diaria
+                await self._verificar_limite_perdida()
 
-            for symbol in list(self._grids.keys()):
-                if not self._grids[symbol].activa or self._grids[symbol].cerrando:
-                    continue
-                try:
-                    st = self._grids[symbol]
-                    if st.activa and not st.cerrando:
-                        # FASE 3 FIX: Auto-cleanup si grid terminó naturalmente
-                        # FASE E.3: En HEDGE MODE, verificar posición del lado específico
-                        pos_actual = float(st.posicion_neta)
-                        if self._hedge_mode and st.grid_mode in ('LONG', 'SHORT'):
-                            try:
-                                position = await self._api_call(asyncio.to_thread(
-                                    self.client.futures_position_information,  # typo del plan corregido
-                                    symbol=symbol
+                for symbol in list(self._grids.keys()):
+                    try:
+                        # P6 FIX: usar .get() — _abortar_grid (otra tarea) puede eliminar
+                        # el símbolo entre el snapshot de keys y este acceso. Antes:
+                        # self._grids[symbol] FUERA del try → KeyError que mataba la tarea
+                        # de monitoreo y dejaba al executor SIN monitoreo el resto del día
+                        # (caso real: LDOUSDT 11:45 — Task-16 murió y nunca se reinició).
+                        st = self._grids.get(symbol)
+                        if st is None or not st.activa or st.cerrando:
+                            continue
+                        if st.activa and not st.cerrando:
+                            # FASE 3 FIX: Auto-cleanup si grid terminó naturalmente
+                            # FASE E.3: En HEDGE MODE, verificar posición del lado específico
+                            pos_actual = float(st.posicion_neta)
+                            if self._hedge_mode and st.grid_mode in ('LONG', 'SHORT'):
+                                try:
+                                    position = await self._api_call(asyncio.to_thread(
+                                        self.client.futures_position_information,  # typo del plan corregido
+                                        symbol=symbol
+                                    ))
+                                    pos_actual = float(self._get_position_amt_hedge(position, st.grid_mode))
+                                except Exception:
+                                    pass  # Fallback a posicion_neta
+
+                            if pos_actual == 0 and len(st.pares_abiertos) == 0:
+                                open_orders = await self._api_call(asyncio.to_thread(
+                                    self.client.futures_get_open_orders, symbol=symbol
                                 ))
-                                pos_actual = float(self._get_position_amt_hedge(position, st.grid_mode))
-                            except Exception:
-                                pass  # Fallback a posicion_neta
+                                if not open_orders:
+                                    print(f"  [EXECUTOR] {symbol} Grid terminado naturalmente (posición 0, sin órdenes). Limpiando...")
+                                    await actualizar_grid_ejecucion_cierre(
+                                        grid_id=st.grid_id,
+                                        estado='CERRADO',
+                                        pnl_real=float(st.pnl_real),
+                                        fees_real=float(st.fees_real),
+                                        razon_cierre='grid_completado_natural'
+                                    )
+                                    st.activa = False
+                                    del self._grids[symbol]
+                                    if st.grid_mode == 'NEUTRAL':
+                                        self._sincronizar_signal_grid_neutral_cerrado(symbol)
+                                    continue
 
-                        if pos_actual == 0 and len(st.pares_abiertos) == 0:
-                            open_orders = await self._api_call(asyncio.to_thread(
-                                self.client.futures_get_open_orders, symbol=symbol
-                            ))
-                            if not open_orders:
-                                print(f"  [EXECUTOR] {symbol} Grid terminado naturalmente (posición 0, sin órdenes). Limpiando...")
-                                await actualizar_grid_ejecucion_cierre(
-                                    grid_id=st.grid_id,
-                                    estado='CERRADO',
-                                    pnl_real=float(st.pnl_real),
-                                    fees_real=float(st.fees_real),
-                                    razon_cierre='grid_completado_natural'
-                                )
-                                st.activa = False
-                                del self._grids[symbol]
-                                if st.grid_mode == 'NEUTRAL':
-                                    self._sincronizar_signal_grid_neutral_cerrado(symbol)
-                                continue
+                            print(f"  [EXECUTOR] {symbol} Monitoreo | Pos: {float(st.posicion_neta):.4f} | PnL: {float(st.pnl_real):+.4f} | Fees: {float(st.fees_real):.4f}")
+                        await self._monitorear_grid(symbol)
 
-                        print(f"  [EXECUTOR] {symbol} Monitoreo | Pos: {float(st.posicion_neta):.4f} | PnL: {float(st.pnl_real):+.4f} | Fees: {float(st.fees_real):.4f}")
-                    await self._monitorear_grid(symbol)
+                        # V7.1 FASE 4: Verificación de integridad cada 3 ciclos (~30s)
+                        if ciclo % 3 == 0:
+                            await self._verificar_integridad_grid(symbol, st)
+                    except Exception as e:
+                        print(f"  ❌ [EXECUTOR] Error monitoreando {symbol}: {e}")
 
-                    # V7.1 FASE 4: Verificación de integridad cada 3 ciclos (~30s)
-                    if ciclo % 3 == 0:
-                        await self._verificar_integridad_grid(symbol, st)
-                except Exception as e:
-                    print(f"  ❌ [EXECUTOR] Error monitoreando {symbol}: {e}")
+            except Exception as e_loop:
+                print(f"  🚨 [P6] Error en ciclo de monitoreo #{ciclo} (la tarea sobrevive): {e_loop}")
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # V7.1 FASE 4: VERIFICACIÓN DE INTEGRIDAD DEL GRID
@@ -2403,8 +2414,21 @@ class GridExecutor:
             print(f"  ⚠️ [SYNC] {symbol} Error sincronizando órdenes: {e_sync}")
             
         # ═══════════════════════════════════════════════════════════════════
+        # CR16 PASO 1: POLL PROACTIVO DE TRADES
+        # ═══════════════════════════════════════════════════════════════════
+        nuevos_fills = await self._poll_fills_proactivo(symbol, state)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # CR16 PASO 2: PROCESAR FILLS PENDIENTES
+        # ═══════════════════════════════════════════════════════════════════
+        await self._procesar_fills_pendientes(symbol, state)
+
+        # ═══════════════════════════════════════════════════════════════════
         # FASE 6: RECONCILIACIÓN RÁPIDA DE POSICIÓN NETA vs BINANCE
         # Se ejecuta cada ciclo de monitoreo. Si diverge >1%, fuerza sync.
+        # P6 FIX: movido DESPUÉS del poll+procesamiento de fills — antes corría
+        # ANTES del poll y el guard P3 no veía los fills recién llegados
+        # (doble conteo transitorio LDO: sync a -267 + 8 fills = -396).
         # ═══════════════════════════════════════════════════════════════════
         try:
             # P3 FIX: Si hay fills pendientes de procesar, Binance ya los refleja
@@ -2447,16 +2471,6 @@ class GridExecutor:
         except Exception as e_rec:
             # FASE 6: No bloquear monitoreo si reconciliación falla
             print(f"  ⚠️ [FASE 6] {symbol} Error reconciliando posición: {e_rec}")
-
-        # ═══════════════════════════════════════════════════════════════════
-        # CR16 PASO 1: POLL PROACTIVO DE TRADES
-        # ═══════════════════════════════════════════════════════════════════
-        nuevos_fills = await self._poll_fills_proactivo(symbol, state)
-
-        # ═══════════════════════════════════════════════════════════════════
-        # CR16 PASO 2: PROCESAR FILLS PENDIENTES
-        # ═══════════════════════════════════════════════════════════════════
-        await self._procesar_fills_pendientes(symbol, state)
 
         # ═══════════════════════════════════════════════════════════════════
         # CR16 PASO 3: MONITOREO REACTIVO (fallback)
@@ -2647,6 +2661,11 @@ class GridExecutor:
             await self._procesar_fills_pendientes(state.symbol, state)
 
             # 3. Verificar discrepancia de posición
+            # P6 FIX: re-leer posicion_neta DESPUÉS del procesamiento de fills de
+            # este mismo paso (antes se comparaba contra el valor capturado al
+            # entrar → falsos "posición huérfana detectada" y syncs innecesarios,
+            # ej: LDO -85 vs -138 e INJ 5.6 vs 17.8 del log del día).
+            pos_amt_interno = state.posicion_neta
             if abs(pos_amt_real - pos_amt_interno) > Decimal('0.0001'):
                 print(f"  🚨 [CR16 RECONCILIACIÓN] {state.symbol} "
                       f"Posición: Binance={float(pos_amt_real):.4f} vs "
