@@ -848,14 +848,21 @@ class SignalGenerator:
     async def _evaluar_transicion_neutral_grid(self, symbol: str, state: SignalState,
                                                 direction: str, score_macro: int,
                                                 umbral_entrada: int, i15: dict,
-                                                price: float, coin_cfg: dict) -> bool:
+                                                price: float, coin_cfg: dict,
+                                                direccion_confianza: str = 'NINGUNA') -> bool:
         """
         FASE 4.1: Evalúa entrada y salida del estado NEUTRAL_GRID.
         Retorna True si entró a NEUTRAL_GRID (el flujo principal debe detenerse).
         """
         entro_neutral_grid = False
 
-        if direction == 'NEUTRAL' and CONFIG.grid_neutral_enabled:
+        # V7.2: Puerta propia del grid neutral. Las 5 condiciones de evaluar_grid_neutro
+        # ya definen "mercado en rango" (ADX<22, RSI medio, ATR moderado, precio pegado
+        # a EMA50, MACD plano). La dirección EMA solo bloquea si hay tendencia REAL
+        # confirmada por 4h (ALTA). Restaura el hábitat neutral que CR1 estrechó.
+        # (Alternativa más estricta: direccion_confianza in ('NINGUNA', 'BAJA'))
+        regimen_neutral = direccion_confianza != 'ALTA'
+        if regimen_neutral and CONFIG.grid_neutral_enabled:
             cb_bloquea_grid = (
                 CONFIG.circuit_breaker_afecta_grid_neutral and
                 state.circuit_breaker_activo
@@ -929,7 +936,7 @@ class SignalGenerator:
                     state.neutral_grid_dir_previa = 'NEUTRAL'
                     state.estado = 'NEUTRAL_GRID'
                     state.neutral_grid_timestamp = int(datetime.now(pytz.UTC).timestamp())
-                    print(f"  [NEUTRAL_GRID] {symbol} -> NEUTRAL_GRID | {razon_grid}")
+                    print(f"  [NEUTRAL_GRID] {symbol} -> NEUTRAL_GRID | {razon_grid} | Dir: {direction} ({direccion_confianza})")
 
                     state.grid_params_neutral = grid_params
 
@@ -1051,7 +1058,7 @@ class SignalGenerator:
         CR1 FIX: Determina dirección con fallback progresivo.
 
         Niveles de confianza:
-        - ALTA: 4h + 15m + 50m alineados
+        - ALTA: 4h + 50m alineados (EMA200 15m es refuerzo, no requisito)
         - MEDIA: 15m + 50m alineados (sin 4h)
         - BAJA: Solo 15m (sin 50m ni 4h)
         - NEUTRAL: Sin alineación
@@ -1064,13 +1071,13 @@ class SignalGenerator:
             trend_threshold_4h = ema4h * 0.02
 
             if ema50:
+                # V7.2: EMA200 15m ya no es requisito para ALTA (endurecimiento no
+                # planificado de CR1). 4h + EMA50 alineados = criterio original.
                 if (price > ema4h + trend_threshold_4h and
-                    price > ema50 + trend_threshold_50 and
-                    price > ema15 + trend_threshold_15m):
+                    price > ema50 + trend_threshold_50):
                     return 'LONG', 'ALTA'
                 elif (price < ema4h - trend_threshold_4h and
-                      price < ema50 - trend_threshold_50 and
-                      price < ema15 - trend_threshold_15m):
+                      price < ema50 - trend_threshold_50):
                     return 'SHORT', 'ALTA'
             else:
                 if (price > ema4h + trend_threshold_4h and
@@ -1142,7 +1149,9 @@ class SignalGenerator:
             tipo = r.split(':')[0] if ':' in r else r
             state.metricas_dia['rechazos_frecuentes'][tipo] = state.metricas_dia['rechazos_frecuentes'].get(tipo, 0) + 1
 
-        await self._evaluar_despausa_automatica(symbol, state, score_ajustado)
+        # V7.2: La pausa/despausa mide actividad (score crudo), no calidad de señal.
+        # La penalización por confianza solo aplica a la aprobación del filtro.
+        await self._evaluar_despausa_automatica(symbol, state, score_macro)
 
         if state.moneda_pausada and not state.moneda_pausada_manual:
             state.filtro_macro_aprobado = False
@@ -1152,14 +1161,14 @@ class SignalGenerator:
 
         if state.estado == 'NEUTRAL_GRID':
             state.score_bajo_desde = None
-        elif score_ajustado < 50:
+        elif score_macro < 50:  # V7.2: crudo, no ajustado
             if state.score_bajo_desde is None:
                 state.score_bajo_desde = int(datetime.now(pytz.UTC).timestamp())
             else:
                 segundos_bajo = int(datetime.now(pytz.UTC).timestamp()) - state.score_bajo_desde
                 if segundos_bajo > CONFIG.pausa_inactividad_horas * 3600 and not state.moneda_pausada:
                     state.moneda_pausada = True
-                    state.moneda_pausada_razon = f"Score ajustado < 50 durante {segundos_bajo/60:.0f}min"
+                    state.moneda_pausada_razon = f"Score < 50 durante {segundos_bajo/60:.0f}min"
                     state.moneda_pausada_timestamp = int(datetime.now(pytz.UTC).timestamp())
                     print(f"  [PAUSA] {symbol} AUTO-PAUSADA por inactividad | {state.moneda_pausada_razon}")
         else:
@@ -1344,7 +1353,8 @@ class SignalGenerator:
 
         # BLOQUE 2: TRANSICIÓN A NEUTRAL_GRID
         entro_neutral_grid = await self._evaluar_transicion_neutral_grid(
-            symbol, state, direction, score_ajustado, umbral_entrada, i15, price, coin_cfg
+            symbol, state, direction, score_ajustado, umbral_entrada, i15, price, coin_cfg,
+            direccion_confianza
         )
         if entro_neutral_grid:
             return
