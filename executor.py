@@ -443,6 +443,7 @@ class GridExecutor:
         await self._cargar_exchange_info()
         await self._detectar_modo_posicion()  # ← FASE A
         await self._recuperar_grids_activos()
+        await self._barrido_huerfanas_global()  # P7: barrido global al arranque
 
         # Tarea de monitoreo periódico
         asyncio.create_task(self._monitoring_loop())
@@ -722,6 +723,60 @@ class GridExecutor:
             await asyncio.sleep(0.5)  # Espera original si todo fue limpio
 
         return True
+
+    async def _barrido_huerfanas_global(self):
+        """
+        P7 FIX: Barrido GLOBAL de órdenes huérfanas al arranque, independiente de la
+        recuperación de grids. Antes el barrido solo corría por símbolo recuperado:
+        si un grid quedaba fuera de la DB (rollback incompleto, cierre manual de DB,
+        crash entre estados) sus órdenes vivas quedaban invisibles y el siguiente
+        grid del mismo símbolo duplicaba precios.
+
+        Lógica: consulta TODAS las órdenes abiertas de la cuenta (1 sola llamada),
+        filtra las de este bot (clientOrderId prefix 'CM'), extrae el grid_id de
+        cada una y cancela las que no pertenezcan a un grid ACTIVO en DB.
+        Es seguro porque la DB se escribe ANTES de enviar el batch (creación),
+        así que toda orden legítima tiene su grid ACTIVO registrado.
+        """
+        try:
+            open_orders = await self._api_call(asyncio.to_thread(
+                self.client.futures_get_open_orders
+            ))
+            if not open_orders:
+                print("  [P7] Barrido global: sin órdenes abiertas en la cuenta")
+                return
+
+            grids_db = await cargar_grid_ejecuciones_activos()
+            ids_activos = {str(g['id']) for g in grids_db}
+
+            huerfanas_por_symbol = {}
+            for o in open_orders:
+                cid = o.get('clientOrderId', '') or ''
+                if not cid.startswith('CM'):
+                    continue  # no es de este bot
+                # Extraer grid_id: formatos CM{id}_..., CM{id}_BUY_..., CM{id}_TP_..., etc.
+                gid = ''
+                for ch in cid[2:]:
+                    if ch.isdigit():
+                        gid += ch
+                    else:
+                        break
+                if not gid or gid in ids_activos:
+                    continue  # pertenece a un grid activo (o no parseable → no tocar)
+                huerfanas_por_symbol.setdefault(o['symbol'], []).append(o)
+
+            if not huerfanas_por_symbol:
+                print(f"  [P7] Barrido global: {len(open_orders)} órdenes abiertas, todas de grids activos")
+                return
+
+            for symbol, lista in huerfanas_por_symbol.items():
+                print(f"  🧹 [P7] {symbol} {len(lista)} órdenes huérfanas GLOBALES "
+                      f"(grid_id no activo en DB). Cancelando...")
+                await self._cancelar_ordenes_huérfanas(symbol, lista)
+
+        except Exception as e:
+            # Nunca abortar el arranque por el barrido
+            print(f"  ⚠️ [P7] Error en barrido global de huérfanas: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # V7.1 FASE 3: VALIDACIÓN DEFENSIVA DE INTEGRIDAD DE NIVELES
@@ -3029,23 +3084,29 @@ class GridExecutor:
         tick_size = Decimal(str(info['tickSize']))
         precio_entry = Decimal(str(fill.get('price', orden_entry['price'])))
 
+        # P8 FIX: El TP va al nivel INMEDIATO de la escalera completa del grid
+        # (niveles_buy + niveles_sell ordenados), no al primer nivel del lado
+        # contrario del centro. Antes solo se miraban niveles_sell (para LONG) o
+        # niveles_buy (para SHORT): dos posiciones distintas podían recibir TP al
+        # MISMO precio (caso real LDO: pos_001 y pos_003 ambas con TP @ 0.3753,
+        # visto por el usuario como "órdenes duplicadas") y los niveles
+        # intermedios quedaban muertos para el round-trip.
+        escalera = sorted(set(list(gs.niveles_buy or []) + list(gs.niveles_sell or [])))
+        if not escalera:
+            print(f"  ⚠️ [E.2] {symbol} Escalera de niveles vacía, no se puede colocar TP")
+            return
+
         if side_filled == 'BUY':
-            if not gs.niveles_sell:
-                print(f"  ⚠️ [E.2] {symbol} Sin niveles_sell, no se puede colocar TP")
-                return
-            candidatos = [n for n in gs.niveles_sell if n > precio_entry * Decimal('1.0001')]
+            candidatos = [n for n in escalera if n > precio_entry * Decimal('1.0001')]
             if not candidatos:
-                print(f"  ⚠️ [E.2] {symbol} No hay nivel sell superior a {float(precio_entry):.4f} para TP de LONG")
+                print(f"  ⚠️ [E.2] {symbol} No hay nivel superior a {float(precio_entry):.4f} para TP de LONG")
                 return
             siguiente = min(candidatos)
             tp_side = 'SELL'
         else:
-            if not gs.niveles_buy:
-                print(f"  ⚠️ [E.2] {symbol} Sin niveles_buy, no se puede colocar TP")
-                return
-            candidatos = [n for n in gs.niveles_buy if n < precio_entry * Decimal('0.9999')]
+            candidatos = [n for n in escalera if n < precio_entry * Decimal('0.9999')]
             if not candidatos:
-                print(f"  ⚠️ [E.2] {symbol} No hay nivel buy inferior a {float(precio_entry):.4f} para TP de SHORT")
+                print(f"  ⚠️ [E.2] {symbol} No hay nivel inferior a {float(precio_entry):.4f} para TP de SHORT")
                 return
             siguiente = max(candidatos)
             tp_side = 'BUY'
