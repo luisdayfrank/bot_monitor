@@ -2514,15 +2514,22 @@ class GridExecutor:
                     if pos_amt_real != 0 and abs(pos_amt_interno) > Decimal('0.0001'):
                         divergencia_pct = abs((pos_amt_real - pos_amt_interno) / pos_amt_real) * 100
                         if divergencia_pct > Decimal('1.0'):
-                            print(f"  🚨 [FASE 6] {symbol} DIVERGENCIA POSICIÓN: "
+                            # P9 FIX: solo DETECTAR — NO forzar sync aquí. Binance puede
+                            # ir por delante del poll de fills (trades aún no consultados);
+                            # sincronizar ahora produce doble conteo cuando el poll entrega
+                            # esos fills (caso real: ARB sync a 39.5 + fills pendientes =
+                            # interno -17.0). La única autoridad de sync es
+                            # _reconciliar_con_binance (PASO 5), que pollea trades
+                            # recientes ANTES de comparar → no puede doble-contar.
+                            # Si la divergencia es real, PASO 5 la corrige en este ciclo.
+                            print(f"  🚨 [P9] {symbol} DIVERGENCIA POSICIÓN detectada: "
                                   f"Binance={float(pos_amt_real):.4f} vs "
                                   f"Interno={float(pos_amt_interno):.4f} "
-                                  f"({float(divergencia_pct):.2f}%). Forzando sync...")
-                            state.posicion_neta = pos_amt_real
+                                  f"({float(divergencia_pct):.2f}%). Sin sync forzado, "
+                                  f"PASO 5 reconcilia.")
                     elif pos_amt_real == 0 and abs(pos_amt_interno) > Decimal('0.0001'):
-                        print(f"  🚨 [FASE 6] {symbol} Posición real=0 pero interno={float(pos_amt_interno):.4f}. "
-                              f"Forzando sync a 0.")
-                        state.posicion_neta = Decimal('0')
+                        print(f"  🚨 [P9] {symbol} Posición real=0 pero interno={float(pos_amt_interno):.4f}. "
+                              f"Sin sync forzado, PASO 5 reconcilia.")
         except Exception as e_rec:
             # FASE 6: No bloquear monitoreo si reconciliación falla
             print(f"  ⚠️ [FASE 6] {symbol} Error reconciliando posición: {e_rec}")
@@ -3283,10 +3290,22 @@ class GridExecutor:
 
             # Consultar trades para obtener precio real y commission
             if order_id:
-                trades = await self._api_call(asyncio.to_thread(
-                    self.client.futures_account_trades,
-                    symbol=symbol, orderId=order_id
-                ))
+                # P10 FIX: el endpoint de trades puede tardar unos segundos en
+                # reflejar la ejecución MARKET. Antes se declaraba huérfana de
+                # inmediato y se abortaba el GRID COMPLETO cuando la posición ya
+                # estaba cerrada (2 grids muertos por lag de API en el log de 24h).
+                # Reintentar antes de escalar.
+                trades = []
+                for intento_p10 in range(3):
+                    trades = await self._api_call(asyncio.to_thread(
+                        self.client.futures_account_trades,
+                        symbol=symbol, orderId=order_id
+                    ))
+                    if trades:
+                        break
+                    print(f"  [P10] {symbol} Trades del kill switch aún no visibles "
+                          f"(intento {intento_p10+1}/3). Reintentando...")
+                    await asyncio.sleep(3)
                 if trades:
                     # CR2 FIX: Procesar cada trade con PnL
                     for trade in trades:
