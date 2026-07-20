@@ -2438,6 +2438,14 @@ class GridExecutor:
                         realized_pnl=float(fill.get('realized_pnl', 0)),
                         timestamp=datetime.fromtimestamp(ts).isoformat() if ts > 0 else datetime.utcnow().isoformat()
                     )
+
+                    # V8 FASE 4: reportar fill al engine (observacional — una falla
+                    # aquí queda capturada por el except de side-effects, nunca
+                    # rompe el pipeline; el fill ya fue marcado como procesado)
+                    if (state.engine_version == 2 and state.grid_engine and
+                            CONFIG.grid_engine_roundtrip and state.grid_mode == 'NEUTRAL'):
+                        await self._v8_track_fill_roundtrip(
+                            state, symbol, orden, side, price, qty, pos_id)
                 except Exception as e_side:
                     print(f"  ⚠️ [FASE 3] {symbol} Fill {fill_id} side-effect falló (TP/PnL/orden) pero YA MARCADO como procesado: {e_side}")
 
@@ -2453,6 +2461,79 @@ class GridExecutor:
                         print(f"  [FASE 3] {symbol} Fill {fill_id} marcado como ERROR_LOOP para evitar reintento infinito")
                     except Exception as e2:
                         print(f"  🚨 [FASE 3] {symbol} CRÍTICO: No se pudo marcar fill {fill_id} como ERROR_LOOP: {e2}")
+
+    async def _v8_track_fill_roundtrip(self, state: GridExecutionState, symbol: str,
+                                       orden: dict, side: str, price: float,
+                                       qty: float, pos_id):
+        """
+        V8 FASE 4: Round-trip por nivel (OBSERVACIONAL — no coloca ni cancela órdenes).
+        Reporta fills al engine para que el LevelMap refleje el ciclo real de V7:
+          ENTRY fill → nivel PARTIAL/FILLED (FILLED = round-trip abierto, esperando TP)
+          TP fill    → nivel rearma a PENDING + roundtrips += 1
+          CIERRE     → rearma sin contar ciclo (no fue round-trip completo)
+        Gateado por: engine_version == 2 AND CONFIG.grid_engine_roundtrip.
+        Se invoca desde el bloque de side-effects del CR16: una falla aquí nunca
+        rompe el pipeline de fills (el fill ya fue marcado como procesado).
+        """
+        engine = state.grid_engine
+        lm = engine.level_map
+        if lm is None:
+            return
+        tol = engine.tolerance()
+        tipo = orden.get('tipo_orden', '')
+
+        if tipo == 'ENTRY':
+            nivel = lm.find_level_for_fill(side, Decimal(str(price)), tol)
+            if nivel is None:
+                print(f"  [V8-RT] {symbol} Fill ENTRY {side} @ {price} sin nivel candidato (tol={float(tol)})")
+                return
+            lm2 = lm.on_entry_fill(nivel.level_index, Decimal(str(qty)))
+            state.grid_engine.level_map = lm2
+            nivel_new = lm2.levels[nivel.level_index]
+            await actualizar_nivel_grid(
+                state.grid_id, nivel.level_index,
+                state=nivel_new.state.value,
+                filled_qty=float(nivel_new.filled_qty),
+                version=nivel_new.version
+            )
+            if nivel_new.state == LevelState.FILLED:
+                print(f"  [V8-RT] {symbol} Nivel {nivel.level_index} {side} FILLED → round-trip abierto")
+            else:
+                print(f"  [V8-RT] {symbol} Nivel {nivel.level_index} {side} fill parcial "
+                      f"({float(nivel_new.filled_qty)}/{float(nivel_new.quantity)})")
+
+        elif tipo in ('TAKE_PROFIT', 'CIERRE'):
+            # Localizar la posición cerrada para conocer su nivel de entrada
+            pos = None
+            if pos_id and state.grid_state:
+                pos = next((p for p in state.grid_state.posiciones if p.id == pos_id), None)
+            if pos is None:
+                print(f"  [V8-RT] {symbol} Cierre {tipo} sin posición localizada (pos_id={pos_id})")
+                return
+            entry_side = 'BUY' if pos.tipo == 'LONG' else 'SELL'
+            nivel = lm.find_filled_for_close(entry_side, pos.nivel_precio, tol)
+            if nivel is None:
+                print(f"  [V8-RT] {symbol} Cierre {tipo} de {pos_id} sin nivel FILLED candidato "
+                      f"(entry {entry_side} @ {float(pos.nivel_precio)})")
+                return
+            count_rt = (tipo == 'TAKE_PROFIT')
+            lm2 = lm.on_roundtrip_close(nivel.level_index, count_roundtrip=count_rt)
+            state.grid_engine.level_map = lm2
+            nivel_new = lm2.levels[nivel.level_index]
+            await actualizar_nivel_grid(
+                state.grid_id, nivel.level_index,
+                state=nivel_new.state.value,
+                filled_qty=0.0,
+                order_id=None,
+                binance_order_id=None,
+                last_placed_at_ms=None,
+                roundtrips=nivel_new.roundtrips,
+                version=nivel_new.version
+            )
+            if count_rt:
+                print(f"  [V8-RT] {symbol} Nivel {nivel.level_index} round-trip #{nivel_new.roundtrips} completado → rearmado")
+            else:
+                print(f"  [V8-RT] {symbol} Nivel {nivel.level_index} rearmado por {tipo} (sin ciclo)")
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # FASE 2: PROCESAMIENTO DE FILLS DIRECCIONALES

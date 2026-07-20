@@ -439,6 +439,7 @@ async def init_db():
                 filled_qty REAL DEFAULT 0,
                 last_placed_at_ms INTEGER,
                 version INTEGER DEFAULT 1,
+                roundtrips INTEGER DEFAULT 0,
                 updated_at INTEGER,
                 UNIQUE(grid_ejecucion_id, level_index)
             )
@@ -511,6 +512,9 @@ async def init_db():
                 ('timestamp_inicio', 'INTEGER'),
                 ('engine_version', 'INTEGER DEFAULT 1'),      # V8: versión del motor
                 ('order_id_counter', 'INTEGER DEFAULT 0'),       # V8: contador de IDs
+            ],
+            'grid_niveles': [
+                ('roundtrips', 'INTEGER DEFAULT 0'),          # V8 FASE 4: ciclos por nivel
             ],
         }
 
@@ -1481,14 +1485,15 @@ async def guardar_niveles_grid(grid_id: int, rows: list):
                 INSERT OR REPLACE INTO grid_niveles
                 (grid_ejecucion_id, symbol, level_index, price, side, position_side,
                  quantity, state, is_gap, order_id, binance_order_id, filled_qty,
-                 last_placed_at_ms, version, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 last_placed_at_ms, version, roundtrips, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 grid_id, row['symbol'], row['level_index'], row['price'],
                 row['side'], row.get('position_side', 'LONG'), row['quantity'],
                 row['state'], row['is_gap'], row.get('order_id'),
                 row.get('binance_order_id'), row.get('filled_qty', 0),
                 row.get('last_placed_at_ms'), row.get('version', 1),
+                row.get('roundtrips', 0),
                 int(time.time())
             ))
         await db.commit()

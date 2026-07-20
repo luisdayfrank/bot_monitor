@@ -77,6 +77,7 @@ class GridLevel:
     last_placed_at_ms: Optional[int] = None
     filled_qty: Decimal = Decimal('0')
     version: int = 1
+    roundtrips: int = 0            # FASE 4: ciclos entrada→TP completados por este nivel
 
     def with_state(self, new_state: LevelState) -> 'GridLevel':
         """Retorna nuevo nivel con estado actualizado."""
@@ -92,7 +93,8 @@ class GridLevel:
             is_gap=self.is_gap,
             last_placed_at_ms=self.last_placed_at_ms,
             filled_qty=self.filled_qty,
-            version=self.version + 1
+            version=self.version + 1,
+            roundtrips=self.roundtrips
         )
 
     def with_order(self, order_id: str, binance_id: str, timestamp_ms: int) -> 'GridLevel':
@@ -109,7 +111,8 @@ class GridLevel:
             is_gap=self.is_gap,
             last_placed_at_ms=timestamp_ms,
             filled_qty=self.filled_qty,
-            version=self.version + 1
+            version=self.version + 1,
+            roundtrips=self.roundtrips
         )
 
     def with_fill(self, filled_qty: Decimal) -> 'GridLevel':
@@ -129,7 +132,44 @@ class GridLevel:
             is_gap=self.is_gap,
             last_placed_at_ms=self.last_placed_at_ms,
             filled_qty=new_filled,
-            version=self.version + 1
+            version=self.version + 1,
+            roundtrips=self.roundtrips
+        )
+
+    def with_roundtrip_closed(self) -> 'GridLevel':
+        """FASE 4: round-trip completado (TP ejecutado). Nivel rearma a PENDING."""
+        return GridLevel(
+            level_index=self.level_index,
+            price=self.price,
+            side=self.side,
+            position_side=self.position_side,
+            quantity=self.quantity,
+            state=LevelState.PENDING,
+            order_id=None,
+            binance_order_id=None,
+            is_gap=self.is_gap,
+            last_placed_at_ms=None,
+            filled_qty=Decimal('0'),
+            version=self.version + 1,
+            roundtrips=self.roundtrips + 1
+        )
+
+    def with_rearm(self) -> 'GridLevel':
+        """FASE 4: rearma sin contar round-trip (cierre de emergencia, no ciclo completo)."""
+        return GridLevel(
+            level_index=self.level_index,
+            price=self.price,
+            side=self.side,
+            position_side=self.position_side,
+            quantity=self.quantity,
+            state=LevelState.PENDING,
+            order_id=None,
+            binance_order_id=None,
+            is_gap=self.is_gap,
+            last_placed_at_ms=None,
+            filled_qty=Decimal('0'),
+            version=self.version + 1,
+            roundtrips=self.roundtrips
         )
 
     def to_row(self, symbol: str, grid_id: int) -> dict:
@@ -149,6 +189,7 @@ class GridLevel:
             'filled_qty': float(self.filled_qty),
             'last_placed_at_ms': self.last_placed_at_ms,
             'version': self.version,
+            'roundtrips': self.roundtrips,
         }
 
     @classmethod
@@ -167,6 +208,7 @@ class GridLevel:
             last_placed_at_ms=row.get('last_placed_at_ms'),
             filled_qty=Decimal(str(row.get('filled_qty', 0))),
             version=row.get('version', 1),
+            roundtrips=int(row.get('roundtrips', 0) or 0),
         )
 
 
@@ -182,6 +224,10 @@ class CoverageReport:
     duplicates: List[List[dict]] = field(default_factory=list)
     actions: List[Tuple[CoverageAction, dict]] = field(default_factory=list)
     diagnostics: List[str] = field(default_factory=list)
+    # FASE 4: round-trip por nivel
+    tp_orders: List[dict] = field(default_factory=list)   # TPs reconocidos (no huérfanos)
+    levels_in_roundtrip: int = 0                          # Niveles FILLED esperando TP
+    roundtrips_total: int = 0                             # Ciclos completados acumulados
 
     def is_clean(self) -> bool:
         return self.severity == CoverageSeverity.CLEAN
@@ -306,7 +352,8 @@ class LevelMap:
                     is_gap=False,
                     last_placed_at_ms=None,
                     filled_qty=level.filled_qty,
-                    version=level.version
+                    version=level.version,
+                    roundtrips=level.roundtrips
                 )
                 new_levels[i] = new_level
             elif i == new_gap_index:
@@ -323,7 +370,8 @@ class LevelMap:
                     is_gap=True,
                     last_placed_at_ms=None,
                     filled_qty=level.filled_qty,
-                    version=level.version
+                    version=level.version,
+                    roundtrips=level.roundtrips
                 )
             else:
                 new_levels[i] = level
@@ -339,6 +387,73 @@ class LevelMap:
         """Niveles que pueden tener orden (excluye gap y filled)."""
         return [l for l in self.levels.values() 
                 if not l.is_gap and l.state != LevelState.FILLED]
+
+    # ═══════════════════════════════════════════════════════════════
+    # FASE 4: ROUND-TRIP POR NIVEL (ciclo ACTIVE→FILLED→PENDING)
+    # ═══════════════════════════════════════════════════════════════
+
+    def find_level_for_fill(self, side: str, price: Decimal, tolerance: Decimal) -> Optional[GridLevel]:
+        """
+        FASE 4: Nivel candidato para un fill de ENTRADA.
+        Excluye gap y niveles ya FILLED (un nivel en round-trip no puede
+        recibir otro fill de entrada — sería doble conteo).
+        """
+        mejor = None
+        mejor_dist = None
+        for level in self.levels.values():
+            if level.is_gap or level.side != side or level.state == LevelState.FILLED:
+                continue
+            dist = abs(level.price - price)
+            if dist <= tolerance:
+                if mejor_dist is None or dist < mejor_dist:
+                    mejor = level
+                    mejor_dist = dist
+        return mejor
+
+    def find_filled_for_close(self, entry_side: str, entry_price: Decimal, tolerance: Decimal) -> Optional[GridLevel]:
+        """
+        FASE 4: Nivel FILLED cuyo round-trip está cerrando un TP.
+        Se busca por el lado y precio de ENTRADA de la posición cerrada.
+        """
+        mejor = None
+        mejor_dist = None
+        for level in self.levels.values():
+            if level.is_gap or level.side != entry_side or level.state != LevelState.FILLED:
+                continue
+            dist = abs(level.price - entry_price)
+            if dist <= tolerance:
+                if mejor_dist is None or dist < mejor_dist:
+                    mejor = level
+                    mejor_dist = dist
+        return mejor
+
+    def on_entry_fill(self, level_index: int, qty: Decimal) -> 'LevelMap':
+        """FASE 4: registra fill de entrada en un nivel (PARTIAL o FILLED)."""
+        level = self.levels.get(level_index)
+        if level is None:
+            return self
+        return self.with_level(level.with_fill(qty))
+
+    def on_roundtrip_close(self, level_index: int, count_roundtrip: bool = True) -> 'LevelMap':
+        """
+        FASE 4: cierra el round-trip de un nivel.
+        count_roundtrip=True (TP ejecutado) → suma ciclo; False (cierre de
+        emergencia) → solo rearma. En ambos casos el nivel vuelve a PENDING.
+        """
+        level = self.levels.get(level_index)
+        if level is None:
+            return self
+        nuevo = level.with_roundtrip_closed() if count_roundtrip else level.with_rearm()
+        return self.with_level(nuevo)
+
+    def levels_in_roundtrip(self) -> List[GridLevel]:
+        """FASE 4: niveles con round-trip abierto (FILLED, esperando TP)."""
+        return [l for l in self.levels.values()
+                if not l.is_gap and l.state == LevelState.FILLED]
+
+    def roundtrips_total(self) -> int:
+        """FASE 4: total de ciclos completados en el grid."""
+        return sum(l.roundtrips for l in self.levels.values())
 
     def find_by_price(self, price: Decimal, side: str, tolerance: Decimal) -> Optional[GridLevel]:
         """Encuentra nivel por precio y side dentro de tolerancia."""
@@ -489,12 +604,35 @@ class GridEngine:
                     fills_by_order[oid] = []
                 fills_by_order[oid].append(fill)
 
+        # ─── FASE 4: Indexar órdenes TP (gestión de round-trip de V7) ───
+        # Patrón clientOrderId: CM{grid_id}_TP_{ts}. Un TP cubre UN nivel FILLED
+        # (una posición = un TP). Se consumen 1-a-1 para detectar TP_FALTANTE.
+        tp_pool: Dict[str, List[dict]] = {'SELL': [], 'BUY': []}
+        for order in open_orders:
+            if '_TP_' in order.get('clientOrderId', ''):
+                tp_pool.get(order.get('side'), tp_pool['SELL']).append(order)
+
         # ─── Match niveles ↔ órdenes ───
         matched_levels: Set[int] = set()
         matched_orders: Set[int] = set()
 
         for level in self.level_map.levels.values():
             if level.is_gap:
+                continue
+
+            # FASE 4: nivel en round-trip (FILLED) — su cobertura es el TP, no una
+            # orden de nivel. Sin TP vivo → TP_FALTANTE (WARNING, corrobora E.6).
+            if level.state == LevelState.FILLED:
+                report.levels_in_roundtrip += 1
+                tp_side = 'SELL' if level.side == 'BUY' else 'BUY'
+                if tp_pool[tp_side]:
+                    tp_order = tp_pool[tp_side].pop()
+                    report.tp_orders.append(tp_order)
+                    matched_orders.add(id(tp_order))
+                else:
+                    report.severity = max(report.severity, CoverageSeverity.WARNING)
+                    report.add_diagnostic(
+                        f"TP_FALTANTE: nivel {level.level_index} {level.side} FILLED sin TP activo")
                 continue
 
             # Buscar orden para este nivel (mismo side, precio dentro de tolerancia)
@@ -524,9 +662,17 @@ class GridEngine:
             if not order.get('clientOrderId', '').startswith(prefix):
                 continue
             if id(order) not in matched_orders:
+                # FASE 4: TPs no consumidos siguen siendo gestión legítima del
+                # grid (ej. TP de posición previa al tracking) — no son huérfanos.
+                if '_TP_' in order.get('clientOrderId', ''):
+                    report.tp_orders.append(order)
+                    continue
                 report.orphan_orders.append(order)
                 report.severity = max(report.severity, CoverageSeverity.WARNING)
                 report.add_diagnostic(f"Orphan: {order.get('clientOrderId')}")
+
+        # ─── FASE 4: métricas de round-trip ───
+        report.roundtrips_total = self.level_map.roundtrips_total()
 
         # ─── Determinar severidad final ───
         if report.uncovered_levels:

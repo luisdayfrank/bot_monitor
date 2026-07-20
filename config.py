@@ -377,7 +377,7 @@ class Config(BaseModel):
     # ═══════════════════════════════════════════════════════════════════════════════
     # V8: MOTOR DE NIVELES
     # ═══════════════════════════════════════════════════════════════════════════════
-    grid_engine_enabled: bool = True           # Master toggle
+    grid_engine_enabled: bool = False           # Master toggle
     grid_engine_coverage_mode: str = "SHADOW"   # SHADOW | ACTIVE | OFF
     grid_engine_roundtrip: bool = False         # Fase 4: round-trip por nivel
     grid_engine_gap_dynamic: bool = False       # Fase 5: gap dinámico
