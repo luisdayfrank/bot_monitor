@@ -390,7 +390,7 @@ class Config(BaseModel):
     # ═══════════════════════════════════════════════════════════════════════════════
     # FASE 4.5: SWEEPER DE HUÉRFANOS + CIERRE POR PAR + DETECTOR DE PIERNA ATASCADA
     # ═══════════════════════════════════════════════════════════════════════════════
-    fase45_policy: str = "SHADOW"               # OFF | SHADOW | ACTIVE
+    fase45_policy: str = "ACTIVE"               # OFF | SHADOW | ACTIVE
     fase45_sweeper_interval_seg: int = 900      # Barrido de posiciones cada 15 min (+1 al arranque)
     fase45_pair_fee_taker: float = 0.0005       # Taker fee estimado por pierna (0.05%)
     fase45_pair_fee_margin_mult: float = 2.0    # Neto del par debe ser >= fees_est × este margen
