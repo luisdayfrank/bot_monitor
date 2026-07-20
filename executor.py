@@ -346,6 +346,10 @@ class GridExecutor:
         self._cancelaciones_propias: Set[str] = set()
         # V8: Locks por símbolo para sincronización
         self._symbol_locks: Dict[str, asyncio.Lock] = {}
+        # FASE 4.5: estado del sweeper de huérfanos / cierre por par
+        self._f45_ultimo_barrido: float = 0.0
+        self._f45_cierres_hoy: int = 0
+        self._f45_dia_contador: str = ""
 
     def _get_symbol_lock(self, symbol: str) -> asyncio.Lock:
         """Obtiene o crea un lock para un símbolo (V8)."""
@@ -438,6 +442,247 @@ class GridExecutor:
         return params
 
     # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 4.5: SWEEPER DE HUÉRFANOS + CIERRE POR PAR + DETECTOR DE PIERNA ATASCADA
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    def _f45_telegram(self, msg: str):
+        """Envía Telegram de F45 si hay notifier; nunca rompe el flujo."""
+        try:
+            if self.notifier:
+                asyncio.create_task(self.notifier.enviar_telegram(msg))
+        except Exception:
+            pass
+
+    def _f45_check_limite_diario(self) -> bool:
+        """True si aún queda cupo de cierres F45 hoy (reset por fecha)."""
+        hoy = time.strftime('%Y-%m-%d')
+        if self._f45_dia_contador != hoy:
+            self._f45_dia_contador = hoy
+            self._f45_cierres_hoy = 0
+        return self._f45_cierres_hoy < CONFIG.fase45_max_cierres_por_dia
+
+    def _f45_redondear_qty(self, symbol: str, qty: float) -> float:
+        """Redondea qty hacia abajo al stepSize del símbolo."""
+        info = self._get_symbol_info(symbol)
+        step = Decimal(str(info['stepSize']))
+        q = Decimal(str(qty))
+        return float(int(q / step) * step)
+
+    def _f45_calcular_neto_par(self, long_entry: float, short_entry: float,
+                                qty_close: float) -> tuple:
+        """
+        Motor del cierre por par: neto estimado de cerrar qty_close de ambas piernas.
+        Retorna (neto_est, fees_est, viable). Viable = spread positivo Y
+        neto >= fees × margen de seguridad. Fee-aware: sin umbral fijo en USDT.
+        """
+        if long_entry >= short_entry:
+            return 0.0, 0.0, False  # Spread invertido: cerrar bloquearía PÉRDIDA
+        spread = (short_entry - long_entry) * qty_close
+        fees = qty_close * (long_entry + short_entry) * CONFIG.fase45_pair_fee_taker
+        neto = spread - fees
+        viable = neto > 0 and neto >= fees * CONFIG.fase45_pair_fee_margin_mult
+        return neto, fees, viable
+
+    async def _barrido_posiciones_huerfanas(self, contexto: str = "periodico"):
+        """
+        FASE 4.5.0: Position Sweeper. Escanea posiciones reales de Binance y
+        detecta las que NO tienen grid dueño en self._grids:
+          - Par hedge (LONG+SHORT) con spread positivo → cierre por par fee-aware
+          - Pierna sola → política fase45_lone_leg_policy (ALERT | CLOSE acotado)
+        SHADOW: solo log + Telegram. ACTIVE: ejecuta con tope diario.
+        """
+        self._f45_ultimo_barrido = time.time()
+        try:
+            positions = await self._api_call(asyncio.to_thread(
+                self.client.futures_position_information
+            ))
+        except Exception as e:
+            print(f"  ⚠️ [F45] Error obteniendo posiciones para barrido: {e}")
+            return
+
+        # Agrupar por símbolo las piernas con cantidad > 0
+        por_symbol: Dict[str, dict] = {}
+        for p in positions:
+            amt = float(p.get('positionAmt', 0) or 0)
+            if abs(amt) <= 0:
+                continue
+            sym = p['symbol']
+            lado = p.get('positionSide', 'BOTH')
+            d = por_symbol.setdefault(sym, {'LONG': None, 'SHORT': None, 'BOTH': None})
+            d[lado] = {'qty': abs(amt), 'entry': float(p.get('entryPrice', 0) or 0),
+                       'mark': float(p.get('markPrice', 0) or 0)}
+
+        huerfanos = {s: d for s, d in por_symbol.items() if s not in self._grids}
+        if not huerfanos:
+            print(f"  [F45] Barrido {contexto}: sin posiciones huérfanas")
+            return
+
+        print(f"  [F45] Barrido {contexto}: {len(huerfanos)} símbolo(s) con posición SIN grid dueño")
+        for symbol, d in huerfanos.items():
+            try:
+                long_leg = d.get('LONG')
+                short_leg = d.get('SHORT')
+                both_leg = d.get('BOTH')
+
+                if long_leg and short_leg:
+                    await self._evaluar_par_huerfano(symbol, long_leg, short_leg)
+                elif both_leg:
+                    await self._manejar_pierna_huerfana_sola(symbol, both_leg)
+                else:
+                    leg = long_leg or short_leg
+                    if leg:
+                        await self._manejar_pierna_huerfana_sola(symbol, leg,
+                                                                 lado='LONG' if long_leg else 'SHORT')
+            except Exception as e_leg:
+                print(f"  ⚠️ [F45] {symbol} Error procesando huérfano: {e_leg}")
+
+    async def _evaluar_par_huerfano(self, symbol: str, long_leg: dict, short_leg: dict):
+        """Evalúa y (si ACTIVE) ejecuta el cierre por par de un huérfano hedge."""
+        qty_close = min(long_leg['qty'], short_leg['qty'])
+        qty_close = self._f45_redondear_qty(symbol, qty_close)
+        if qty_close <= 0:
+            print(f"  [F45] {symbol} Par huérfano con qty redondeada a 0, skip")
+            return
+
+        neto, fees, viable = self._f45_calcular_neto_par(
+            long_leg['entry'], short_leg['entry'], qty_close)
+        residual = abs(long_leg['qty'] - short_leg['qty'])
+        margen_lib = qty_close * (long_leg['entry'] + short_leg['entry']) / 2 / 5  # ~lev 5
+
+        if not viable:
+            print(f"  [F45] {symbol} Par huérfano NO viable: neto est. {neto:+.4f} "
+                  f"(fees {fees:.4f}) — spread insuficiente o invertido, se mantiene")
+            return
+
+        msg = (f"[F45] {symbol} PAR HUÉRFANO: cerrar {qty_close} de cada pierna | "
+               f"neto est. {neto:+.4f} USDT (fees {fees:.4f}) | "
+               f"margen liberado ~{margen_lib:.1f} | residual {residual:.4f}")
+
+        if CONFIG.fase45_policy != "ACTIVE":
+            print(f"  {msg} → SHADOW, no se ejecuta")
+            return
+
+        if not self._f45_check_limite_diario():
+            print(f"  [F45] {symbol} Tope diario de cierres alcanzado, skip")
+            return
+
+        # ── ACTIVE: cerrar qty_close de ambas piernas (reduceOnly) ──
+        print(f"  {msg} → EJECUTANDO")
+        try:
+            kw_long = dict(symbol=symbol, side='SELL', type='MARKET', quantity=qty_close)
+            kw_short = dict(symbol=symbol, side='BUY', type='MARKET', quantity=qty_close)
+            if self._hedge_mode:
+                kw_long['positionSide'] = 'LONG'
+                kw_short['positionSide'] = 'SHORT'
+            else:
+                kw_long['reduceOnly'] = True
+                kw_short['reduceOnly'] = True
+
+            r1 = await self._api_call(asyncio.to_thread(self.client.futures_create_order, **kw_long))
+            r2 = await self._api_call(asyncio.to_thread(self.client.futures_create_order, **kw_short))
+            self._f45_cierres_hoy += 1
+            print(f"  ✅ [F45] {symbol} PAR HUÉRFANO CERRADO | órdenes {r1.get('orderId')}/{r2.get('orderId')} | "
+                  f"neto est. {neto:+.4f}")
+            self._f45_telegram(
+                f"🧹 [F45] {symbol} Par huérfano cerrado\n"
+                f"Qty: {qty_close} c/pierna | Neto est: {neto:+.4f} USDT\n"
+                f"Margen liberado ~{margen_lib:.1f} USDT | Residual: {residual:.4f}")
+        except Exception as e:
+            print(f"  ❌ [F45] {symbol} Error cerrando par huérfano: {e}")
+            self._f45_telegram(f"⚠️ [F45] {symbol} Error cerrando par huérfano: {e}")
+
+    async def _manejar_pierna_huerfana_sola(self, symbol: str, leg: dict, lado: str = None):
+        """Pierna huérfana sin contraparte: ALERT (default) o CLOSE si es polvo."""
+        lado = lado or ('LONG' if leg['qty'] > 0 else 'SHORT')
+        notional = leg['qty'] * leg['mark']
+        info = self._get_symbol_info(symbol)
+
+        if notional < info['minNotional']:
+            print(f"  [F45] {symbol} Pierna huérfana sola {lado} es POLVO "
+                  f"(notional {notional:.2f} < min {info['minNotional']}), solo log")
+            return
+
+        msg = (f"[F45] {symbol} PIERNA HUÉRFANA SOLA: {lado} qty {leg['qty']} @ {leg['entry']} "
+               f"(notional ~{notional:.1f} USDT, mark {leg['mark']})")
+
+        if CONFIG.fase45_lone_leg_policy == "CLOSE" and \
+                notional <= CONFIG.fase45_lone_leg_max_close_usdt and \
+                CONFIG.fase45_policy == "ACTIVE" and self._f45_check_limite_diario():
+            print(f"  {msg} → CERRANDO (política CLOSE acotada)")
+            try:
+                kw = dict(symbol=symbol,
+                          side='SELL' if lado == 'LONG' else 'BUY',
+                          type='MARKET', quantity=self._f45_redondear_qty(symbol, leg['qty']))
+                if self._hedge_mode:
+                    kw['positionSide'] = lado
+                else:
+                    kw['reduceOnly'] = True
+                r = await self._api_call(asyncio.to_thread(self.client.futures_create_order, **kw))
+                self._f45_cierres_hoy += 1
+                print(f"  ✅ [F45] {symbol} Pierna sola cerrada | orden {r.get('orderId')}")
+                self._f45_telegram(f"🧹 [F45] {symbol} Pierna huérfana sola ({lado}) cerrada a mercado")
+            except Exception as e:
+                print(f"  ❌ [F45] {symbol} Error cerrando pierna sola: {e}")
+        else:
+            print(f"  {msg} → ALERTA (política {CONFIG.fase45_lone_leg_policy})")
+            self._f45_telegram(
+                f"👁️ [F45] {symbol} Pierna huérfana sin gestión\n"
+                f"{lado} {leg['qty']} @ {leg['entry']} (~{notional:.1f} USDT)\n"
+                f"Requiere decisión manual o política CLOSE")
+
+    async def _detectar_piernas_atascadas(self):
+        """
+        FASE 4.5.1 (SHADOW-ONLY en esta iteración): detector de pierna atascada
+        en grids VIVOS. Una pierna es candidata si:
+          edad > fase45_stuck_age_hours Y distancia en contra > fase45_stuck_dist_steps.
+        Solo mide y reporta qué acción tomaría cada caso (par / TP reducido /
+        salida acotada) — NO ejecuta nada en grids vivos (eso es Fase 4.5.2).
+        """
+        for symbol, state in list(self._grids.items()):
+            try:
+                if not state.activa or state.cerrando or not state.grid_state:
+                    continue
+                posiciones = [p for p in state.grid_state.posiciones if p.estado == 'ABIERTA']
+                if not posiciones:
+                    continue
+                current = self.precios_vivo.get(symbol, 0)
+                if current <= 0 or len(state.niveles) < 2:
+                    continue
+                step = abs(state.niveles[1] - state.niveles[0])
+                if step <= 0:
+                    continue
+
+                for pos in posiciones:
+                    ts = pos.timestamp_apertura
+                    ts_seg = ts / 1000 if ts > 1e12 else ts
+                    edad_h = (time.time() - ts_seg) / 3600
+                    entry = float(pos.precio_ejecucion)
+                    if pos.tipo == 'LONG':
+                        dist_contra = (entry - current) / step
+                    else:
+                        dist_contra = (current - entry) / step
+
+                    if edad_h < CONFIG.fase45_stuck_age_hours or dist_contra < CONFIG.fase45_stuck_dist_steps:
+                        continue
+
+                    # Candidata a atascada: ¿hay pierna opuesta para par?
+                    opuesta = next((q for q in posiciones
+                                    if q.estado == 'ABIERTA' and q.tipo != pos.tipo), None)
+                    if opuesta:
+                        le = entry if pos.tipo == 'LONG' else float(opuesta.precio_ejecucion)
+                        se = entry if pos.tipo == 'SHORT' else float(opuesta.precio_ejecucion)
+                        qc = min(float(pos.filled_qty), float(opuesta.filled_qty))
+                        neto, fees, viable = self._f45_calcular_neto_par(le, se, qc)
+                        accion = f"PAR viable neto est. {neto:+.4f}" if viable else f"PAR no viable ({neto:+.4f})"
+                    else:
+                        accion = "sin contraparte → TP reducido a breakeven+fees sería la vía"
+
+                    print(f"  [F45-DETECTOR] {symbol} {pos.tipo} {pos.id}: edad {edad_h:.1f}h, "
+                          f"en contra {dist_contra:.1f} steps, qty {float(pos.filled_qty)} → {accion}")
+            except Exception as e_det:
+                print(f"  ⚠️ [F45-DETECTOR] {symbol} Error: {e_det}")
+
+    # ═══════════════════════════════════════════════════════════════════════════════
     # LOOP PRINCIPAL
     # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -508,11 +753,12 @@ class GridExecutor:
             return long_amt + short_amt
         return Decimal(str(position_list[0].get('positionAmt', 0)))
 
-    def _sincronizar_signal_grid_neutral_activo(self, symbol: str):
+    def _sincronizar_signal_grid_neutral_activo(self, symbol: str, params: dict = None):
         """
         SYNC FIX: Alinear la máquina de señales cuando el executor tiene un grid
         NEUTRAL activo creado por una vía que la bypassa (force_fire) o
         recuperado post-reinicio. Idempotente: si ya está en NEUTRAL_GRID no toca nada.
+        FASE 4.5: acepta params para inyectar grid_params_neutral en recuperación.
         """
         st = self.signal_states.get(symbol)
         if st is None:
@@ -522,6 +768,10 @@ class GridExecutor:
             st.estado = 'NEUTRAL_GRID'
             st.neutral_grid_timestamp = int(time.time())
             print(f"  🔄 [SYNC] {symbol} SignalState -> NEUTRAL_GRID (executor tiene grid activo)")
+        # FASE 4.5 FIX: inyectar params del grid recuperado — sin esto el aborto de
+        # emergencia 1m de signals queda ciego ("grid_params_neutral no es dict")
+        if params is not None and getattr(st, 'grid_params_neutral', None) is None:
+            st.grid_params_neutral = params
 
     def _sincronizar_signal_grid_neutral_cerrado(self, symbol: str):
         """
@@ -551,6 +801,10 @@ class GridExecutor:
         await self._detectar_modo_posicion()  # ← FASE A
         await self._recuperar_grids_activos()
         await self._barrido_huerfanas_global()  # P7: barrido global al arranque
+        # FASE 4.5: sweeper de posiciones huérfanas + detector stuck-leg al arranque
+        if CONFIG.fase45_policy != "OFF":
+            await self._barrido_posiciones_huerfanas(contexto="arranque")
+            await self._detectar_piernas_atascadas()
 
         # Tarea de monitoreo periódico
         asyncio.create_task(self._monitoring_loop())
@@ -1980,6 +2234,12 @@ class GridExecutor:
             try:
                 # FASE 3: Verificar límite de pérdida diaria
                 await self._verificar_limite_perdida()
+
+                # FASE 4.5: barrido periódico de huérfanos + detector de piernas atascadas
+                if CONFIG.fase45_policy != "OFF" and \
+                        time.time() - self._f45_ultimo_barrido >= CONFIG.fase45_sweeper_interval_seg:
+                    await self._barrido_posiciones_huerfanas(contexto="periodico")
+                    await self._detectar_piernas_atascadas()
 
                 for symbol in list(self._grids.keys()):
                     try:
@@ -4400,8 +4660,9 @@ class GridExecutor:
                 print(f"  ✅ [EXECUTOR] {symbol} Recuperado | {len(state.ordenes)} órdenes activas | "
                       f"Posición: {float(state.posicion_neta):.4f}")
                 # SYNC FIX: post-reinicio la máquina vuelve a MONITOREO; realinear si es neutral
+                # FASE 4.5: pasar params para que el aborto 1m de signals no quede ciego
                 if grid['direction'] == 'NEUTRAL':
-                    self._sincronizar_signal_grid_neutral_activo(symbol)
+                    self._sincronizar_signal_grid_neutral_activo(symbol, params=params)
 
             except Exception as e:
                 print(f"  ❌ [EXECUTOR] Error recuperando {symbol}: {e}")

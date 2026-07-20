@@ -377,7 +377,7 @@ class Config(BaseModel):
     # ═══════════════════════════════════════════════════════════════════════════════
     # V8: MOTOR DE NIVELES
     # ═══════════════════════════════════════════════════════════════════════════════
-    grid_engine_enabled: bool = False           # Master toggle
+    grid_engine_enabled: bool = True           # Master toggle
     grid_engine_coverage_mode: str = "SHADOW"   # SHADOW | ACTIVE | OFF
     grid_engine_roundtrip: bool = True         # Fase 4: round-trip por nivel
     grid_engine_gap_dynamic: bool = False       # Fase 5: gap dinámico
@@ -386,6 +386,19 @@ class Config(BaseModel):
     grid_engine_coverage_interval_ticks: int = 3  # Cada N ciclos de monitoreo
     grid_engine_gap_hysteresis_ticks: int = 2     # Histeresis para mover gap
     grid_engine_max_snapshots: int = 100        # Máximo snapshots en DB
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 4.5: SWEEPER DE HUÉRFANOS + CIERRE POR PAR + DETECTOR DE PIERNA ATASCADA
+    # ═══════════════════════════════════════════════════════════════════════════════
+    fase45_policy: str = "SHADOW"               # OFF | SHADOW | ACTIVE
+    fase45_sweeper_interval_seg: int = 900      # Barrido de posiciones cada 15 min (+1 al arranque)
+    fase45_pair_fee_taker: float = 0.0005       # Taker fee estimado por pierna (0.05%)
+    fase45_pair_fee_margin_mult: float = 2.0    # Neto del par debe ser >= fees_est × este margen
+    fase45_lone_leg_policy: str = "ALERT"       # ALERT | CLOSE (pierna huérfana sola)
+    fase45_lone_leg_max_close_usdt: float = 30.0  # CLOSE solo si notional <= este tope
+    fase45_stuck_age_hours: float = 2.0         # Detector: edad mínima del round-trip
+    fase45_stuck_dist_steps: float = 3.0        # Detector: distancia en contra, en steps
+    fase45_max_cierres_por_dia: int = 10        # Tope de seguridad diario de cierres F45
 
     # Helper para lag guard adaptativo
     def get_lag_guard_ms(self) -> int:
