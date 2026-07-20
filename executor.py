@@ -39,7 +39,17 @@ from database_v5 import (
     obtener_pnl_por_tipo,
     cargar_grid_ejecuciones_activos,
     cargar_ordenes_por_grid,
+    # V8: Motor de niveles
+    guardar_niveles_grid,
+    cargar_niveles_grid,
+    actualizar_nivel_grid,
+    actualizar_grid_engine_version,
+    actualizar_order_id_counter,
+    cargar_order_id_counter,
+    guardar_snapshot_engine,
 )
+
+from grid_engine import GridEngine, LevelMap, LevelState, CoverageAction, GapManager, ClientOrderIdGenerator
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -185,6 +195,11 @@ class GridExecutionState:
         self.grid_state = None
         self.grid_mode = direction
 
+        # ═══ V8: Motor de Niveles ═══
+        self.grid_engine: 'GridEngine' = None
+        self.engine_version: int = 1  # 1=legacy, 2=engine
+        self.order_id_generator: 'ClientOrderIdGenerator' = None
+
     def init_grid_state(self, niveles_buy: List[float] = None, niveles_sell: List[float] = None):
         """Inicializa el GridState propio del executor."""
         fee_rate = getattr(CONFIG, 'grid_neutral_sim_fee_rate', 0.0005)
@@ -329,6 +344,98 @@ class GridExecutor:
         # El monitor reactivo las reconoce y deja de reportarlas como
         # "cancelada externamente" (ruido que ensuciaba el log y la auditoría).
         self._cancelaciones_propias: Set[str] = set()
+        # V8: Locks por símbolo para sincronización
+        self._symbol_locks: Dict[str, asyncio.Lock] = {}
+
+    def _get_symbol_lock(self, symbol: str) -> asyncio.Lock:
+        """Obtiene o crea un lock para un símbolo (V8)."""
+        if symbol not in self._symbol_locks:
+            self._symbol_locks[symbol] = asyncio.Lock()
+        return self._symbol_locks[symbol]
+
+    def _normalizar_params_b5(self, symbol: str, params: dict, price: float):
+        """
+        V8-B5 CLAMP: Garantiza step > 4×tick (condición del engine para atribuir
+        fills a niveles sin ambigüedad: tolerancia < step/2).
+
+        Estrategia en 2 etapas (reduce primero, amplía solo si es inevitable):
+          1. Reduce niveles (mínimo 4 = 3 órdenes + gap V8) PRESERVANDO el rango
+             → mantiene la zona de operación y sube el notional por orden.
+          2. Amplía el rango hasta atr_seguro × grid_rango_mult_max (tope
+             vol-escalado de la config), re-centrado al precio actual.
+
+        REGLA DE ORO: muta `params` in-place, jamás reasignar el dict. El mismo
+        objeto lo lee signals como state.grid_params_neutral para el aborto de
+        emergencia 1m → la mutación sincroniza ambas vistas automáticamente.
+
+        Retorna: params (mutado o no) si hay solución; None si es insalvable
+        (ej. MEME). Solo se invoca con CONFIG.grid_engine_enabled == True.
+        """
+        info = self._get_symbol_info(symbol)
+        tick_raw = info.get('tickSize') if info else None
+        if not tick_raw or float(tick_raw) <= 0:
+            print(f"  ⚠️ [V8-B5] {symbol} tick_size no disponible → params sin normalizar")
+            return params
+
+        tick = Decimal(str(tick_raw))
+        step_min = tick * 4 * Decimal('1.02')  # 2% margen anti-empate (B5 exige step > 4×tick estricto)
+
+        rango = Decimal(str(params['upper_limit'])) - Decimal(str(params['lower_limit']))
+        niveles = int(params['grid_count'])
+        if rango <= 0 or niveles < 2:
+            return params  # params degenerados; el flujo normal los rechaza después
+
+        grid_count_original = niveles
+        rango_original = float(rango)
+
+        def _step(rng, niv):
+            return rng / (niv - 1) if niv > 1 else rng
+
+        step = _step(rango, niveles)
+
+        # ── ETAPA 1: reducir niveles (preserva rango → máxima frecuencia de toques) ──
+        while step < step_min and niveles > 4:
+            niveles -= 1
+            step = _step(rango, niveles)
+
+        # ── ETAPA 2: ampliar rango (solo si Etapa 1 no bastó), tope = mult_max × ATR ──
+        if step < step_min:
+            atr_seguro = params.get('atr_seguro')
+            if atr_seguro and float(atr_seguro) > 0:
+                rango_max = Decimal(str(atr_seguro)) * Decimal(str(CONFIG.grid_rango_mult_max))
+                rango_necesario = step_min * (niveles - 1)
+                rango_nuevo = min(rango_max, rango_necesario * Decimal('1.01'))
+                if rango_nuevo > rango and rango_nuevo >= rango_necesario:
+                    rango = rango_nuevo
+                    step = _step(rango, niveles)
+
+        # ── Veredicto ──
+        if step < step_min:
+            print(f"  ⚠️ [V8-B5] {symbol} Clamp insalvable: step {float(step):.8f} < min {float(step_min):.8f} "
+                  f"(tick {float(tick)}) tras reducir niveles y ampliar rango al tope")
+            return None
+
+        # ── No-op: ya cumplía B5 (caso majors) → params intactos ──
+        if niveles == grid_count_original and float(rango) == rango_original:
+            return params
+
+        # ── Mutar params IN-PLACE (sync-back con signals vía referencia compartida) ──
+        p = Decimal(str(price))
+        params['grid_count'] = niveles
+        params['step_usdt'] = float(step)
+        params['step_pct'] = float(step / p * 100) if p > 0 else 0.0
+        if float(rango) != rango_original:
+            half = rango / 2
+            params['lower_limit'] = float(p - half)
+            params['upper_limit'] = float(p + half)
+        params['b5_adjusted'] = True
+        params['grid_count_original'] = grid_count_original
+        params['rango_original'] = round(rango_original, 8)
+        print(f"  [V8-B5-CLAMP] {symbol} niveles {grid_count_original}→{niveles} | "
+              f"rango {rango_original:.6f}→{float(rango):.6f} | "
+              f"step {float(step):.6f} ({params['step_pct']:.3f}%) ≥ min {float(step_min):.6f}")
+
+        return params
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # LOOP PRINCIPAL
@@ -1597,6 +1704,14 @@ class GridExecutor:
     # ═══════════════════════════════════════════════════════════════════════════════
 
     async def _crear_grid_neutral(self, symbol: str, params: dict, price: float):
+        """Crea un grid neutral. V8: Lock por símbolo + Engine opcional."""
+        # V8: Lock por símbolo (externo al lock V7.1, mismo orden de adquisición:
+        # symbol_lock → creation_lock. Implementado como wrapper para no re-indentar
+        # el cuerpo completo del método; semántica idéntica al parche original)
+        async with self._get_symbol_lock(symbol):
+            await self._crear_grid_neutral_locked(symbol, params, price)
+
+    async def _crear_grid_neutral_locked(self, symbol: str, params: dict, price: float):
         """Crea un grid neutral usando lógica interna del executor (FASE 2). V7.1: Lock atómico."""
         # V7.1 FASE 1: Lock atómico por símbolo
         lock = self._grid_creation_locks.setdefault(symbol, asyncio.Lock())
@@ -1621,6 +1736,17 @@ class GridExecutor:
                 except Exception as e:
                     print(f"  ⚠️ [V7.1] {symbol} Error limpiando huérfanas: {e}")
                     return
+
+            # ═══ V8-B5: Normalizar params para el engine (reduce niveles / amplía rango) ═══
+            # ANTES del leverage para que notional/orden use el grid_count final.
+            # Con toggle apagado no corre → comportamiento idéntico a V7.
+            b5_ok = True
+            if CONFIG.grid_engine_enabled:
+                params_norm = self._normalizar_params_b5(symbol, params, price)
+                if params_norm is None:
+                    # Insalvable (ej. MEME): fallback a grid legacy con params originales
+                    b5_ok = False
+                    print(f"  ⚠️ [V8-B5] {symbol} Sin solución B5 → grid legacy (engine_version=1)")
 
             # 1. Calcular leverage (igual que directional)
             leverage = self._calcular_leverage_adaptativo(
@@ -1701,6 +1827,85 @@ class GridExecutor:
 
             # 9. INICIAR GridState propio del executor (FASE 2)
             state.init_grid_state(niveles_buy=niveles_buy, niveles_sell=niveles_sell)
+
+            # ═══════════════════════════════════════════════════════════════════
+            # V8: Inicializar engine si toggle activo.
+            # NOTA DE UBICACIÓN: el parche original lo ponía justo antes de
+            # `self._grids[symbol] = state`, es decir DESPUÉS de enviar las órdenes
+            # a Binance — si la validación B5 abortaba, las órdenes ya colocadas
+            # quedaban huérfanas. Se movió ANTES del envío de órdenes: si aborta,
+            # no hay nada que limpiar en Binance (solo se marca el grid ABORTADO).
+            # V8-B5 CLAMP: además exige b5_ok (params ya normalizados al entrar al
+            # método). Si el clamp fue insalvable, cae al else → grid legacy v1.
+            # ═══════════════════════════════════════════════════════════════════
+            if CONFIG.grid_engine_enabled and b5_ok:
+                info = self._get_symbol_info(symbol)
+                tick_size = Decimal(str(info['tickSize']))
+                rango_total = Decimal(str(params['upper_limit'])) - Decimal(str(params['lower_limit']))
+                grid_count = int(params['grid_count'])
+                step = rango_total / (grid_count - 1) if grid_count > 1 else rango_total
+
+                # Validación B5
+                if tick_size * 2 >= step / 2:
+                    print(f"  ❌ [V8-B5] {symbol} Grid rechazado: tick*2 >= step/2")
+                    await self._notificar_rechazo(symbol, "Tolerancia insuficiente")
+                    await actualizar_grid_ejecucion_cierre(
+                        grid_id=grid_id, estado='ABORTADO', pnl_real=0, fees_real=0,
+                        razon_cierre='v8_b5_tolerancia_insuficiente'
+                    )
+                    return
+
+                # Validación mínimo órdenes con GAP
+                if len(niveles) - 1 < 3:
+                    print(f"  ❌ [V8] {symbol} Grid rechazado: solo {len(niveles)-1} órdenes posibles")
+                    await self._notificar_rechazo(symbol, "Mínimo 3 órdenes requeridas")
+                    await actualizar_grid_ejecucion_cierre(
+                        grid_id=grid_id, estado='ABORTADO', pnl_real=0, fees_real=0,
+                        razon_cierre='v8_minimo_ordenes'
+                    )
+                    return
+
+                # Inicializar engine
+                engine = GridEngine(
+                    symbol=symbol,
+                    tick_size=tick_size,
+                    step=step,
+                    hedge_mode=self._hedge_mode,
+                    lag_guard_ms=CONFIG.get_lag_guard_ms(),
+                    max_ops_per_tick=CONFIG.grid_engine_max_ops_per_tick
+                )
+                level_map = engine.initialize(niveles, qty, price)
+
+                # Generador de order IDs
+                order_gen = ClientOrderIdGenerator(grid_id)
+                order_gen.initialize(0)
+
+                # Guardar niveles en DB
+                niveles_rows = level_map.to_rows(symbol, grid_id)
+                await guardar_niveles_grid(grid_id, niveles_rows)
+
+                # Actualizar versión
+                await actualizar_grid_engine_version(grid_id, 2)
+                await actualizar_order_id_counter(grid_id, 0)
+
+                # Extraer niveles para órdenes (excluyendo gap)
+                niveles_buy = []
+                niveles_sell = []
+                for level in level_map.levels.values():
+                    if not level.is_gap:
+                        if level.side == 'BUY':
+                            niveles_buy.append(float(level.price))
+                        else:
+                            niveles_sell.append(float(level.price))
+
+                print(f"  [V8-ENGINE] {symbol} Grid v2 | GAP idx {level_map.gap_index} | BUY:{len(niveles_buy)} SELL:{len(niveles_sell)}")
+
+                state.grid_engine = engine
+                state.engine_version = 2
+                state.order_id_generator = order_gen
+            else:
+                await actualizar_grid_engine_version(grid_id, 1)
+                state.engine_version = 1
 
             # 10. Colocar órdenes LIMIT reales: BUY debajo, SELL encima
             ordenes = []
@@ -2435,6 +2640,7 @@ class GridExecutor:
             return
 
         # ─── SYNC: Sincronizar órdenes abiertas de Binance con DB local ───
+        open_orders = []  # V8: garantizar variable ligada aunque el SYNC falle (coverage la usa al final)
         try:
             open_orders = await self._api_call(asyncio.to_thread(
                 self.client.futures_get_open_orders, symbol=symbol
@@ -2624,6 +2830,64 @@ class GridExecutor:
                                     await self._colocar_take_profit(symbol, state, orden_padre, fill_fallback)
                     except Exception as e:
                         print(f"  ⚠️ [E.6] {symbol} Error fallback TP para {pos.id}: {e}")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # V8: COVERAGE (SHADOW o ACTIVO)
+        # Ubicación: al final de _monitorear_grid (posterior al último
+        # _reconciliar_pnl y al fallback E.6), para analizar el estado ya
+        # completamente reconciliado del ciclo.
+        # ═══════════════════════════════════════════════════════════════════
+        if (state.engine_version == 2 and state.grid_engine and
+                CONFIG.grid_engine_enabled):
+
+            ciclo = getattr(self, '_monitoreo_ciclo', 0)
+            self._monitoreo_ciclo = ciclo + 1
+
+            if ciclo % CONFIG.grid_engine_coverage_interval_ticks == 0:
+                try:
+                    # Cargar fills recientes
+                    db = await _get_db()
+                    async with _db_lock:
+                        desde_ms = int((time.time() - 90) * 1000)
+                        cursor = await db.execute("""
+                            SELECT ft.*, COALESCE(geo.price, ft.price) as order_price
+                            FROM fills_tracking ft
+                            LEFT JOIN grid_ejecucion_ordenes geo
+                              ON ft.binance_order_id = geo.binance_order_id
+                            WHERE ft.symbol = ? AND ft.timestamp_ms > ?
+                            ORDER BY ft.timestamp_ms DESC
+                        """, (symbol, desde_ms))
+                        fills_rows = await cursor.fetchall()
+                        fills_recientes = [dict(r) for r in fills_rows]
+
+                    # Analizar coverage
+                    reporte = state.grid_engine.analyze_coverage(
+                        open_orders=open_orders,
+                        current_price=self.precios_vivo.get(symbol, 0),
+                        recent_fills=fills_recientes,
+                        now_ms=int(time.time() * 1000)
+                    )
+
+                    # Guardar snapshot
+                    if len(reporte.diagnostics) > 0:
+                        await guardar_snapshot_engine(
+                            state.grid_id,
+                            json.dumps({i: l.to_row(symbol, state.grid_id)
+                                       for i, l in state.grid_engine.level_map.levels.items()}),
+                            json.dumps(reporte.diagnostics)
+                        )
+
+                    # MODO SHADOW: solo logs
+                    if CONFIG.grid_engine_coverage_mode == "SHADOW":
+                        if not reporte.is_clean():
+                            print(f"  [V8-SHADOW] {symbol} Coverage detectado:")
+                            for diag in reporte.diagnostics:
+                                print(f"    {diag}")
+                        else:
+                            print(f"  [V8-SHADOW] {symbol} Coverage limpio")
+                except Exception as e_v8:
+                    # V8: coverage nunca debe romper el monitoreo principal
+                    print(f"  ⚠️ [V8] {symbol} Error en coverage: {e_v8}")
 
 
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -3952,6 +4216,71 @@ class GridExecutor:
                     precio_entrada=grid['precio_entrada'],
                     niveles=niveles, qty_por_orden=qty
                 )
+
+                # V8: Manejar engine_version NULL como legacy
+                engine_version = grid.get('engine_version')
+                if engine_version is None:
+                    engine_version = 1
+                    print(f"  [V8] {symbol} engine_version=NULL → legacy")
+                else:
+                    engine_version = int(engine_version)
+
+                # V8: Reconstruir engine si es v2
+                if engine_version == 2 and CONFIG.grid_engine_enabled:
+                    try:
+                        niveles_db = await cargar_niveles_grid(grid['id'])
+                        if niveles_db:
+                            info = self._get_symbol_info(symbol)
+                            tick_size = Decimal(str(info['tickSize']))
+                            params = json.loads(grid['grid_params_json']) if grid.get('grid_params_json') else {}
+                            rango_total = Decimal(str(params.get('upper_limit', grid['precio_entrada'] * 1.1))) - \
+                                         Decimal(str(params.get('lower_limit', grid['precio_entrada'] * 0.9)))
+                            grid_count = int(params.get('grid_count', len(niveles_db)))
+                            step = rango_total / (grid_count - 1) if grid_count > 1 else rango_total
+
+                            engine = GridEngine(
+                                symbol=symbol,
+                                tick_size=tick_size,
+                                step=step,
+                                hedge_mode=self._hedge_mode,
+                                lag_guard_ms=CONFIG.get_lag_guard_ms()
+                            )
+                            level_map = LevelMap.from_rows(niveles_db)
+                            engine.level_map = level_map
+
+                            # Recalcular GAP si precio cambió
+                            current_price = self.precios_vivo.get(symbol, grid['precio_entrada'])
+                            if current_price > 0:
+                                new_gap = GapManager.should_move_gap(level_map, current_price)
+                                if new_gap is not None and new_gap != level_map.gap_index:
+                                    print(f"  [V8] {symbol} GAP recalculado: {level_map.gap_index} → {new_gap}")
+                                    engine.level_map = GapManager.move_gap(level_map, new_gap, current_price)
+                                    for idx, level in engine.level_map.levels.items():
+                                        await actualizar_nivel_grid(
+                                            grid['id'], idx,
+                                            is_gap=1 if level.is_gap else 0,
+                                            state=level.state.value,
+                                            side=level.side,
+                                            position_side=level.position_side
+                                        )
+
+                            counter = await cargar_order_id_counter(grid['id'])
+                            order_gen = ClientOrderIdGenerator(grid['id'])
+                            order_gen.initialize(counter)
+
+                            state.grid_engine = engine
+                            state.order_id_generator = order_gen
+                            state.engine_version = 2
+                            print(f"  [EXECUTOR] {symbol} GridEngine v2 reconstruido")
+                        else:
+                            print(f"  ⚠️ [EXECUTOR] {symbol} Engine v2 sin niveles → fallback legacy")
+                            state.engine_version = 1
+                    except Exception as e:
+                        print(f"  ⚠️ [EXECUTOR] {symbol} Error reconstruyendo engine: {e}")
+                        state.engine_version = 1
+                else:
+                    state.engine_version = 1
+
                 state.pares_abiertos = []  # FIX: Inicializar atributo faltante en recuperación
                 
                 # FASE 2 / FASE 6: Reconstruir grid_state SOLO para grids neutral

@@ -374,5 +374,24 @@ class Config(BaseModel):
     binance_testnet_api_key: str = os.getenv("BINANCE_TESTNET_API_KEY", "sX7kym5t0AE11IRWWg0Ks84z2K34RH5yirclh5MoyWcPgQVbnW670vTJfDJ1W01m")
     binance_testnet_secret: str = os.getenv("BINANCE_TESTNET_SECRET", "9OflvUojY6Pyht86VezoIF6F2WnHPr4RtWp0wO1BmwZOFyHysKr8TkTZofMIf03t")
 
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # V8: MOTOR DE NIVELES
+    # ═══════════════════════════════════════════════════════════════════════════════
+    grid_engine_enabled: bool = True           # Master toggle
+    grid_engine_coverage_mode: str = "SHADOW"   # SHADOW | ACTIVE | OFF
+    grid_engine_roundtrip: bool = False         # Fase 4: round-trip por nivel
+    grid_engine_gap_dynamic: bool = False       # Fase 5: gap dinámico
+    grid_engine_lag_guard_ms: int = 10000       # 10s real, 15s testnet
+    grid_engine_max_ops_per_tick: int = 3       # Máximo operaciones por ciclo
+    grid_engine_coverage_interval_ticks: int = 3  # Cada N ciclos de monitoreo
+    grid_engine_gap_hysteresis_ticks: int = 2     # Histeresis para mover gap
+    grid_engine_max_snapshots: int = 100        # Máximo snapshots en DB
+
+    # Helper para lag guard adaptativo
+    def get_lag_guard_ms(self) -> int:
+        if self.trading_mode == 'TESTNET':
+            return 15000
+        return self.grid_engine_lag_guard_ms
+
 
 CONFIG = Config()

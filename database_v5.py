@@ -1,5 +1,6 @@
 import aiosqlite
 import asyncio
+import time
 from config import CONFIG
 from datetime import datetime, timedelta
 import pytz
@@ -419,6 +420,44 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_fills_procesado ON fills_tracking(procesado)")
 
         # ═══════════════════════════════════════════════════════════════════════════════
+        # V8: TABLAS DEL MOTOR DE NIVELES
+        # ═══════════════════════════════════════════════════════════════════════════════
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS grid_niveles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                grid_ejecucion_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                level_index INTEGER NOT NULL,
+                price REAL NOT NULL,
+                side TEXT NOT NULL,
+                position_side TEXT NOT NULL DEFAULT 'LONG',
+                quantity REAL NOT NULL,
+                state TEXT NOT NULL DEFAULT 'PENDING',
+                is_gap INTEGER DEFAULT 0,
+                order_id TEXT,
+                binance_order_id TEXT,
+                filled_qty REAL DEFAULT 0,
+                last_placed_at_ms INTEGER,
+                version INTEGER DEFAULT 1,
+                updated_at INTEGER,
+                UNIQUE(grid_ejecucion_id, level_index)
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_niveles_grid ON grid_niveles(grid_ejecucion_id)")
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS grid_engine_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                grid_ejecucion_id INTEGER NOT NULL,
+                timestamp_ms INTEGER NOT NULL,
+                level_map_json TEXT NOT NULL,
+                coverage_report_json TEXT,
+                created_at INTEGER DEFAULT (strftime('%s', 'now'))
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_grid ON grid_engine_snapshots(grid_ejecucion_id, timestamp_ms)")
+
+        # ═══════════════════════════════════════════════════════════════════════════════
         # CR2: TABLA PARA EVENTOS DE PnL (cada trade genera un evento)
         # ═══════════════════════════════════════════════════════════════════════════════
         await db.execute("""
@@ -470,6 +509,8 @@ async def init_db():
             ],
             'grid_ejecuciones': [            
                 ('timestamp_inicio', 'INTEGER'),
+                ('engine_version', 'INTEGER DEFAULT 1'),      # V8: versión del motor
+                ('order_id_counter', 'INTEGER DEFAULT 0'),       # V8: contador de IDs
             ],
         }
 
@@ -1425,3 +1466,92 @@ async def obtener_pnl_por_tipo(grid_ejecucion_id: int) -> dict:
         """, (grid_ejecucion_id,))
         rows = await cursor.fetchall()
         return {row[0]: {'pnl': float(row[1]), 'count': int(row[2])} for row in rows}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# V8: FUNCIONES DEL MOTOR DE NIVELES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def guardar_niveles_grid(grid_id: int, rows: list):
+    """Guarda o actualiza niveles de un grid."""
+    db = await _get_db()
+    async with _db_lock:
+        for row in rows:
+            await db.execute("""
+                INSERT OR REPLACE INTO grid_niveles
+                (grid_ejecucion_id, symbol, level_index, price, side, position_side,
+                 quantity, state, is_gap, order_id, binance_order_id, filled_qty,
+                 last_placed_at_ms, version, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                grid_id, row['symbol'], row['level_index'], row['price'],
+                row['side'], row.get('position_side', 'LONG'), row['quantity'],
+                row['state'], row['is_gap'], row.get('order_id'),
+                row.get('binance_order_id'), row.get('filled_qty', 0),
+                row.get('last_placed_at_ms'), row.get('version', 1),
+                int(time.time())
+            ))
+        await db.commit()
+
+async def cargar_niveles_grid(grid_id: int) -> list:
+    """Carga niveles de un grid desde DB."""
+    db = await _get_db()
+    async with _db_lock:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM grid_niveles WHERE grid_ejecucion_id = ? ORDER BY level_index",
+            (grid_id,)
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def actualizar_nivel_grid(grid_id: int, level_index: int, **campos):
+    """Actualiza campos específicos de un nivel."""
+    db = await _get_db()
+    sets = [f"{k} = ?" for k in campos.keys()]
+    vals = list(campos.values())
+    vals.extend([int(time.time()), grid_id, level_index])
+
+    async with _db_lock:
+        await db.execute(
+            f"UPDATE grid_niveles SET {', '.join(sets)}, updated_at = ? WHERE grid_ejecucion_id = ? AND level_index = ?",
+            tuple(vals)
+        )
+        await db.commit()
+
+async def actualizar_grid_engine_version(grid_id: int, version: int):
+    """Actualiza la versión del engine de un grid."""
+    await _execute_with_retry(
+        "UPDATE grid_ejecuciones SET engine_version = ? WHERE id = ?",
+        (version, grid_id)
+    )
+
+async def actualizar_order_id_counter(grid_id: int, counter: int):
+    """Actualiza el contador de order IDs para un grid."""
+    await _execute_with_retry(
+        "UPDATE grid_ejecuciones SET order_id_counter = ? WHERE id = ?",
+        (counter, grid_id)
+    )
+
+async def cargar_order_id_counter(grid_id: int) -> int:
+    """Carga el contador de order IDs para un grid."""
+    db = await _get_db()
+    async with _db_lock:
+        cursor = await db.execute(
+            "SELECT order_id_counter FROM grid_ejecuciones WHERE id = ?",
+            (grid_id,)
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+async def guardar_snapshot_engine(grid_id: int, level_map_json: str,
+                                   coverage_report_json: str = None):
+    """Guarda snapshot del engine para debugging."""
+    db = await _get_db()
+    async with _db_lock:
+        await db.execute("""
+            INSERT INTO grid_engine_snapshots
+            (grid_ejecucion_id, timestamp_ms, level_map_json, coverage_report_json)
+            VALUES (?, ?, ?, ?)
+        """, (grid_id, int(time.time() * 1000), level_map_json, coverage_report_json))
+        await db.commit()

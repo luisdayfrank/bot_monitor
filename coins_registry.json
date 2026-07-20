@@ -208,7 +208,7 @@
     "grid_timeout": 10
   },
   "MEMEUSDT": {
-    "active": 1,
+    "active": 0,
     "category": "memecoin",
     "volume_threshold": 0.3,
     "adx_reject": 65.0,
