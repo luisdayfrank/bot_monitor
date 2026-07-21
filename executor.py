@@ -2925,6 +2925,16 @@ class GridExecutor:
             if pos is None:
                 print(f"  [V8-RT] {symbol} Cierre {tipo} sin posición localizada (pos_id={pos_id})")
                 return
+            # FIX (detectado en log real NEAR): un TP que se llena en PARCIALES no
+            # debe rearmar el nivel ni contar round-trip hasta que la posición cierre
+            # de verdad. Sin esto, el primer parcial rearma a PENDING con posición
+            # viva: los parciales siguientes quedan huérfanos ("sin nivel FILLED
+            # candidato") y coverage reporta REPONER sobre un round-trip que sigue
+            # corriendo (en ACTIVE sería doble entrada sobre nivel con posición).
+            if pos.estado != 'CERRADA':
+                print(f"  [V8-RT] {symbol} Cierre parcial {tipo} de {pos_id} "
+                      f"(resta {float(pos.qty)}) → nivel sigue en round-trip")
+                return
             entry_side = 'BUY' if pos.tipo == 'LONG' else 'SELL'
             nivel = lm.find_filled_for_close(entry_side, pos.nivel_precio, tol)
             if nivel is None:
