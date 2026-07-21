@@ -3290,25 +3290,31 @@ class GridExecutor:
                     print(f"  🚨 [E.6] {symbol} Pos {pos.id} ABIERTA sin TP. Intentando recrear...")
                     try:
                         db = await _get_db()
+                        # FIX DEADLOCK (parálisis total observada en log real): solo el
+                        # SELECT va bajo el lock. cargar_ordenes_por_grid y
+                        # _colocar_take_profit* adquieren _db_lock internamente (vía
+                        # _execute_with_retry); llamarlas bajo el lock congela la
+                        # tarea para siempre (asyncio.Lock NO es reentrante) y como
+                        # queda retenido, paraliza TODA la DB del bot.
                         async with _db_lock:
                             cursor = await db.execute(
                                 "SELECT * FROM fills_tracking WHERE binance_order_id = ? AND procesado = 1 LIMIT 1",
                                 (pos.binance_order_id,)
                             )
                             row = await cursor.fetchone()
-                            if row:
-                                fill_fallback = dict(row)
-                                ordenes_db = await cargar_ordenes_por_grid(state.grid_id)
-                                orden_padre = next((
-                                    o for o in ordenes_db
-                                    if str(o['binance_order_id']) == pos.binance_order_id
-                                ), None)
-                                if orden_padre:
-                                    await self._colocar_take_profit_neutral(
-                                        symbol, state, orden_padre, fill_fallback,
-                                        'BUY' if pos.tipo == 'LONG' else 'SELL',
-                                        pos.id
-                                    )
+                        if row:
+                            fill_fallback = dict(row)
+                            ordenes_db = await cargar_ordenes_por_grid(state.grid_id)
+                            orden_padre = next((
+                                o for o in ordenes_db
+                                if str(o['binance_order_id']) == pos.binance_order_id
+                            ), None)
+                            if orden_padre:
+                                await self._colocar_take_profit_neutral(
+                                    symbol, state, orden_padre, fill_fallback,
+                                    'BUY' if pos.tipo == 'LONG' else 'SELL',
+                                    pos.id
+                                )
                     except Exception as e:
                         print(f"  ⚠️ [E.6] {symbol} Error fallback TP para {pos.id}: {e}")
 
@@ -3318,22 +3324,24 @@ class GridExecutor:
                     print(f"  🚨 [E.6] {symbol} Pos direccional {pos.id} ABIERTA sin TP. Intentando recrear...")
                     try:
                         db = await _get_db()
+                        # FIX DEADLOCK: misma corrección que la rama NEUTRAL — el lock
+                        # solo envuelve el SELECT; el resto adquiere su propio lock.
                         async with _db_lock:
                             cursor = await db.execute(
                                 "SELECT * FROM fills_tracking WHERE binance_order_id = ? AND procesado = 1 LIMIT 1",
                                 (pos.binance_order_id,)
                             )
                             row = await cursor.fetchone()
-                            if row:
-                                fill_fallback = dict(row)
-                                ordenes_db = await cargar_ordenes_por_grid(state.grid_id)
-                                orden_padre = next((
-                                    o for o in ordenes_db
-                                    if str(o['binance_order_id']) == pos.binance_order_id
-                                ), None)
-                                if orden_padre:
-                                    fill_fallback['pos_id'] = pos.id
-                                    await self._colocar_take_profit(symbol, state, orden_padre, fill_fallback)
+                        if row:
+                            fill_fallback = dict(row)
+                            ordenes_db = await cargar_ordenes_por_grid(state.grid_id)
+                            orden_padre = next((
+                                o for o in ordenes_db
+                                if str(o['binance_order_id']) == pos.binance_order_id
+                            ), None)
+                            if orden_padre:
+                                fill_fallback['pos_id'] = pos.id
+                                await self._colocar_take_profit(symbol, state, orden_padre, fill_fallback)
                     except Exception as e:
                         print(f"  ⚠️ [E.6] {symbol} Error fallback TP para {pos.id}: {e}")
 
