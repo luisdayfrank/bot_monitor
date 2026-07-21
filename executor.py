@@ -770,7 +770,10 @@ class GridExecutor:
                 current = self.precios_vivo.get(symbol, 0)
                 if current <= 0 or len(state.niveles) < 2:
                     continue
-                step = abs(state.niveles[1] - state.niveles[0])
+                # FIX: state.niveles son Decimal (GridExecutionState) — convertir a
+                # float o la división (entry - current) / step revienta con
+                # "unsupported operand type(s) for /: 'float' and 'decimal.Decimal'"
+                step = float(abs(state.niveles[1] - state.niveles[0]))
                 if step <= 0:
                     continue
 
