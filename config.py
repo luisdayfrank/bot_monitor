@@ -377,9 +377,9 @@ class Config(BaseModel):
     # ═══════════════════════════════════════════════════════════════════════════════
     # V8: MOTOR DE NIVELES
     # ═══════════════════════════════════════════════════════════════════════════════
-    grid_engine_enabled: bool = True           # Master toggle
+    grid_engine_enabled: bool = False           # Master toggle
     grid_engine_coverage_mode: str = "SHADOW"   # SHADOW | ACTIVE | OFF
-    grid_engine_roundtrip: bool = True         # Fase 4: round-trip por nivel
+    grid_engine_roundtrip: bool = False         # Fase 4: round-trip por nivel
     grid_engine_gap_dynamic: bool = False       # Fase 5: gap dinámico
     grid_engine_lag_guard_ms: int = 10000       # 10s real, 15s testnet
     grid_engine_max_ops_per_tick: int = 3       # Máximo operaciones por ciclo
@@ -399,6 +399,7 @@ class Config(BaseModel):
     fase45_stuck_age_hours: float = 2.0         # Detector: edad mínima del round-trip
     fase45_stuck_dist_steps: float = 3.0        # Detector: distancia en contra, en steps
     fase45_max_cierres_por_dia: int = 10        # Tope de seguridad diario de cierres F45
+    fase45_live_pair_close: bool = True        # 4.5.2: cerrar pares atascados en grids VIVOS (requiere policy ACTIVE)
 
     # Helper para lag guard adaptativo
     def get_lag_guard_ms(self) -> int:

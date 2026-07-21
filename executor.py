@@ -630,18 +630,140 @@ class GridExecutor:
                 f"{lado} {leg['qty']} @ {leg['entry']} (~{notional:.1f} USDT)\n"
                 f"Requiere decisión manual o política CLOSE")
 
+    async def _f45_limpiar_linkage_pc(self, state: GridExecutionState):
+        """
+        FASE 4.5.2 (Punto 3, autocuración): tras un cierre de par PARCIAL, la pierna
+        remanente queda ABIERTA con orden_cierre_id apuntando a la orden PC ya FILLED
+        (linkage consumido). E.6 no recrearía su TP porque el id no es None.
+        Aquí detectamos ese linkage consumido (orden tipo CIERRE con cid '_PC_' en
+        status FILLED en DB) y lo liberamos → E.6 recrea el TP en el mismo ciclo.
+
+        Seguro contra carreras: una orden MARKET solo llega a status FILLED en DB
+        después de que actualizar_orden_fill corrió, es decir DESPUÉS de que
+        _on_fill_cierre_neutral ya aplicó el fill al estado RAM (PASO 1 < PASO 3
+        en _procesar_fills_pendientes). Ningún fill futuro necesitará ese match.
+        """
+        if not CONFIG.fase45_live_pair_close or not state.grid_state:
+            return
+        candidatas = [p for p in state.grid_state.posiciones
+                      if p.estado == 'ABIERTA' and p.orden_cierre_id]
+        if not candidatas:
+            return
+        try:
+            db_ordenes = await cargar_ordenes_por_grid(state.grid_id)
+            for pos in candidatas:
+                orden = next((o for o in db_ordenes
+                              if str(o['binance_order_id']) == str(pos.orden_cierre_id)), None)
+                if (orden and orden['tipo_orden'] == 'CIERRE'
+                        and orden['status'] == 'FILLED'
+                        and '_PC_' in (orden['client_order_id'] or '')):
+                    print(f"  [F45] {state.symbol} Linkage PC consumido en {pos.id} "
+                          f"→ orden_cierre_id liberado para que E.6 recree TP del remanente")
+                    pos.orden_cierre_id = None
+        except Exception as e:
+            print(f"  ⚠️ [F45] {state.symbol} Error limpiando linkage PC: {e}")
+
+    async def _cerrar_par_en_grid_vivo(self, state: GridExecutionState,
+                                       pos_l, pos_s, qty_close: float,
+                                       neto_est: float, fees_est: float) -> bool:
+        """
+        FASE 4.5.2 — Cierra un par delta-neutral DENTRO de un grid vivo,
+        con atribución completa al pipeline CR16 (nada de posiciones fantasma).
+
+        Punto 1: registra ambas órdenes en grid_ejecucion_ordenes como
+                 tipo_orden='CIERRE' → sus fills entran a _on_fill_cierre_neutral
+                 con PnL atribuido al grid vivo.
+        Punto 2: cancela los TPs de AMBAS piernas antes de cerrar (coordinación
+                 con E.6/P5: un TP vivo con orden_cierre_id pisado caería al
+                 fallback del pipeline y podría atribuirse a la posición equivocada).
+        Punto 3: pos.orden_cierre_id = id real de la orden de cierre → match exacto
+                 en _on_fill_cierre_neutral, que soporta parciales nativamente
+                 (reduce pos.qty; CERRADA al llegar a cero). El remanente parcial
+                 queda cubierto por _f45_limpiar_linkage_pc + E.6.
+        """
+        symbol = state.symbol
+        try:
+            qty_close = self._f45_redondear_qty(symbol, qty_close)
+            if qty_close <= 0:
+                return False
+            info = self._get_symbol_info(symbol)
+            px_ref = self.precios_vivo.get(symbol, 0) or float(pos_l.precio_ejecucion)
+            if qty_close * px_ref < info['minNotional']:
+                print(f"  [F45] {symbol} Par en grid vivo es POLVO "
+                      f"(notional {qty_close * px_ref:.2f} < min {info['minNotional']}), skip")
+                return False
+
+            # Punto 2: cancelar TPs de ambas piernas (registra cancelación propia P5)
+            await self._cancelar_tp_si_existe(state, pos_l)
+            await self._cancelar_tp_si_existe(state, pos_s)
+
+            ts = int(time.time() * 1000)
+            cid_l = f"CM{state.grid_id}_PC_{ts}"
+            cid_s = f"CM{state.grid_id}_PC_{ts + 1}"
+            kw_long = dict(symbol=symbol, side='SELL', type='MARKET',
+                           quantity=qty_close, newClientOrderId=cid_l)
+            kw_short = dict(symbol=symbol, side='BUY', type='MARKET',
+                            quantity=qty_close, newClientOrderId=cid_s)
+            if self._hedge_mode:
+                kw_long['positionSide'] = 'LONG'
+                kw_short['positionSide'] = 'SHORT'
+            else:
+                kw_long['reduceOnly'] = True
+                kw_short['reduceOnly'] = True
+
+            r1 = await self._api_call(asyncio.to_thread(self.client.futures_create_order, **kw_long))
+            try:
+                r2 = await self._api_call(asyncio.to_thread(self.client.futures_create_order, **kw_short))
+            except Exception as e2:
+                # Pierna LONG ya cerrada, SHORT no: desbalance. Alerta fuerte para
+                # intervención (el detector la verá como pierna sola la próxima pasada).
+                print(f"  🚨 [F45] {symbol} LONG cerrado pero SHORT falló: {e2} — DESBALANCE, revisar manual")
+                self._f45_telegram(f"🚨 [F45] {symbol} Desbalance al cerrar par: LONG cerrada, SHORT falló ({e2})")
+                raise
+
+            id_l = int(r1.get('orderId'))
+            id_s = int(r2.get('orderId'))
+
+            # Punto 3: linkage inmediato, sin awaits intermedios (ventana de carrera ~0)
+            pos_l.orden_cierre_id = id_l
+            pos_s.orden_cierre_id = id_s
+
+            # Punto 1: registrar como CIERRE para atribución CR16 dentro del grid vivo
+            await guardar_orden_ejecucion(
+                state.grid_id, id_l, cid_l, symbol, 'SELL', 'CIERRE', px_ref, qty_close)
+            await guardar_orden_ejecucion(
+                state.grid_id, id_s, cid_s, symbol, 'BUY', 'CIERRE', px_ref, qty_close)
+
+            self._f45_cierres_hoy += 1
+            print(f"  ✅ [F45] {symbol} PAR EN GRID VIVO CERRADO | {pos_l.id}/{pos_s.id} qty {qty_close} | "
+                  f"órdenes {id_l}/{id_s} | neto est. {neto_est:+.4f} (fees {fees_est:.4f}) | atribución CR16 ✓")
+            self._f45_telegram(
+                f"🔗 [F45] {symbol} Par en grid vivo cerrado\n"
+                f"{pos_l.id}/{pos_s.id} | Qty: {qty_close} c/pierna\n"
+                f"Neto est: {neto_est:+.4f} USDT (fees {fees_est:.4f})\n"
+                f"PnL atribuido al grid vivo vía CR16")
+            return True
+        except Exception as e:
+            print(f"  ❌ [F45] {symbol} Error cerrando par en grid vivo: {e}")
+            return False
+
     async def _detectar_piernas_atascadas(self):
         """
-        FASE 4.5.1 (SHADOW-ONLY en esta iteración): detector de pierna atascada
-        en grids VIVOS. Una pierna es candidata si:
+        FASE 4.5.1 + 4.5.2: detector de pierna atascada en grids VIVOS.
+        Una pierna es candidata si:
           edad > fase45_stuck_age_hours Y distancia en contra > fase45_stuck_dist_steps.
-        Solo mide y reporta qué acción tomaría cada caso (par / TP reducido /
-        salida acotada) — NO ejecuta nada en grids vivos (eso es Fase 4.5.2).
+        SHADOW: solo mide y reporta la acción que tomaría.
+        ACTIVE + fase45_live_pair_close: ejecuta el cierre del par viable con
+        atribución CR16 (ver _cerrar_par_en_grid_vivo). Dedup por par en cada pasada.
         """
         for symbol, state in list(self._grids.items()):
             try:
                 if not state.activa or state.cerrando or not state.grid_state:
                     continue
+
+                # 4.5.2: liberar linkages PC consumidos (remanente parcial → E.6 recrea TP)
+                await self._f45_limpiar_linkage_pc(state)
+
                 posiciones = [p for p in state.grid_state.posiciones if p.estado == 'ABIERTA']
                 if not posiciones:
                     continue
@@ -652,7 +774,15 @@ class GridExecutor:
                 if step <= 0:
                     continue
 
+                pares_procesados = set()   # dedup: cada par se evalúa una vez por pasada
+                piernas_gestionadas = set()  # seguridad: una pierna ya enviada a cierre
+                                             # no se reusa en otro par de esta pasada
+                                             # (RAM no refleja el cierre hasta que CR16
+                                             # procese los fills → riesgo de doble cierre)
+
                 for pos in posiciones:
+                    if pos.id in piernas_gestionadas:
+                        continue
                     ts = pos.timestamp_apertura
                     ts_seg = ts / 1000 if ts > 1e12 else ts
                     edad_h = (time.time() - ts_seg) / 3600
@@ -667,18 +797,40 @@ class GridExecutor:
 
                     # Candidata a atascada: ¿hay pierna opuesta para par?
                     opuesta = next((q for q in posiciones
-                                    if q.estado == 'ABIERTA' and q.tipo != pos.tipo), None)
+                                    if q.estado == 'ABIERTA' and q.tipo != pos.tipo
+                                    and q.id not in piernas_gestionadas), None)
                     if opuesta:
-                        le = entry if pos.tipo == 'LONG' else float(opuesta.precio_ejecucion)
-                        se = entry if pos.tipo == 'SHORT' else float(opuesta.precio_ejecucion)
-                        qc = min(float(pos.filled_qty), float(opuesta.filled_qty))
+                        pos_l = pos if pos.tipo == 'LONG' else opuesta
+                        pos_s = pos if pos.tipo == 'SHORT' else opuesta
+                        pair_key = frozenset((pos_l.id, pos_s.id))
+                        if pair_key in pares_procesados:
+                            continue
+                        le = float(pos_l.precio_ejecucion)
+                        se = float(pos_s.precio_ejecucion)
+                        # Punto 3: qty VIVA restante (filled_qty es histórico acumulado)
+                        qc = min(float(pos_l.qty), float(pos_s.qty))
                         neto, fees, viable = self._f45_calcular_neto_par(le, se, qc)
                         accion = f"PAR viable neto est. {neto:+.4f}" if viable else f"PAR no viable ({neto:+.4f})"
+
+                        # FASE 4.5.2: ejecución real en grid vivo (gates: ACTIVE + toggle + tope diario)
+                        if (viable and CONFIG.fase45_policy == "ACTIVE"
+                                and CONFIG.fase45_live_pair_close):
+                            pares_procesados.add(pair_key)
+                            piernas_gestionadas.add(pos_l.id)
+                            piernas_gestionadas.add(pos_s.id)
+                            if not self._f45_check_limite_diario():
+                                print(f"  [F45] {symbol} Tope diario de cierres alcanzado, skip par vivo")
+                                continue
+                            accion += " → EJECUTANDO cierre de par (CR16)"
+                            print(f"  [F45-DETECTOR] {symbol} {pos.tipo} {pos.id}: edad {edad_h:.1f}h, "
+                                  f"en contra {dist_contra:.1f} steps, qty {float(pos.qty)} → {accion}")
+                            await self._cerrar_par_en_grid_vivo(state, pos_l, pos_s, qc, neto, fees)
+                            continue
                     else:
                         accion = "sin contraparte → TP reducido a breakeven+fees sería la vía"
 
                     print(f"  [F45-DETECTOR] {symbol} {pos.tipo} {pos.id}: edad {edad_h:.1f}h, "
-                          f"en contra {dist_contra:.1f} steps, qty {float(pos.filled_qty)} → {accion}")
+                          f"en contra {dist_contra:.1f} steps, qty {float(pos.qty)} → {accion}")
             except Exception as e_det:
                 print(f"  ⚠️ [F45-DETECTOR] {symbol} Error: {e_det}")
 
