@@ -128,28 +128,28 @@ class Config(BaseModel):
     grid_max_grids_hard: int = 50        # Cap absoluto para evitar saturación API
     grid_fee_rate: float = 0.0005
     grid_slippage: float = 0.0005
-    grid_default_capital: float = 100.0
-    grid_default_leverage: int = 5       # CAMBIO: antes 5 → ahora 10
+    grid_default_capital: float = 10.0
+    grid_default_leverage: int = 15      # CAMBIO: antes 5 → ahora 10
 
     # Nocional mínimo por orden (Binance Futures)
     grid_notional_min: float = 10.0
 
     # Multiplicador de rango del grid (atr * multiplicador = rango total)
     # Rango simétrico: price ± (atr * multiplicador / 2)
-    grid_rango_mult_min: float = 2.0     # CAMBIO: antes 2.0 → ahora 4.0
-    grid_rango_mult_max: float = 6.0     # CAMBIO: antes 6.0 → ahora 10.0
+    grid_rango_mult_min: float = 4.0     # CAMBIO: antes 2.0 → ahora 4.0
+    grid_rango_mult_max: float = 10.0     # CAMBIO: antes 6.0 → ahora 10.0
 
     # Breakeven: step_pct debe ser al menos este múltiplo para ser rentable
-    grid_breakeven_mult: float = 1.2     # CAMBIO: antes 1.2 → ahora 1.15
+    grid_breakeven_mult: float = 1.15     # CAMBIO: antes 1.2 → ahora 1.15
 
     # Auto-compresión: si step_pct < breakeven * mult, reducir grids
     grid_auto_compress: bool = True
 
     # Densidad máxima de grids: mínimo 0.5 ATR entre grids
-    grid_min_dist_atr: float = 0.5       # CAMBIO: antes 0.5 → ahora 0.15
+    grid_min_dist_atr: float = 0.15       # CAMBIO: antes 0.5 → ahora 0.15
 
     # Percentil para truncar ATR (95 = corta outliers, respeta volatilidad normal)
-    grid_atr_percentil: float = 95.0     # CAMBIO: antes 95.0 → ahora 90.0
+    grid_atr_percentil: float = 90.0     # CAMBIO: antes 95.0 → ahora 90.0
 
     # Posición en rango: alerta si >80% o <20% (grid mal posicionado)
     grid_posicion_alerta_max: float = 0.80
@@ -222,16 +222,16 @@ class Config(BaseModel):
     # Activar estrategia de grid en mercados neutrales
     grid_neutral_enabled: bool = True  # Toggle global, sin confirmación manual
     # Tiempo máximo en estado NEUTRAL_GRID antes de aborto automático
-    grid_neutral_timeout_min: int = 75          # CAMBIO: antes 75 → ahora 720
+    grid_neutral_timeout_min: int = 310          # CAMBIO: antes 75 → ahora 720
     # Aborto si ADX sube +5 sobre umbral de entrada
     grid_neutral_aborto_adx_delta: float = 5.0
     # Aborto si precio se mueve >2% de EMA50/200
-    grid_neutral_aborto_precio_pct: float = 1.2  # CAMBIO: antes 1.2 → ahora 1.8
+    grid_neutral_aborto_precio_pct: float = 1.8  # CAMBIO: antes 1.2 → ahora 1.8
     # ADX máximo para considerar mercado neutral (sin tendencia fuerte)
-    grid_neutral_adx_max: float = 22.0           # CAMBIO: antes 22.0 → ahora 25.0
+    grid_neutral_adx_max: float = 25.0           # CAMBIO: antes 22.0 → ahora 25.0
     # RSI rango para grid neutral (no extremos)
-    grid_neutral_rsi_min: float = 35.0           # CAMBIO: antes 35.0 → ahora 30.0
-    grid_neutral_rsi_max: float = 65.0           # CAMBIO: antes 65.0 → ahora 70.0
+    grid_neutral_rsi_min: float = 30.0           # CAMBIO: antes 35.0 → ahora 30.0
+    grid_neutral_rsi_max: float = 70.0           # CAMBIO: antes 65.0 → ahora 70.0
     # Percentil ATR para grid neutral (30-70 = volatilidad moderada)
     grid_neutral_atr_percentil_min: float = 30.0
     grid_neutral_atr_percentil_max: float = 70.0
