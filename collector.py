@@ -88,7 +88,7 @@ class DataCollector:
     # F1.1: Helpers del buffer batch de precios
     # ═══════════════════════════════════════════════════════════════════════════════
     async def _buffer_precio(self, symbol: str, precio: float):
-        """Acumula precio en buffer RAM. El flush periódico persiste en SQLite."""
+        """Acumula precio en buffer RAM. El flush periódico persiste en MySQL/MariaDB."""
         if not CONFIG.guardar_precios_vivo:
             return
         async with self._precio_buffer_lock:
@@ -114,7 +114,7 @@ class DataCollector:
         await self._flush_precios_buffer()
 
     async def _flush_precios_buffer(self):
-        """Persiste el buffer de precios en SQLite de forma batch (reduce I/O 95%)."""
+        """Persiste el buffer de precios en MySQL/MariaDB de forma batch (reduce I/O 95%)."""
         async with self._precio_buffer_lock:
             if not self._precio_buffer:
                 return

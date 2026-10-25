@@ -23,7 +23,15 @@ background_tasks = set()
 @asynccontextmanager
 async def lifespan(fastapi_app):
     await init_db()
-    print("🗄️ Base de datos SQLite inicializada.")
+    print("🗄️ Base de datos MySQL/MariaDB inicializada.")
+
+    # ── LEARNING ENGINE Fase 0: DB separada (crypto_learning.db, SQLite) ──
+    # Aislado total del trading; cero impacto si learning_enabled=False.
+    learning_engine = None
+    if getattr(CONFIG, 'learning_enabled', False):
+        from learning_db import init_learning_db
+        modo_db = await init_learning_db(getattr(CONFIG, 'learning_db_path', 'crypto_learning.db'))
+        print(f"  🧠 [LEARN] base de learning lista (journal={modo_db})")
 
     queue_velas = asyncio.Queue()
     queue_indicadores = asyncio.Queue()
@@ -75,6 +83,17 @@ async def lifespan(fastapi_app):
     if executor:
         executor.notifier = notifier  # ← FASE 1: Executor puede notificar
     signals.notifier = notifier  # FASE 3.2: Para alertas pre-disparo Telegram
+
+    # ── LEARNING ENGINE Fases 1-8: crear e inyectar en signals + executor ──
+    if getattr(CONFIG, 'learning_enabled', False):
+        from learning_engine import LearningEngine
+        learning_engine = LearningEngine(signals)
+        learning_engine.notifier = notifier   # ANEXO A §4/§5: alertas de guardrail/drift
+        signals.learning_engine = learning_engine
+        if executor:
+            executor.learning_engine = learning_engine
+        print(f"  🧠 [LEARN] engine inyectado | apply={CONFIG.learning_apply_mode} "
+              f"exit={CONFIG.learning_exit_mode}")
 
 
     print("⏳ Cold start en progreso...")
@@ -145,6 +164,13 @@ async def lifespan(fastapi_app):
         background_tasks.add(t_executor)
         t_executor.add_done_callback(task_done_callback)
         print(f"  ✅ [FASE 1] Tarea executor añadida al pipeline")
+
+    # ── LEARNING ENGINE: loop de background (flush, labeler, learner diario) ──
+    if learning_engine:
+        t_learn = asyncio.create_task(learning_engine.run())
+        background_tasks.add(t_learn)
+        t_learn.add_done_callback(task_done_callback)
+        print(f"  ✅ [LEARN] Tarea del LearningEngine añadida al pipeline")
 
     # Aplicar callback a tareas principales
     for t in [t1, t2, t3, t4]:
@@ -300,6 +326,12 @@ async def lifespan(fastapi_app):
 
     print("⏹️ Apagando procesos de forma segura...")
 
+    # LEARNING ENGINE: parar antes que nada (flush final en curso)
+    if learning_engine:
+        print("  🧠 [SHUTDOWN] Deteniendo LearningEngine...")
+        learning_engine.stop()
+        await asyncio.sleep(0.5)
+
     # FASE 1.4: Apagar executor antes de cerrar DB
     if executor:
         print("  🛑 [SHUTDOWN] Solicitando parada del executor...")
@@ -313,6 +345,11 @@ async def lifespan(fastapi_app):
         await audit_logger.stop()
 
     collector.stop()
+
+    # LEARNING ENGINE: cerrar DB de learning
+    if getattr(CONFIG, 'learning_enabled', False):
+        from learning_db import close_learning_db
+        await close_learning_db()
 
 
 app.router.lifespan_context = lifespan

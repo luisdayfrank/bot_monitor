@@ -1,0 +1,6 @@
+database-1.cnqsq0e6cf6z.eu-west-1.rds.amazonaws.com
+
+
+cd bot_monitor
+sudo systemctl stop bot_monitor
+sudo systemctl start bot_monitor

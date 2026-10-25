@@ -1,0 +1,69 @@
+# Activar venv en sesión nueva de PowerShell
+cd C:\BotMonitor
+venv\Scripts\activate
+
+# Ejecutar
+python main.py
+
+# Detener
+#   ? Ctrl+C en la ventana (apagado limpio, guarda near-misses en RAM)
+
+
+ Crear el entorno virtual
+powershell
+cd C:\BotMonitor
+python -m venv venv
+venv\Scripts\activate
+Deberías ver el prompt con (venv) al inicio. Actualizar pip:
+
+powershell
+python -m pip install --upgrade pip setuptools wheel
+
+
+7?? Configurar el archivo .env
+Crea C:\BotMonitor\.env con este contenido (edita los valores):
+
+env
+# --- Base de datos MySQL/MariaDB ---
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_USER=bot
+DB_PASSWORD=BotPass2024!
+DB_NAME=crypto_monitor
+DB_CONNECT_TIMEOUT=10
+
+# --- Carpeta de reportes de auditoría ---
+AUDIT_EXPORT_DIR=auditoria
+
+# --- Telegram ---
+# 1) Hablar con @BotFather en Telegram ? /newbot ? copiar el token
+# 2) Hablar con @userinfobot ? copiar tu chat_id numérico
+TELEGRAM_BOT_TOKEN=123456789:AAEhK...
+TELEGRAM_CHAT_ID=987654321
+
+# --- Binance TESTNET (https://testnet.binancefuture.com/) ---
+BINANCE_TESTNET_API_KEY=tu_testnet_api_key_aqui
+BINANCE_TESTNET_SECRET=tu_testnet_secret_aqui
+
+# --- Binance REAL (solo si trading_mode = "REAL") ---
+BINANCE_API_KEY=
+BINANCE_API_SECRET=
+
+
+Ahora modifica main.py para que cargue el .env antes de importar config. Busca las primeras líneas del archivo y déjalas así:
+
+python
+import asyncio
+import uvicorn
+from contextlib import asynccontextmanager
+from datetime import datetime
+import pytz
+
+# --- AÑADIR ESTAS 2 LÍNEAS ---
+from dotenv import load_dotenv
+load_dotenv()
+# ------------------------------
+
+from config import CONFIG
+# ... resto del archivo sin cambios
+?? El orden es crítico: config.py ejecuta CONFIG = Config() al importarse, y ese constructor lee os.getenv(...). Si cargas .env después, las variables no existen y se usan los defaults.

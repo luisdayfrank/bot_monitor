@@ -1,14 +1,279 @@
-import aiosqlite
+"""
+database_v5.py — Capa de persistencia V5 (adaptada a MySQL / MariaDB).
+
+Capa de persistencia sobre MySQL/MariaDB mediante aiomysql (driver async).
+Para NO romper la estructura ni las ~50 funciones existentes, se
+introduce una delgada capa de compatibilidad (_CompatConnection / Row) que
+expone una interfaz idéntica a la que el código ya utilizaba:
+
+    db.execute(sql, params)   -> cursor con .fetchall() / .fetchone()
+    db.executemany(sql, seq)  -> cursor
+    db.commit() / db.rollback() / db.close()
+    db.row_factory = Row      -> filas con acceso por índice y por nombre
+                                 (dict(row) sigue funcionando)
+
+La capa traduce, de forma centralizada y segura:
+    • placeholders  '?'          -> '%s'   (paramstyle de PyMySQL/aiomysql)
+    • '%' literales (LIKE, DATE_FORMAT) -> '%%'  (para no interferir con el
+      formateo del driver; conserva la parametrización real = sin inyección SQL)
+    • INSERT OR REPLACE INTO     -> REPLACE INTO
+    • INSERT OR IGNORE INTO      -> INSERT IGNORE INTO
+    • SELECT last_insert_rowid() -> SELECT LAST_INSERT_ID()
+    • PRAGMA table_info(x)       -> consulta a information_schema
+    • CREATE INDEX IF NOT EXISTS -> portabilidad MySQL/MariaDB
+
+De este modo las funciones de negocio permanecen intactas.
+"""
+
 import asyncio
+import re
 import time
+import warnings
+
+import aiomysql
+import pymysql
+
 from config import CONFIG
 from datetime import datetime, timedelta
 import pytz
 import json
 
+# Silenciar WARNINGS inofensivos del driver (CREATE TABLE IF NOT EXISTS cuando
+# la tabla ya existe, INSERT IGNORE ante duplicados). Son avisos, no errores:
+# las violaciones reales de integridad siguen lanzando excepciones.
+warnings.filterwarnings("ignore", message=".*already exists.*")
+warnings.filterwarnings("ignore", message=".*Duplicate entry.*")
+warnings.filterwarnings("ignore", message=".*PRIMARY KEY.*")
+
 # ─── Conexión persistente singleton ───
 _db_conn = None
-_db_lock = asyncio.Lock()
+_db_lock = asyncio.Lock()          # serializa transacciones (igual que antes)
+_conn_lock = asyncio.Lock()        # protege la creación de la conexión
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Capa de compatibilidad MySQL/MariaDB (interfaz unificada de acceso a datos)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class Row:
+    """Fila con acceso por índice (row[0]) y por nombre (row['col']).
+
+    Filas con acceso por índice y por nombre, tal y como las usaba el
+    código: admite `dict(row)`, `row[i]` y `row['nombre']`.
+    """
+    __slots__ = ("_cols", "_vals")
+
+    def __init__(self, cols, vals):
+        self._cols = tuple(cols)
+        self._vals = tuple(vals)
+
+    def keys(self):
+        return list(self._cols)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._vals[key]
+        try:
+            idx = self._cols.index(key)
+        except ValueError:
+            raise KeyError(key)
+        return self._vals[idx]
+
+    def __len__(self):
+        return len(self._vals)
+
+    def __iter__(self):
+        return iter(self._vals)
+
+    def __repr__(self):
+        return "<Row %s>" % dict(zip(self._cols, self._vals))
+
+
+class _CompatCursor:
+    """Cursor precargado: los resultados se materializan al ejecutar."""
+
+    def __init__(self, cols, rows, rowcount=-1, lastrowid=None):
+        self._cols = tuple(cols)
+        self._rows = list(rows)
+        self._pos = 0
+        self.rowcount = rowcount
+        self.lastrowid = lastrowid
+
+    def _mk(self, r):
+        return Row(self._cols, r)
+
+    async def fetchall(self):
+        out = [self._mk(r) for r in self._rows[self._pos:]]
+        self._pos = len(self._rows)
+        return out
+
+    async def fetchone(self):
+        if self._pos >= len(self._rows):
+            return None
+        r = self._rows[self._pos]
+        self._pos += 1
+        return self._mk(r)
+
+    async def fetchmany(self, size=1):
+        chunk = self._rows[self._pos:self._pos + size]
+        self._pos += len(chunk)
+        return [self._mk(r) for r in chunk]
+
+    async def close(self):
+        return None
+
+
+# Traducciones SQL centralizadas (sintaxis heredada -> MySQL/MariaDB).
+_REPLACEMENTS = [
+    (re.compile(r"INSERT\s+OR\s+REPLACE\s+INTO", re.I), "REPLACE INTO"),
+    (re.compile(r"INSERT\s+OR\s+IGNORE\s+INTO", re.I), "INSERT IGNORE INTO"),
+    (re.compile(r"last_insert_rowid\s*\(\s*\)", re.I), "LAST_INSERT_ID()"),
+]
+
+_PRAGMA_TABLE_INFO = re.compile(r"^\s*PRAGMA\s+table_info\s*\(\s*([A-Za-z0-9_]+)\s*\)\s*$", re.I)
+
+
+def _translate_sql(sql: str) -> str:
+    """Convierte SQL con placeholders '?' y sintaxis heredada a formato MySQL."""
+    # 1. Funciones / palabras clave heredadas.
+    for pat, rep in _REPLACEMENTS:
+        sql = pat.sub(rep, sql)
+    # 2. Portabilidad de índices: MySQL no soporta IF NOT EXISTS en CREATE INDEX.
+    if re.match(r"\s*CREATE\s+(UNIQUE\s+)?INDEX", sql, re.I):
+        sql = re.sub(r"\s+IF\s+NOT\s+EXISTS", "", sql, count=1, flags=re.I)
+    # 3. Escapar '%' literales (LIKE '%x%', DATE_FORMAT '%Y-%m-%d') para que el
+    #    formateo %-style del driver no los interprete.
+    sql = sql.replace("%", "%%")
+    # 4. Placeholders qmark -> %s (paramstyle de PyMySQL).
+    sql = sql.replace("?", "%s")
+    return sql
+
+
+class _CompatConnection:
+    """Conexión persistente con la interfaz unificada de acceso a datos."""
+
+    def __init__(self, raw):
+        self._raw = raw
+        self._op_lock = asyncio.Lock()   # serializa cada operación de red
+        self.row_factory = Row           # aceptado por compatibilidad
+
+    # ---- vida de la conexión ----
+    def _alive(self):
+        return not getattr(self._raw, "closed", False)
+
+    async def _ping(self):
+        async with self._op_lock:
+            await self._raw.ping(reconnect=True)
+
+    # ---- ejecución ----
+    async def execute(self, sql, params=()):
+        m = _PRAGMA_TABLE_INFO.match(sql)
+        if m:
+            return await self._pragma_table_info(m.group(1))
+        is_create_index = bool(re.match(r"\s*CREATE\s+(UNIQUE\s+)?INDEX", sql, re.I))
+        sql2 = _translate_sql(sql)
+        args = tuple(params) if params is not None else ()
+        async with self._op_lock:
+            cur = await self._raw.cursor()
+            try:
+                await cur.execute(sql2, args)
+                cols, rows = await self._drain(cur)
+                rc = cur.rowcount
+                lrid = cur.lastrowid
+            except Exception as e:
+                # CREATE INDEX idempotente: si el índice ya existe, no es error.
+                if is_create_index and _is_missing_index(e):
+                    cols, rows, rc, lrid = (), [], 0, None
+                else:
+                    raise
+            finally:
+                await cur.close()
+        return _CompatCursor(cols, rows, rowcount=rc, lastrowid=lrid)
+
+    async def executemany(self, sql, seq):
+        sql2 = _translate_sql(sql)
+        args = [tuple(p) for p in seq]
+        async with self._op_lock:
+            cur = await self._raw.cursor()
+            try:
+                await cur.executemany(sql2, args)
+                cols, rows = await self._drain(cur)
+                rc = cur.rowcount
+                lrid = cur.lastrowid
+            finally:
+                await cur.close()
+        return _CompatCursor(cols, rows, rowcount=rc, lastrowid=lrid)
+
+    async def _drain(self, cur):
+        desc = cur.description
+        cols = tuple(d[0] for d in desc) if desc else tuple()
+        rows = []
+        if desc:
+            fetched = await cur.fetchall()
+            if fetched:
+                rows = [tuple(r) for r in fetched]
+        return cols, rows
+
+    async def _pragma_table_info(self, tabla):
+        """Sustituto de PRAGMA table_info(tabla) usando information_schema."""
+        sql = ("SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, "
+               "EXTRA FROM information_schema.COLUMNS "
+               "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s "
+               "ORDER BY ORDINAL_POSITION")
+        async with self._op_lock:
+            cur = await self._raw.cursor()
+            try:
+                await cur.execute(sql, (tabla,))
+                fetched = (await cur.fetchall()) or []
+            finally:
+                await cur.close()
+        cols = ("cid", "name", "type", "notnull", "dflt_value", "pk")
+        rows = []
+        for i, r in enumerate(fetched):
+            # Formato heredado: r[1] == nombre de columna.
+            rows.append((i, r[0], r[1], 0 if r[2] == "YES" else 1, r[3], 0))
+        return _CompatCursor(cols, rows)
+
+    # ---- transacción ----
+    async def commit(self):
+        async with self._op_lock:
+            await self._raw.commit()
+
+    async def rollback(self):
+        async with self._op_lock:
+            await self._raw.rollback()
+
+    async def close(self):
+        async with self._op_lock:
+            await self._raw.ensure_closed()
+
+
+async def _crear_conexion():
+    """Crea una conexión MySQL/MariaDB con la sesión configurada."""
+    raw = await aiomysql.connect(
+        host=CONFIG.db_host,
+        port=CONFIG.db_port,
+        user=CONFIG.db_user,
+        password=CONFIG.db_password,
+        db=CONFIG.db_name,
+        charset="utf8mb4",
+        autocommit=False,
+        connect_timeout=CONFIG.db_connect_timeout,
+    )
+    # Ajustes de sesión: comportamiento equivalente al esquema original.
+    async with raw.cursor() as cur:
+        # utf8mb4 completo
+        await cur.execute("SET NAMES utf8mb4")
+        # No aplicar restricciones de FOREIGN KEY (no se aplicaban antes).
+        await cur.execute("SET FOREIGN_KEY_CHECKS = 0")
+        # Zona horaria UTC: FROM_UNIXTIME() devuelve UTC, igual que las
+        # conversiones de tiempo heredadas. Preserva la semántica original.
+        await cur.execute("SET time_zone = '+00:00'")
+        # Modo permisivo (sin STRICT_*): admite coerciones laxas y evita
+        # errores por tipos laxos heredados.
+        await cur.execute("SET SESSION sql_mode = 'NO_ENGINE_SUBSTITUTION'")
+    return _CompatConnection(raw)
+
 
 # ─── Helpers de zona horaria ───
 def get_tz():
@@ -18,6 +283,7 @@ def get_tz():
     except Exception:
         return pytz.UTC
 
+
 def utc_to_local(dt_utc):
     """Convierte datetime UTC a hora local configurada."""
     if dt_utc is None:
@@ -25,6 +291,7 @@ def utc_to_local(dt_utc):
     if dt_utc.tzinfo is None:
         dt_utc = dt_utc.replace(tzinfo=pytz.UTC)
     return dt_utc.astimezone(get_tz())
+
 
 def local_to_utc(dt_local):
     """Convierte datetime local a UTC."""
@@ -34,115 +301,158 @@ def local_to_utc(dt_local):
         dt_local = get_tz().localize(dt_local)
     return dt_local.astimezone(pytz.UTC)
 
+
 def now_local():
     """Obtiene la hora actual en zona horaria local."""
     return datetime.now(get_tz())
+
 
 def now_utc():
     """Obtiene la hora actual en UTC."""
     return datetime.now(pytz.UTC)
 
+
 async def _get_db():
-    """Obtiene o crea la conexión persistente a SQLite."""
+    """Obtiene o crea la conexión persistente a MySQL/MariaDB."""
     global _db_conn
-    if _db_conn is None:
-        _db_conn = await aiosqlite.connect(CONFIG.db_path, timeout=30.0)
-        # Activar WAL mode para mejor concurrencia (lectura/escritura simultánea)
-        await _db_conn.execute("PRAGMA journal_mode=WAL")
-        await _db_conn.execute("PRAGMA synchronous=NORMAL")
-        await _db_conn.execute("PRAGMA busy_timeout=60000")  # 60s de espera antes de "database is locked"
-        await _db_conn.commit()
+    if _db_conn is not None and _db_conn._alive():
+        return _db_conn
+    async with _conn_lock:
+        if _db_conn is None or not _db_conn._alive():
+            if _db_conn is not None:
+                try:
+                    await _db_conn.close()
+                except Exception:
+                    pass
+            _db_conn = await _crear_conexion()
     return _db_conn
+
 
 async def close_db():
     """Cierra la conexión persistente."""
     global _db_conn
     if _db_conn:
-        await _db_conn.close()
-        _db_conn = None
+        try:
+            await _db_conn.close()
+        finally:
+            _db_conn = None
+
+
+# Códigos / mensajes transitorios que se reintentan.
+_TRANSIENT_ERRNOS = {1205, 1213, 2002, 2003, 2006, 2013, 2014, 2055}
+_TRANSIENT_MSGS = (
+    "database is locked", "deadlock", "lock wait", "lost connection",
+    "connection refused", "server has gone away", "broken pipe",
+    "can't connect", "connection reset", "connection aborted",
+)
+
+
+def _is_transient(e: Exception) -> bool:
+    if isinstance(e, (pymysql.err.OperationalError, pymysql.err.InternalError)):
+        if e.args and isinstance(e.args[0], int) and e.args[0] in _TRANSIENT_ERRNOS:
+            return True
+    msg = str(e).lower()
+    return any(m in msg for m in _TRANSIENT_MSGS)
+
+
+def _is_missing_index(e: Exception) -> bool:
+    msg = str(e).lower()
+    return ("duplicate key name" in msg or "already exists" in msg
+            or (e.args and isinstance(e.args[0], int) and e.args[0] == 1061))
+
 
 async def _execute_with_retry(sql, params=(), max_retries=10):
-    """Ejecuta SQL con retry automático ante 'database is locked'."""
-    db = await _get_db()
+    """Ejecuta SQL con retry automático ante bloqueos / desconexiones transitorias."""
     for attempt in range(max_retries):
+        db = await _get_db()
         try:
             async with _db_lock:
                 await db.execute(sql, params)
                 await db.commit()
             return True
         except Exception as e:
-            if "database is locked" in str(e).lower() and attempt < max_retries - 1:
+            if _is_transient(e) and attempt < max_retries - 1:
                 wait = 0.5 * (2 ** attempt)  # 0.5, 1.0, 2.0, 4.0, 8.0s
-                print(f"  ⚠️ DB locked (intento {attempt+1}/{max_retries}), esperando {wait}s...")
+                print(f"  ⚠️ DB transitorio (intento {attempt+1}/{max_retries}), esperando {wait}s...")
+                # Forzar reconexión en el próximo intento si hubo desconexión.
+                if not _is_missing_index(e):
+                    global _db_conn
+                    try:
+                        if _db_conn is not None and not _db_conn._alive():
+                            await _db_conn.close()
+                            _db_conn = None
+                    except Exception:
+                        _db_conn = None
                 await asyncio.sleep(wait)
             else:
                 print(f"  ❌ DB error definitivo: {e}")
                 raise
     return False
 
+
 async def init_db():
-    """Inicializa las tablas de la base de datos."""
+    """Inicializa las tablas de la base de datos (MySQL / MariaDB)."""
     db = await _get_db()
     async with _db_lock:
         # Tabla 1M
         await db.execute("""
             CREATE TABLE IF NOT EXISTS velas_1m (
-                symbol TEXT,
-                timestamp INTEGER,
-                open REAL,
-                high REAL,
-                low REAL,
-                close REAL,
-                volume REAL,
+                symbol VARCHAR(32),
+                timestamp BIGINT,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE,
+                volume DOUBLE,
                 PRIMARY KEY (symbol, timestamp)
             )
         """)
         # Tabla 15M
         await db.execute("""
             CREATE TABLE IF NOT EXISTS velas_15m (
-                symbol TEXT,
-                timestamp INTEGER,
-                open REAL,
-                high REAL,
-                low REAL,
-                close REAL,
-                volume REAL,
+                symbol VARCHAR(32),
+                timestamp BIGINT,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE,
+                volume DOUBLE,
                 PRIMARY KEY (symbol, timestamp)
             )
         """)
         # Tabla 4H
         await db.execute("""
             CREATE TABLE IF NOT EXISTS velas_4h (
-                symbol TEXT,
-                timestamp INTEGER,
-                open REAL,
-                high REAL,
-                low REAL,
-                close REAL,
-                volume REAL,
+                symbol VARCHAR(32),
+                timestamp BIGINT,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE,
+                volume DOUBLE,
                 PRIMARY KEY (symbol, timestamp)
             )
         """)
         # Alertas
         await db.execute("""
             CREATE TABLE IF NOT EXISTS alertas (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT,
-                timestamp TEXT,
-                tipo TEXT,
-                direccion TEXT,
-                score INTEGER,
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                symbol VARCHAR(32),
+                timestamp VARCHAR(40),
+                tipo VARCHAR(32),
+                direccion VARCHAR(16),
+                score INT,
                 mensaje TEXT,
                 params_json TEXT,
-                precio REAL
+                precio DOUBLE
             )
         """)
         # Precios vivo
         await db.execute("""
             CREATE TABLE IF NOT EXISTS precios_vivo (
-                symbol TEXT PRIMARY KEY,
-                precio REAL,
-                actualizado TEXT
+                symbol VARCHAR(32) PRIMARY KEY,
+                precio DOUBLE,
+                actualizado VARCHAR(40)
             )
         """)
 
@@ -153,32 +463,32 @@ async def init_db():
         # Eventos del bot para auditoría (FIRE, RECHAZADO, CAMBIO_ESTADO, etc.)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS auditoria_eventos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                fecha TEXT,                    -- Fecha local (YYYY-MM-DD) para agrupar
-                symbol TEXT,
-                timestamp_utc TEXT,            -- Timestamp exacto en UTC
-                timestamp_local TEXT,          -- Timestamp en hora local del usuario
-                tipo TEXT,                     -- FIRE, RECHAZADO, CAMBIO_ESTADO, ARMED, etc.
-                direccion TEXT,                -- SHORT, LONG, o NULL
-                precio REAL,
-                contexto_json TEXT,            -- JSON con todo el contexto (1m, 15m, 4h)
-                grid_params_json TEXT,         -- JSON con parámetros del grid (si aplica)
-                score INTEGER,                 -- Score del disparo o macro
-                rechazos_json TEXT,            -- JSON array con motivos de rechazo
-                estado_maquina TEXT            -- Estado de la máquina después del evento
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                fecha VARCHAR(16),
+                symbol VARCHAR(32),
+                timestamp_utc VARCHAR(40),
+                timestamp_local VARCHAR(40),
+                tipo VARCHAR(32),
+                direccion VARCHAR(16),
+                precio DOUBLE,
+                contexto_json TEXT,
+                grid_params_json TEXT,
+                score INT,
+                rechazos_json TEXT,
+                estado_maquina VARCHAR(32)
             )
         """)
 
         # Muestras de precio post-disparo para seguimiento
         await db.execute("""
             CREATE TABLE IF NOT EXISTS auditoria_muestras_post (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                evento_id INTEGER,
-                symbol TEXT,
-                timestamp_utc TEXT,
-                timestamp_local TEXT,
-                precio REAL,
-                minutos_desde_disparo INTEGER,
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                evento_id BIGINT,
+                symbol VARCHAR(32),
+                timestamp_utc VARCHAR(40),
+                timestamp_local VARCHAR(40),
+                precio DOUBLE,
+                minutos_desde_disparo INT,
                 FOREIGN KEY (evento_id) REFERENCES auditoria_eventos(id)
             )
         """)
@@ -186,16 +496,15 @@ async def init_db():
         # Eventos significativos post-disparo (picos, valles, entradas/salidas de grid)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS auditoria_eventos_post (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                evento_id INTEGER,
-                symbol TEXT,
-                timestamp_utc TEXT,
-                timestamp_local TEXT,
-                tipo_evento TEXT,              -- MINIMO_ABSOLUTO, MAXIMO_ABSOLUTO,
-                                              -- PRIMERA_VEZ_EN_GRID, PRIMERA_VEZ_FUERA_RANGO
-                precio REAL,
-                distancia_desde_entrada_pct REAL,
-                grid_rentable_aqui INTEGER,    -- 0/1
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                evento_id BIGINT,
+                symbol VARCHAR(32),
+                timestamp_utc VARCHAR(40),
+                timestamp_local VARCHAR(40),
+                tipo_evento VARCHAR(48),
+                precio DOUBLE,
+                distancia_desde_entrada_pct DOUBLE,
+                grid_rentable_aqui INT,
                 nota TEXT,
                 FOREIGN KEY (evento_id) REFERENCES auditoria_eventos(id)
             )
@@ -204,17 +513,17 @@ async def init_db():
         # Velas 15m posteriores al disparo
         await db.execute("""
             CREATE TABLE IF NOT EXISTS auditoria_velas_post (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                evento_id INTEGER,
-                symbol TEXT,
-                timestamp_utc TEXT,
-                timestamp_local TEXT,
-                open REAL,
-                high REAL,
-                low REAL,
-                close REAL,
-                volume REAL,
-                minutos_desde_disparo INTEGER,
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                evento_id BIGINT,
+                symbol VARCHAR(32),
+                timestamp_utc VARCHAR(40),
+                timestamp_local VARCHAR(40),
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE,
+                volume DOUBLE,
+                minutos_desde_disparo INT,
                 FOREIGN KEY (evento_id) REFERENCES auditoria_eventos(id)
             )
         """)
@@ -224,19 +533,19 @@ async def init_db():
         # ═══════════════════════════════════════════════════════════════════════════════
         await db.execute("""
             CREATE TABLE IF NOT EXISTS auditoria_disparos_activos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                evento_id INTEGER NOT NULL,
-                symbol TEXT NOT NULL,
-                timestamp_utc TEXT NOT NULL,
-                precio_entrada REAL NOT NULL,
-                direccion TEXT NOT NULL,
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                evento_id BIGINT NOT NULL,
+                symbol VARCHAR(32) NOT NULL,
+                timestamp_utc VARCHAR(40) NOT NULL,
+                precio_entrada DOUBLE NOT NULL,
+                direccion VARCHAR(16) NOT NULL,
                 grid_params_json TEXT,
-                maximo_visto REAL,
-                minimo_visto REAL,
-                primera_vez_en_grid_json TEXT,      -- JSON con {timestamp, precio, minutos_desde}
-                primera_vez_fuera_rango_json TEXT,  -- JSON con {timestamp, precio, minutos_desde, direccion}
-                muestras_guardadas INTEGER DEFAULT 0,
-                horas_seguimiento INTEGER,
+                maximo_visto DOUBLE,
+                minimo_visto DOUBLE,
+                primera_vez_en_grid_json TEXT,
+                primera_vez_fuera_rango_json TEXT,
+                muestras_guardadas INT DEFAULT 0,
+                horas_seguimiento INT,
                 FOREIGN KEY (evento_id) REFERENCES auditoria_eventos(id)
             )
         """)
@@ -246,25 +555,25 @@ async def init_db():
         # ═══════════════════════════════════════════════════════════════════════════════
         await db.execute("""
             CREATE TABLE IF NOT EXISTS near_miss_seguimientos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                timestamp_inicio REAL NOT NULL,
-                timestamp_fin REAL,
-                precio_inicio REAL NOT NULL,
-                direccion_nm TEXT NOT NULL,
-                score INTEGER NOT NULL,
-                umbral INTEGER NOT NULL,
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                symbol VARCHAR(32) NOT NULL,
+                timestamp_inicio DOUBLE NOT NULL,
+                timestamp_fin DOUBLE,
+                precio_inicio DOUBLE NOT NULL,
+                direccion_nm VARCHAR(16) NOT NULL,
+                score INT NOT NULL,
+                umbral INT NOT NULL,
                 filtros_rechazo TEXT,
                 muestras_json TEXT,
-                precio_max REAL,
-                precio_min REAL,
-                precio_fin REAL,
-                movimiento_pct REAL,
-                direccion_real TEXT,
-                acerto_bot INTEGER,
-                hubiera_sido_rentable INTEGER,
+                precio_max DOUBLE,
+                precio_min DOUBLE,
+                precio_fin DOUBLE,
+                movimiento_pct DOUBLE,
+                direccion_real VARCHAR(16),
+                acerto_bot INT,
+                hubiera_sido_rentable INT,
                 notas TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -287,38 +596,38 @@ async def init_db():
         # ═══════════════════════════════════════════════════════════════════════════════
         await db.execute("""
             CREATE TABLE IF NOT EXISTS grid_estados (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                timestamp_inicio REAL NOT NULL,
-                timestamp_fin REAL,
-                estado TEXT NOT NULL DEFAULT 'ACTIVO',
-                direccion TEXT,
-                precio_entrada REAL,
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                symbol VARCHAR(32) NOT NULL,
+                timestamp_inicio DOUBLE NOT NULL,
+                timestamp_fin DOUBLE,
+                estado VARCHAR(24) NOT NULL DEFAULT 'ACTIVO',
+                direccion VARCHAR(16),
+                precio_entrada DOUBLE,
                 grid_params_json TEXT,
-                evento_auditoria_id INTEGER,
+                evento_auditoria_id BIGINT,
                 FOREIGN KEY (evento_auditoria_id) REFERENCES auditoria_eventos(id)
             )
         """)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS grid_simulaciones (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                grid_id INTEGER NOT NULL,
-                symbol TEXT NOT NULL,
-                timestamp_inicio REAL NOT NULL,
-                timestamp_fin REAL,
-                precio_inicio REAL NOT NULL,
-                precio_fin REAL,
-                pnl_bruto REAL DEFAULT 0.0,
-                pnl_neto REAL DEFAULT 0.0,
-                fees_totales REAL DEFAULT 0.0,
-                slippage_total REAL DEFAULT 0.0,
-                trades_completados INTEGER DEFAULT 0,
-                trades_kill_switch INTEGER DEFAULT 0,
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                grid_id BIGINT NOT NULL,
+                symbol VARCHAR(32) NOT NULL,
+                timestamp_inicio DOUBLE NOT NULL,
+                timestamp_fin DOUBLE,
+                precio_inicio DOUBLE NOT NULL,
+                precio_fin DOUBLE,
+                pnl_bruto DOUBLE DEFAULT 0.0,
+                pnl_neto DOUBLE DEFAULT 0.0,
+                fees_totales DOUBLE DEFAULT 0.0,
+                slippage_total DOUBLE DEFAULT 0.0,
+                trades_completados INT DEFAULT 0,
+                trades_kill_switch INT DEFAULT 0,
                 posiciones_abiertas_json TEXT,
-                max_posiciones_simultaneas INTEGER DEFAULT 0,
+                max_posiciones_simultaneas INT DEFAULT 0,
                 posiciones_atrapadas_json TEXT,
-                estado TEXT NOT NULL DEFAULT 'SIMULANDO',
+                estado VARCHAR(24) NOT NULL DEFAULT 'SIMULANDO',
                 FOREIGN KEY (grid_id) REFERENCES grid_estados(id)
             )
         """)
@@ -336,38 +645,40 @@ async def init_db():
         # Grid de ejecución real (testnet o real)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS grid_ejecuciones (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                direction TEXT NOT NULL,
-                estado TEXT NOT NULL DEFAULT 'ACTIVO',
-                trading_mode TEXT NOT NULL,
-                capital_asignado REAL NOT NULL,
-                apalancamiento_usado INTEGER NOT NULL,
-                precio_entrada REAL NOT NULL,
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                symbol VARCHAR(32) NOT NULL,
+                direction VARCHAR(16) NOT NULL,
+                estado VARCHAR(24) NOT NULL DEFAULT 'ACTIVO',
+                trading_mode VARCHAR(24) NOT NULL,
+                capital_asignado DOUBLE NOT NULL,
+                apalancamiento_usado INT NOT NULL,
+                precio_entrada DOUBLE NOT NULL,
                 grid_params_json TEXT,
-                pnl_real REAL DEFAULT 0,
-                fees_real REAL DEFAULT 0,
-                razon_cierre TEXT,
-                timestamp_inicio INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                closed_at TIMESTAMP
+                pnl_real DOUBLE DEFAULT 0,
+                fees_real DOUBLE DEFAULT 0,
+                razon_cierre VARCHAR(255),
+                timestamp_inicio BIGINT,
+                engine_version INT DEFAULT 1,
+                order_id_counter INT DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                closed_at DATETIME NULL DEFAULT NULL
             )
         """)
 
         # Órdenes individuales en Binance (para recuperación post-crash)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS grid_ejecucion_ordenes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                grid_ejecucion_id INTEGER NOT NULL,
-                binance_order_id TEXT,
-                client_order_id TEXT NOT NULL UNIQUE,
-                symbol TEXT NOT NULL,
-                side TEXT NOT NULL,
-                tipo_orden TEXT NOT NULL,
-                price REAL,
-                quantity REAL,
-                quantity_filled REAL DEFAULT 0,
-                status TEXT DEFAULT 'NEW',
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                grid_ejecucion_id BIGINT NOT NULL,
+                binance_order_id VARCHAR(64),
+                client_order_id VARCHAR(64) NOT NULL UNIQUE,
+                symbol VARCHAR(32) NOT NULL,
+                side VARCHAR(8) NOT NULL,
+                tipo_orden VARCHAR(24) NOT NULL,
+                price DOUBLE,
+                quantity DOUBLE,
+                quantity_filled DOUBLE DEFAULT 0,
+                status VARCHAR(24) DEFAULT 'NEW',
                 FOREIGN KEY (grid_ejecucion_id) REFERENCES grid_ejecuciones(id)
             )
         """)
@@ -375,16 +686,16 @@ async def init_db():
         # Fills reales (parciales o completos)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS grid_ejecucion_fills (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                grid_ejecucion_id INTEGER NOT NULL,
-                orden_id INTEGER NOT NULL,
-                binance_trade_id TEXT,
-                price REAL,
-                qty REAL,
-                commission REAL,
-                commission_asset TEXT,
-                realized_pnl REAL,
-                timestamp TIMESTAMP,
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                grid_ejecucion_id BIGINT NOT NULL,
+                orden_id BIGINT NOT NULL,
+                binance_trade_id VARCHAR(64),
+                price DOUBLE,
+                qty DOUBLE,
+                commission DOUBLE,
+                commission_asset VARCHAR(16),
+                realized_pnl DOUBLE,
+                timestamp VARCHAR(40),
                 FOREIGN KEY (orden_id) REFERENCES grid_ejecucion_ordenes(id)
             )
         """)
@@ -394,25 +705,24 @@ async def init_db():
         # ═══════════════════════════════════════════════════════════════════════════════
         await db.execute("""
             CREATE TABLE IF NOT EXISTS fills_tracking (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                grid_ejecucion_id INTEGER NOT NULL,
-                symbol TEXT NOT NULL,
-                binance_trade_id TEXT NOT NULL UNIQUE,
-                binance_order_id TEXT NOT NULL,
-                side TEXT NOT NULL,
-                price REAL NOT NULL,
-                qty REAL NOT NULL,
-                commission REAL NOT NULL,
-                commission_asset TEXT,
-                realized_pnl REAL,
-                timestamp_ms INTEGER NOT NULL,
-                procesado INTEGER DEFAULT 0,  -- 0=no, 1=sí
-                posicion_id TEXT,  -- Link a PosicionReal
-                fecha_procesamiento TIMESTAMP,
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                grid_ejecucion_id BIGINT NOT NULL,
+                symbol VARCHAR(32) NOT NULL,
+                binance_trade_id VARCHAR(64) NOT NULL UNIQUE,
+                binance_order_id VARCHAR(64) NOT NULL,
+                side VARCHAR(8) NOT NULL,
+                price DOUBLE NOT NULL,
+                qty DOUBLE NOT NULL,
+                commission DOUBLE NOT NULL,
+                commission_asset VARCHAR(16),
+                realized_pnl DOUBLE,
+                timestamp_ms BIGINT NOT NULL,
+                procesado INT DEFAULT 0,
+                posicion_id VARCHAR(64),
+                fecha_procesamiento DATETIME NULL DEFAULT NULL,
                 FOREIGN KEY (grid_ejecucion_id) REFERENCES grid_ejecuciones(id)
             )
         """)
-
 
         # Índices para ejecución real
         await db.execute("CREATE INDEX IF NOT EXISTS idx_fills_grid ON fills_tracking(grid_ejecucion_id)")
@@ -424,23 +734,23 @@ async def init_db():
         # ═══════════════════════════════════════════════════════════════════════════════
         await db.execute("""
             CREATE TABLE IF NOT EXISTS grid_niveles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                grid_ejecucion_id INTEGER NOT NULL,
-                symbol TEXT NOT NULL,
-                level_index INTEGER NOT NULL,
-                price REAL NOT NULL,
-                side TEXT NOT NULL,
-                position_side TEXT NOT NULL DEFAULT 'LONG',
-                quantity REAL NOT NULL,
-                state TEXT NOT NULL DEFAULT 'PENDING',
-                is_gap INTEGER DEFAULT 0,
-                order_id TEXT,
-                binance_order_id TEXT,
-                filled_qty REAL DEFAULT 0,
-                last_placed_at_ms INTEGER,
-                version INTEGER DEFAULT 1,
-                roundtrips INTEGER DEFAULT 0,
-                updated_at INTEGER,
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                grid_ejecucion_id BIGINT NOT NULL,
+                symbol VARCHAR(32) NOT NULL,
+                level_index INT NOT NULL,
+                price DOUBLE NOT NULL,
+                side VARCHAR(8) NOT NULL,
+                position_side VARCHAR(16) NOT NULL DEFAULT 'LONG',
+                quantity DOUBLE NOT NULL,
+                state VARCHAR(24) NOT NULL DEFAULT 'PENDING',
+                is_gap INT DEFAULT 0,
+                order_id VARCHAR(64),
+                binance_order_id VARCHAR(64),
+                filled_qty DOUBLE DEFAULT 0,
+                last_placed_at_ms BIGINT,
+                version INT DEFAULT 1,
+                roundtrips INT DEFAULT 0,
+                updated_at BIGINT,
                 UNIQUE(grid_ejecucion_id, level_index)
             )
         """)
@@ -448,12 +758,12 @@ async def init_db():
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS grid_engine_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                grid_ejecucion_id INTEGER NOT NULL,
-                timestamp_ms INTEGER NOT NULL,
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                grid_ejecucion_id BIGINT NOT NULL,
+                timestamp_ms BIGINT NOT NULL,
                 level_map_json TEXT NOT NULL,
                 coverage_report_json TEXT,
-                created_at INTEGER DEFAULT (strftime('%s', 'now'))
+                created_at BIGINT DEFAULT NULL
             )
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_grid ON grid_engine_snapshots(grid_ejecucion_id, timestamp_ms)")
@@ -463,22 +773,22 @@ async def init_db():
         # ═══════════════════════════════════════════════════════════════════════════════
         await db.execute("""
             CREATE TABLE IF NOT EXISTS pnl_eventos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                grid_ejecucion_id INTEGER NOT NULL,
-                symbol TEXT NOT NULL,
-                tipo_evento TEXT NOT NULL,
-                side TEXT NOT NULL,
-                binance_trade_id TEXT NOT NULL UNIQUE,
-                binance_order_id TEXT NOT NULL,
-                price REAL NOT NULL,
-                qty REAL NOT NULL,
-                commission REAL NOT NULL,
-                commission_asset TEXT,
-                realized_pnl REAL NOT NULL,
-                notional REAL NOT NULL,
-                timestamp_ms INTEGER NOT NULL,
-                timestamp_local TEXT,
-                procesado INTEGER DEFAULT 1,
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                grid_ejecucion_id BIGINT NOT NULL,
+                symbol VARCHAR(32) NOT NULL,
+                tipo_evento VARCHAR(32) NOT NULL,
+                side VARCHAR(8) NOT NULL,
+                binance_trade_id VARCHAR(64) NOT NULL UNIQUE,
+                binance_order_id VARCHAR(64) NOT NULL,
+                price DOUBLE NOT NULL,
+                qty DOUBLE NOT NULL,
+                commission DOUBLE NOT NULL,
+                commission_asset VARCHAR(16),
+                realized_pnl DOUBLE NOT NULL,
+                notional DOUBLE NOT NULL,
+                timestamp_ms BIGINT NOT NULL,
+                timestamp_local VARCHAR(40),
+                procesado INT DEFAULT 1,
                 FOREIGN KEY (grid_ejecucion_id) REFERENCES grid_ejecuciones(id)
             )
         """)
@@ -500,29 +810,29 @@ async def init_db():
         """Añade columnas faltantes en tablas existentes (idempotente)."""
         columnas_necesarias = {
             'grid_estados': [
-                ('evento_auditoria_id', 'INTEGER'),
+                ('evento_auditoria_id', 'BIGINT'),
             ],
             'near_miss_seguimientos': [
                 ('filtros_rechazo', 'TEXT'),
                 ('muestras_json', 'TEXT'),
-                ('precio_max', 'REAL'),
-                ('precio_min', 'REAL'),
+                ('precio_max', 'DOUBLE'),
+                ('precio_min', 'DOUBLE'),
             ],
-            'grid_ejecuciones': [            
-                ('timestamp_inicio', 'INTEGER'),
-                ('engine_version', 'INTEGER DEFAULT 1'),      # V8: versión del motor
-                ('order_id_counter', 'INTEGER DEFAULT 0'),       # V8: contador de IDs
+            'grid_ejecuciones': [
+                ('timestamp_inicio', 'BIGINT'),
+                ('engine_version', 'INT DEFAULT 1'),      # V8: versión del motor
+                ('order_id_counter', 'INT DEFAULT 0'),       # V8: contador de IDs
             ],
             'grid_niveles': [
-                ('roundtrips', 'INTEGER DEFAULT 0'),          # V8 FASE 4: ciclos por nivel
+                ('roundtrips', 'INT DEFAULT 0'),          # V8 FASE 4: ciclos por nivel
             ],
         }
 
         for tabla, columnas in columnas_necesarias.items():
             try:
-                cursor = await db.execute(f"PRAGMA table_info({tabla})")
+                cursor = await db.execute(f"SHOW COLUMNS FROM {tabla}")
                 rows = await cursor.fetchall()
-                columnas_existentes = {r[1] for r in rows}  # r[1] = name
+                columnas_existentes = {r[0] for r in rows}  # r[0] = Field
 
                 for col, tipo in columnas:
                     if col not in columnas_existentes:
@@ -534,7 +844,7 @@ async def init_db():
 
     await _migrar_columnas_faltantes()
 
-    print("🗄️ Base de datos inicializada (WAL mode) + Auditoría + Disparos + Near-miss + V5.9.2 Grid Neutral + F1.4 Migración")
+    print("🗄️ Base de datos MySQL/MariaDB inicializada + Auditoría + Disparos + Near-miss + V5.9.2 Grid Neutral + F1.4 Migración")
 
 # Mapeo seguro de timeframes a tablas (evita SQL injection)
 _TABLAS_VELAS = {
@@ -550,7 +860,7 @@ async def insertar_vela(symbol: str, tf: str, vela: dict):
         return
 
     await _execute_with_retry(f"""
-        INSERT OR REPLACE INTO {tabla}
+        REPLACE INTO {tabla}
         (symbol, timestamp, open, high, low, close, volume)
         VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (symbol, vela['timestamp'], vela['open'], vela['high'],
@@ -571,7 +881,7 @@ async def insertar_velas_batch(symbol: str, tf: str, velas: list):
         try:
             await db.executemany(
                 f"""
-                INSERT OR REPLACE INTO {tabla}
+                REPLACE INTO {tabla}
                 (symbol, timestamp, open, high, low, close, volume)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
@@ -590,7 +900,7 @@ async def cargar_velas_historicas(symbol: str, tf: str, limit: int):
         return []
     db = await _get_db()
     async with _db_lock:
-        db.row_factory = aiosqlite.Row
+        db.row_factory = Row
         cursor = await db.execute(
             f"SELECT * FROM {tabla} WHERE symbol = ? ORDER BY timestamp DESC LIMIT ?",
             (symbol, limit)
@@ -607,7 +917,7 @@ async def guardar_alerta(symbol, tipo, direccion, score, mensaje, params_json, p
 
 async def actualizar_precio_vivo(symbol: str, precio: float):
     await _execute_with_retry("""
-        INSERT OR REPLACE INTO precios_vivo (symbol, precio, actualizado)
+        REPLACE INTO precios_vivo (symbol, precio, actualizado)
         VALUES (?, ?, ?)
     """, (symbol, precio, datetime.utcnow().isoformat()))
 
@@ -623,7 +933,7 @@ async def actualizar_precios_vivo_batch(precios: dict):
     async with _db_lock:
         try:
             await db.executemany(
-                "INSERT OR REPLACE INTO precios_vivo (symbol, precio, actualizado) VALUES (?, ?, ?)",
+                "REPLACE INTO precios_vivo (symbol, precio, actualizado) VALUES (?, ?, ?)",
                 [(symbol, precio, ts) for symbol, precio in precios.items()]
             )
             await db.commit()
@@ -662,7 +972,7 @@ async def guardar_evento_auditoria(symbol, timestamp_utc, tipo, direccion=None, 
                         rechazos_json, estado_maquina))
 
                 # Obtener ID dentro de la misma transacción
-                cursor = await db.execute("SELECT last_insert_rowid()")
+                cursor = await db.execute("SELECT LAST_INSERT_ID()")
                 row = await cursor.fetchone()
                 await db.commit()
 
@@ -735,7 +1045,7 @@ async def guardar_disparo_activo(evento_id, symbol, timestamp_utc, precio_entrad
                                   muestras_guardadas, horas_seguimiento):
     """Guarda o actualiza un disparo activo en la base de datos para persistencia."""
     await _execute_with_retry("""
-        INSERT OR REPLACE INTO auditoria_disparos_activos
+        REPLACE INTO auditoria_disparos_activos
         (evento_id, symbol, timestamp_utc, precio_entrada, direccion, grid_params_json,
          maximo_visto, minimo_visto, primera_vez_en_grid_json, primera_vez_fuera_rango_json,
          muestras_guardadas, horas_seguimiento)
@@ -750,7 +1060,7 @@ async def cargar_disparos_activos():
     """Carga todos los disparos activos persistentes (útil al reiniciar el bot)."""
     db = await _get_db()
     async with _db_lock:
-        db.row_factory = aiosqlite.Row
+        db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM auditoria_disparos_activos
             ORDER BY timestamp_utc ASC
@@ -798,7 +1108,7 @@ async def cargar_eventos_dia(fecha_local: str):
     """Carga todos los eventos de auditoría de un día específico (fecha local)."""
     db = await _get_db()
     async with _db_lock:
-        db.row_factory = aiosqlite.Row
+        db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM auditoria_eventos
             WHERE fecha = ?
@@ -811,7 +1121,7 @@ async def cargar_muestras_post_evento(evento_id: int):
     """Carga las muestras post-disparo de un evento específico."""
     db = await _get_db()
     async with _db_lock:
-        db.row_factory = aiosqlite.Row
+        db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM auditoria_muestras_post
             WHERE evento_id = ?
@@ -824,7 +1134,7 @@ async def cargar_eventos_post_evento(evento_id: int):
     """Carga los eventos significativos post-disparo de un evento específico."""
     db = await _get_db()
     async with _db_lock:
-        db.row_factory = aiosqlite.Row
+        db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM auditoria_eventos_post
             WHERE evento_id = ?
@@ -837,7 +1147,7 @@ async def cargar_velas_post_evento(evento_id: int):
     """Carga las velas 15m posteriores de un evento específico."""
     db = await _get_db()
     async with _db_lock:
-        db.row_factory = aiosqlite.Row
+        db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM auditoria_velas_post
             WHERE evento_id = ?
@@ -864,7 +1174,7 @@ async def guardar_near_miss_seguimiento(symbol, timestamp_inicio, precio_inicio,
                 """, (symbol, timestamp_inicio, precio_inicio, direccion_nm, score, umbral,
                         json.dumps(filtros_rechazo) if filtros_rechazo else None))
 
-                cursor = await db.execute("SELECT last_insert_rowid()")
+                cursor = await db.execute("SELECT LAST_INSERT_ID()")
                 row = await cursor.fetchone()
                 await db.commit()
 
@@ -923,7 +1233,7 @@ async def cargar_near_miss_seguimientos_dia(fecha_local: str):
     """Carga todos los seguimientos de un día específico (fecha local)."""
     db = await _get_db()
     async with _db_lock:
-        db.row_factory = aiosqlite.Row
+        db.row_factory = Row
         # Convertir fecha local a rango de timestamps UTC para la consulta
         tz = get_tz()
         fecha_inicio = datetime.strptime(fecha_local, "%Y-%m-%d")
@@ -945,7 +1255,7 @@ async def cargar_near_miss_seguimientos_activos():
     """Carga seguimientos que aún no han finalizado (timestamp_fin IS NULL)."""
     db = await _get_db()
     async with _db_lock:
-        db.row_factory = aiosqlite.Row
+        db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM near_miss_seguimientos
             WHERE timestamp_fin IS NULL
@@ -971,7 +1281,7 @@ async def guardar_grid_estado(symbol, timestamp_inicio, estado='ACTIVO', direcci
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, (symbol, timestamp_inicio, estado, direccion, precio_entrada, grid_params_json, evento_auditoria_id))
 
-                cursor = await db.execute("SELECT last_insert_rowid()")
+                cursor = await db.execute("SELECT LAST_INSERT_ID()")
                 row = await cursor.fetchone()
                 await db.commit()
 
@@ -1028,7 +1338,7 @@ async def guardar_grid_simulacion(grid_id, symbol, timestamp_inicio, precio_inic
                     VALUES (?, ?, ?, ?, ?, ?)
                 """, (grid_id, symbol, timestamp_inicio, precio_inicio, posiciones_abiertas_json, estado))
 
-                cursor = await db.execute("SELECT last_insert_rowid()")
+                cursor = await db.execute("SELECT LAST_INSERT_ID()")
                 row = await cursor.fetchone()
                 await db.commit()
 
@@ -1107,7 +1417,7 @@ async def cargar_grid_activo(symbol):
     """Carga el grid activo más reciente para un símbolo."""
     db = await _get_db()
     async with _db_lock:
-        db.row_factory = aiosqlite.Row
+        db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM grid_estados
             WHERE symbol = ? AND estado = 'ACTIVO'
@@ -1121,7 +1431,7 @@ async def cargar_simulacion_activa(grid_id):
     """Carga la simulación activa para un grid_id."""
     db = await _get_db()
     async with _db_lock:
-        db.row_factory = aiosqlite.Row
+        db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM grid_simulaciones
             WHERE grid_id = ? AND estado = 'SIMULANDO'
@@ -1136,7 +1446,7 @@ async def cargar_grids_huerfanos(timeout_seg):
     db = await _get_db()
     ahora = int(datetime.now(pytz.UTC).timestamp())
     async with _db_lock:
-        db.row_factory = aiosqlite.Row
+        db.row_factory = Row
         cursor = await db.execute("""
             SELECT g.id, g.symbol, g.timestamp_inicio
             FROM grid_estados g
@@ -1189,7 +1499,7 @@ async def guardar_grid_estado_atomico(symbol, timestamp_inicio, precio_inicio, g
                     VALUES (?, ?, 'ACTIVO', ?, ?, ?, ?)
                 """, (symbol, timestamp_inicio, direccion, precio_inicio, grid_params_json, evento_auditoria_id))
 
-                cursor = await db.execute("SELECT last_insert_rowid()")
+                cursor = await db.execute("SELECT LAST_INSERT_ID()")
                 row = await cursor.fetchone()
                 grid_id = row[0] if row else None
 
@@ -1204,7 +1514,7 @@ async def guardar_grid_estado_atomico(symbol, timestamp_inicio, precio_inicio, g
                     VALUES (?, ?, ?, ?, ?, 'SIMULANDO')
                 """, (grid_id, symbol, timestamp_inicio, precio_inicio, posiciones_abiertas_json))
 
-                cursor2 = await db.execute("SELECT last_insert_rowid()")
+                cursor2 = await db.execute("SELECT LAST_INSERT_ID()")
                 row2 = await cursor2.fetchone()
                 sim_id = row2[0] if row2 else None
 
@@ -1230,7 +1540,7 @@ async def cargar_todos_grids_activos():
     """Carga todos los grids activos con su simulación."""
     db = await _get_db()
     async with _db_lock:
-        db.row_factory = aiosqlite.Row
+        db.row_factory = Row
         cursor = await db.execute("""
             SELECT g.id as grid_id, g.symbol, g.timestamp_inicio, g.estado as grid_estado,
                    g.precio_entrada, g.grid_params_json,
@@ -1276,7 +1586,7 @@ async def guardar_grid_ejecucion(symbol, direction, trading_mode, capital_asigna
                       apalancamiento_usado, precio_entrada, grid_params_json,
                       timestamp_inicio or int(datetime.now(pytz.UTC).timestamp())))
 
-                cursor = await db.execute("SELECT last_insert_rowid()")
+                cursor = await db.execute("SELECT LAST_INSERT_ID()")
                 row = await cursor.fetchone()
                 await db.commit()
                 return row[0] if row else None
@@ -1326,7 +1636,7 @@ async def cargar_grid_ejecuciones_activos():
     """Carga grids de ejecución en estado ACTIVO."""
     db = await _get_db()
     async with _db_lock:
-        db.row_factory = aiosqlite.Row
+        db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM grid_ejecuciones WHERE estado = 'ACTIVO' ORDER BY created_at ASC
         """)
@@ -1338,7 +1648,7 @@ async def cargar_ordenes_por_grid(grid_ejecucion_id):
     """Carga órdenes de un grid de ejecución."""
     db = await _get_db()
     async with _db_lock:
-        db.row_factory = aiosqlite.Row
+        db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM grid_ejecucion_ordenes WHERE grid_ejecucion_id = ? ORDER BY id ASC
         """, (grid_ejecucion_id,))
@@ -1366,7 +1676,7 @@ async def guardar_fill_tracking(grid_ejecucion_id, symbol,
                                  realized_pnl, timestamp_ms):
     """Guarda un fill detectado para procesamiento posterior."""
     await _execute_with_retry("""
-        INSERT OR IGNORE INTO fills_tracking
+        INSERT IGNORE INTO fills_tracking
         (grid_ejecucion_id, symbol, binance_trade_id, binance_order_id,
          side, price, qty, commission, commission_asset, realized_pnl,
          timestamp_ms, procesado)
@@ -1380,7 +1690,7 @@ async def cargar_fills_sin_procesar(grid_ejecucion_id):
     """Carga fills no procesados de un grid."""
     db = await _get_db()
     async with _db_lock:
-        db.row_factory = aiosqlite.Row
+        db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM fills_tracking
             WHERE grid_ejecucion_id = ? AND procesado = 0
@@ -1422,7 +1732,7 @@ async def guardar_pnl_evento(grid_ejecucion_id: int, symbol: str, tipo_evento: s
     timestamp_local = datetime.now(get_tz()).isoformat()
 
     await _execute_with_retry("""
-        INSERT OR IGNORE INTO pnl_eventos
+        INSERT IGNORE INTO pnl_eventos
         (grid_ejecucion_id, symbol, tipo_evento, side, binance_trade_id,
          binance_order_id, price, qty, commission, commission_asset,
          realized_pnl, notional, timestamp_ms, timestamp_local)
@@ -1447,7 +1757,7 @@ async def calcular_pnl_acumulado(grid_ejecucion_id: int) -> dict:
         """, (grid_ejecucion_id,))
         row = await cursor.fetchone()
 
-        # FIX: SUM() sobre conjunto vacío devuelve NULL en SQLite (grid sin trades).
+        # FIX: SUM() sobre conjunto vacío devuelve NULL en MySQL (grid sin trades).
         # Los COALESCE del SQL no cubren los CASE. Normalizar aquí.
         return {
             'pnl_real': float(row[0] or 0),
@@ -1482,7 +1792,7 @@ async def guardar_niveles_grid(grid_id: int, rows: list):
     async with _db_lock:
         for row in rows:
             await db.execute("""
-                INSERT OR REPLACE INTO grid_niveles
+                REPLACE INTO grid_niveles
                 (grid_ejecucion_id, symbol, level_index, price, side, position_side,
                  quantity, state, is_gap, order_id, binance_order_id, filled_qty,
                  last_placed_at_ms, version, roundtrips, updated_at)
@@ -1502,7 +1812,7 @@ async def cargar_niveles_grid(grid_id: int) -> list:
     """Carga niveles de un grid desde DB."""
     db = await _get_db()
     async with _db_lock:
-        db.row_factory = aiosqlite.Row
+        db.row_factory = Row
         cursor = await db.execute(
             "SELECT * FROM grid_niveles WHERE grid_ejecucion_id = ? ORDER BY level_index",
             (grid_id,)
@@ -1556,7 +1866,19 @@ async def guardar_snapshot_engine(grid_id: int, level_map_json: str,
     async with _db_lock:
         await db.execute("""
             INSERT INTO grid_engine_snapshots
-            (grid_ejecucion_id, timestamp_ms, level_map_json, coverage_report_json)
-            VALUES (?, ?, ?, ?)
-        """, (grid_id, int(time.time() * 1000), level_map_json, coverage_report_json))
+            (grid_ejecucion_id, timestamp_ms, level_map_json, coverage_report_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (grid_id, int(time.time() * 1000), level_map_json, coverage_report_json, int(time.time())))
         await db.commit()
+
+
+async def obtener_tamano_db_mb():
+    """Tamaño aproximado de la base de datos (MB) desde information_schema."""
+    db = await _get_db()
+    async with _db_lock:
+        cursor = await db.execute(
+            "SELECT COALESCE(SUM(data_length + index_length), 0) "
+            "FROM information_schema.TABLES WHERE table_schema = DATABASE()"
+        )
+        row = await cursor.fetchone()
+        return float(row[0] or 0) / (1024 * 1024)

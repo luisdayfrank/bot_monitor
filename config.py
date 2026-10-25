@@ -38,7 +38,7 @@ _ACTIVE_SYMBOLS, _COIN_REGISTRY = load_coin_registry()
 
 class Config(BaseModel):
     # ───────────────────────────────────────────────────────────────────────────────
-    # F1.1: Feature flag para I/O de precios en vivo (evita asfixia de SQLite)
+    # F1.1: Feature flag para I/O de precios en vivo (evita asfixia de la DB)
     # ───────────────────────────────────────────────────────────────────────────────
     guardar_precios_vivo: bool = False   # True = persiste precios en DB (costoso I/O)
 
@@ -46,6 +46,46 @@ class Config(BaseModel):
     # F1.2: Feature flag de arquitectura adaptativa (MOVIDO DENTRO de la clase)
     # ───────────────────────────────────────────────────────────────────────────────
     use_per_coin_params: bool = True   # False = usa globals, ignora registry por moneda
+
+    # ───────────────────────────────────────────────────────────────────────────────
+    # LEARNING ENGINE — todos los flags arrancan OFF / SHADOW (Fase 0)
+    # Ver: informe_revision_learning_engine.md (correcciones C-1..C-6, §3A-§3I)
+    # ───────────────────────────────────────────────────────────────────────────────
+    learning_enabled: bool = True              # master switch (Fase 0)
+    learning_db_path: str = "crypto_learning.db"
+    learning_apply_mode: str = "OFF"            # OFF | SHADOW | ACTIVE (refusal-first)
+    learning_exit_mode: str = "OFF"             # OFF | SHADOW | ACTIVE (Fase 8)
+    learning_regime_tracking: bool = True       # Fase 6
+
+    # Parámetros del learner
+    learning_fee_rate: float = 0.0005           # fee por lado (0.05%) — todo neto §3C
+    learning_label_intervalo_min: int = 10
+    learning_learn_hora_local: int = 3          # corrida diaria del learner
+    learning_ventana_short_dias: int = 30
+    learning_ventana_medium_dias: int = 180
+    learning_ventana_long_dias: int = 1825      # 5 años
+    learning_decay_half_life_dias: int = 125    # peso = 0.5 ** (edad/half_life) §3G
+    learning_min_snapshots_perfil: int = 300
+    learning_min_labels_para_ml: int = 5000
+    learning_refusal_threshold: float = 0.35    # override por moneda vía registry
+
+    # Rigor estadístico de la minería (corrección §3A)
+    learning_min_lift: float = 1.5
+    learning_min_lift_lower: float = 1.2        # límite inferior Wilson 95%
+    learning_min_n: int = 40
+    learning_fdr_q: float = 0.10                # Benjamini-Hochberg
+    learning_regime_min_velas: int = 4          # histéresis del clasificador §3F
+
+    # ─────────────────────────────────────────────────────────────────────
+    # LEARNING ENGINE — GUARDRAILS FINANCIEROS (Anexo A §4: auto-rollback)
+    # ─────────────────────────────────────────────────────────────────────
+    learning_auto_rollback_enabled: bool = True
+    learning_max_reject_ratio_daily: float = 0.60    # >60% FIREs rechazados/24h → SHADOW
+    learning_max_reject_ratio_hourly: float = 0.80   # >80% en 1h → SHADOW + alerta
+    learning_min_precision_delta: float = -0.10      # precisión de rechazos cae >10% → SHADOW
+    learning_drift_psi_threshold: float = 0.20       # PSI > 0.20 → solo alerta
+    learning_alerta_telegram: bool = True
+    learning_exit_captura_pct_min: float = 30.0      # Fase 8: captura mínima de MFE
 
     # ───────────────────────────────────────────────────────────────────────────────
     # CONFIGURACIÓN DE ZONA HORARIA
@@ -264,8 +304,18 @@ class Config(BaseModel):
     telegram_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # DB
-    db_path: str = "crypto_monitor.db"
+    # ─── Base de datos MySQL / MariaDB ───
+    # Conexión local por defecto (MariaDB/MySQL en tu PC). Configurable por
+    # variables de entorno para no exponer credenciales en el código.
+    db_host: str = os.getenv("DB_HOST", "database-1.cnqsq0e6cf6z.eu-west-1.rds.amazonaws.com")
+    db_port: int = int(os.getenv("DB_PORT", "3306"))
+    db_user: str = os.getenv("DB_USER", "admin")
+    db_password: str = os.getenv("DB_PASSWORD", "1605584496")
+    db_name: str = os.getenv("DB_NAME", "database-1")
+    db_connect_timeout: int = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))
+
+    # Carpeta donde se exportan los reportes JSON de auditoría
+    audit_export_dir: str = os.getenv("AUDIT_EXPORT_DIR", "auditoria")
 
     # Binance
     binance_api_key: str = os.getenv("BINANCE_API_KEY", "")

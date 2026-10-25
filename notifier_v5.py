@@ -3,12 +3,13 @@ import logging
 import os
 import shutil
 import signal
-import sqlite3
+import subprocess
 from datetime import datetime, timedelta
 from plyer import notification
 from telegram import Bot, Update, InputFile
 from telegram.constants import ParseMode
 from config import CONFIG
+from database_v5 import obtener_tamano_db_mb
 import pytz
 
 class Notifier:
@@ -499,9 +500,10 @@ class Notifier:
             if s.estado == 'NEUTRAL_GRID':
                 neutral_grid_count += 1
 
-        db_size = 0
-        if os.path.exists(CONFIG.db_path):
-            db_size = os.path.getsize(CONFIG.db_path) / (1024*1024)
+        try:
+            db_size = await obtener_tamano_db_mb()
+        except Exception:
+            db_size = 0
 
         msg = (
             f"<b>🏥 HEALTH CHECK V5.7</b>\n\n"
@@ -519,7 +521,7 @@ class Notifier:
             f"<b>💠 Fase 5 - Grid Neutral:</b> {'✅ ACTIVADO' if CONFIG.grid_neutral_enabled else '❌ DESACTIVADO'}\n\n"
             f"<b>🗄️ Base de datos:</b>\n"
             f"  • Tamaño: {db_size:.1f} MB\n"
-            f"  • Path: <code>{CONFIG.db_path}</code>\n\n"
+            f"  • Base: <code>{CONFIG.db_name}</code> @ <code>{CONFIG.db_host}</code>\n\n"
             f"<b>🔌 WebSocket:</b>\n"
             f"  • Último mensaje: hace {(datetime.now(pytz.UTC)-self._ws_last_msg_time).seconds}s\n"
             f"  • Estado: {'✅ Conectado' if self._ws_connected else '❌ Desconectado'}"
@@ -679,24 +681,35 @@ class Notifier:
             )
 
     async def _cmd_backup(self):
-        """/backup — Forzar backup seguro de la base de datos."""
-        if not os.path.exists(CONFIG.db_path):
-            await self.enviar_telegram("❌ Base de datos no encontrada.")
-            return
-
+        """/backup — Forzar backup seguro de la base de datos (mysqldump)."""
         timestamp = datetime.now(pytz.UTC).strftime("%Y%m%d_%H%M%S")
         backup_dir = "backups"
         os.makedirs(backup_dir, exist_ok=True)
-        backup_path = f"{backup_dir}/crypto_monitor_{timestamp}.db"
+        backup_path = f"{backup_dir}/crypto_monitor_{timestamp}.sql"
+
+        def hacer_backup():
+            cmd = [
+                "mysqldump",
+                f"--host={CONFIG.db_host}",
+                f"--port={CONFIG.db_port}",
+                f"--user={CONFIG.db_user}",
+                "--single-transaction",
+                "--routines",
+                "--triggers",
+                f"--result-file={backup_path}",
+                CONFIG.db_name,
+            ]
+            env = dict(os.environ)
+            # La contraseña se pasa por variable de entorno (no en la línea
+            # de comandos) para no exponer credenciales en el proceso.
+            if CONFIG.db_password:
+                env["MYSQL_PWD"] = CONFIG.db_password
+            subprocess.run(
+                cmd, env=env, check=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+            )
 
         try:
-            # FIX: Copiar SQLite usando el motor nativo garantiza que los
-            # datos temporales en el archivo WAL pasen completos al backup.
-            def hacer_backup():
-                with sqlite3.connect(CONFIG.db_path) as src:
-                    with sqlite3.connect(backup_path) as dst:
-                        src.backup(dst)
-
             await asyncio.to_thread(hacer_backup)
             size_mb = os.path.getsize(backup_path) / (1024*1024)
             await self.enviar_telegram(
@@ -704,6 +717,14 @@ class Notifier:
                 f"Archivo: <code>{backup_path}</code>\n"
                 f"Tamaño: {size_mb:.1f} MB"
             )
+        except FileNotFoundError:
+            await self.enviar_telegram(
+                "❌ No se encontró <code>mysqldump</code>. Instala las herramientas "
+                "de cliente de MySQL/MariaDB (p. ej. <code>mariadb-client</code>)."
+            )
+        except subprocess.CalledProcessError as e:
+            msg = e.stderr.decode(errors="ignore").strip() if e.stderr else str(e)
+            await self.enviar_telegram(f"❌ Error creando backup: {msg}")
         except Exception as e:
             await self.enviar_telegram(f"❌ Error creando backup: {e}")
 
@@ -866,7 +887,7 @@ class Notifier:
                             "<code>/set_threshold param valor</code> — Cambiar umbral\n\n"
                             "<b>[SOS] Emergencia:</b>\n"
                             "<code>/reset_circuit SYMBOL</code> — Resetear circuit breaker\n"
-                            "<code>/backup</code> — Backup nativo de SQLite\n\n"
+                            "<code>/backup</code> — Backup con <code>mysqldump</code>\n\n"
                             "<b>📖 Leyenda de Estados:</b>\n"
                             "⚪ = Monitoreo\n"
                             "🟡 = Armed\n"

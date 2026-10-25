@@ -26,7 +26,7 @@ class AuditReporter:
     • FASE 6: Commitment score eliminado completamente — NO se reporta
     • Analisis de evolucion del score durante el dia
     • Deteccion de "horas muertas" vs "horas activas"
-    • Near-miss seguimientos persistentes (SQLite)
+    • Near-miss seguimientos persistentes (MySQL/MariaDB)
     """
 
     def __init__(self, notifier):
@@ -86,7 +86,7 @@ class AuditReporter:
                 nm_seguimientos_moneda = [nm for nm in near_miss_seguimientos if nm.get('symbol') == symbol]
                 json_data = await self._generar_json_moneda(symbol, fecha_reporte, eventos, nm_seguimientos_moneda)
 
-                db_dir = os.path.dirname(os.path.abspath(CONFIG.db_path))
+                db_dir = CONFIG.audit_export_dir
                 os.makedirs(db_dir, exist_ok=True)
                 filename = f"auditoria_{symbol}_{fecha_reporte}.json"
                 filepath = os.path.join(db_dir, filename)

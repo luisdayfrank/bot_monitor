@@ -41,17 +41,17 @@ from database_v5 import (
 
 class AuditLogger:
     """
-    Logger de auditoria V5.7.1 — Seguimiento virtual post near-miss con persistencia SQLite.
+    Logger de auditoria V5.7.1 — Seguimiento virtual post near-miss con persistencia MySQL/MariaDB.
 
     FASE V5.7.1 CAMBIOS (Fix I/O):
     ———————————————————————————————
     • FIX CRÍTICO: Near-miss muestras solo en RAM durante seguimiento
-    • Persistencia SQLite solo al finalizar (2h) o en stop() (crash-recovery)
+    • Persistencia MySQL/MariaDB solo al finalizar (2h) o en stop() (crash-recovery)
     • Eliminados 23 UPDATES intermedios por near-miss (95% menos I/O)
 
     FASE V5.7 CAMBIOS:
     —————————————————
-    • NUEVO: Seguimientos virtuales persistentes en SQLite (tabla near_miss_seguimientos)
+    • NUEVO: Seguimientos virtuales persistentes en MySQL/MariaDB (tabla near_miss_seguimientos)
     • NUEVO: Muestras cada 5 minutos con JSON en columna muestras_json
     • NUEVO: Evento NEAR_MISS_SEGUIMIENTO_FIN con evaluacion completa
     • log_continuo() eliminado (reemplazado por granularidad nativa de near-miss)
@@ -155,7 +155,7 @@ class AuditLogger:
             print(f"  ⚠️ Error persistiendo disparo activo {symbol}: {e}")
 
     async def _flush_disparos_updates(self):
-        """V5.7.1 FIX #1: Flush acumulado de updates de disparos a SQLite."""
+        """V5.7.1 FIX #1: Flush acumulado de updates de disparos a MySQL/MariaDB."""
         if not self._disparos_updates_buffer:
             return
         updates_copia = dict(self._disparos_updates_buffer)
@@ -267,7 +267,7 @@ class AuditLogger:
                             direccion: str = None, contexto: dict = None, detalle: dict = None):
         """
         Detecta, guarda e inicia seguimiento virtual de near-misses.
-        El seguimiento se persiste en SQLite para sobrevivir reinicios.
+        El seguimiento se persiste en MySQL/MariaDB para sobrevivir reinicios.
         """
         if not CONFIG.modo_auditoria:
             return
@@ -614,7 +614,7 @@ class AuditLogger:
 
 
     # ═══════════════════════════════════════════════════════════════════════════════
-    # V5.7: SEGUIMIENTO VIRTUAL DE NEAR-MISSES CON PERSISTENCIA SQLITE
+    # V5.7: SEGUIMIENTO VIRTUAL DE NEAR-MISSES CON PERSISTENCIA MySQL/MariaDB
     # ═══════════════════════════════════════════════════════════════════════════════
 
     async def _recuperar_near_miss_activos(self):
@@ -695,7 +695,7 @@ class AuditLogger:
                                              contexto: dict = None):
         """
         Inicia seguimiento virtual persistente de un near-miss de alto score.
-        Se guarda en SQLite para sobrevivir reinicios del bot.
+        Se guarda en MySQL/MariaDB para sobrevivir reinicios del bot.
         """
         if not CONFIG.modo_auditoria:
             return
@@ -711,7 +711,7 @@ class AuditLogger:
                     # Ya hay seguimiento activo, no duplicar
                     return
 
-            # Guardar en SQLite primero
+            # Guardar en MySQL/MariaDB primero
             seguimiento_id = await guardar_near_miss_seguimiento(
                 symbol=symbol,
                 timestamp_inicio=ts_actual.timestamp(),

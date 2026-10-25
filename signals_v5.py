@@ -82,7 +82,7 @@ class SignalGenerator:
     """
     Generador de senales V5.7 — Fases 1-5 implementadas.
 
-    FASE 1: Post near-miss seguimiento persistente (SQLite)
+    FASE 1: Post near-miss seguimiento persistente (MySQL/MariaDB)
     FASE 2: Volumen adaptativo por clase de moneda (volume_threshold en registry)
     FASE 3: RSI contextualizado (evaluar segun tendencia)
     FASE 4: Umbrales dinamicos por volatilidad historica (ATR percentil)
@@ -105,6 +105,8 @@ class SignalGenerator:
         self._historial_1m: Dict[str, list] = {s: [] for s in CONFIG.symbols}
 
         self.audit_logger = None
+        # LEARNING ENGINE (Fase 1): inyectado desde main.py si CONFIG.learning_enabled
+        self.learning_engine = None
         # V7.1 FASE 4: Debounce de CREAR_GRID para evitar spam al executor
         self._grid_pending_creation: Dict[str, float] = {}
         # FASE 4: Grid neutral ahora es manejado 100% por el executor
@@ -436,6 +438,14 @@ class SignalGenerator:
 
             elif tf == '15m':
                 self.indicadores_15m[symbol] = data
+                # ── LEARNING ENGINE Fase 1 (corrección C-4): snapshot al cierre de
+                #    vela, ANTES de cualquier lógica de decisión y del `continue`
+                #    del aborto NEUTRAL_GRID (si no, se pierden snapshots).
+                if self.learning_engine is not None:
+                    try:
+                        self.learning_engine.on_vela_15m(symbol)
+                    except Exception as e_learn:
+                        print(f"  ⚠️ [LEARN] hook {symbol}: {e_learn}")
                 atr_val = data.get('atr')
                 if atr_val and atr_val > 0:
                     self._atr_historico[symbol].append(atr_val)
@@ -1329,6 +1339,37 @@ class SignalGenerator:
         # CR1 FASE 2.2: Ajustar score por nivel de confianza direccional
         score_ajustado = self._ajustar_score_por_confianza(score_macro, direccion_confianza)
 
+        # ── LEARNING ENGINE Fase 4 — SHADOW serving (no toca decisiones) ──────
+        # Solo log + predictions_log. En ACTIVE el refusal vive en _procesar_disparo
+        # (corrección C-3: antes de mutar state).
+        if (self.learning_engine is not None and
+                getattr(CONFIG, 'learning_apply_mode', 'OFF') in ('SHADOW', 'ACTIVE') and
+                direction != 'NEUTRAL'):
+            try:
+                _perfil = await self.learning_engine.get_perfil(symbol)
+                if _perfil:
+                    _feats = {'regime': self.learning_engine.regime_cls.regimen_actual.get(symbol, 'RANGE'),
+                              'rsi_15m': i15.get('rsi'), 'adx_15m': i15.get('adx'),
+                              'mfm_15m': i15.get('mfm_15m'), 'mfm_sma5': i15.get('mfm_sma5'),
+                              'macd_hist': i15.get('macd_hist')}
+                    _prob = self.learning_engine.compute_confidence(_perfil, direction, _feats)
+                    _reg = _perfil.get('perfil', {}).get('por_regimen', {}).get(_feats['regime'], {})
+                    _top = (_reg.get('patrones') or [{}])[0]
+                    print(f"  🧠 [LEARN-{getattr(CONFIG, 'learning_apply_mode', 'OFF')}] "
+                          f"{symbol} {direction} | prob={_prob:.3f} | "
+                          f"patrón top: {_top.get('feature', '—')} {_top.get('bucket', '')} "
+                          f"→ {_top.get('label_objetivo', '—')} "
+                          f"(lift {_top.get('lift', '—')}, n={_top.get('n', '—')})")
+                    self.learning_engine.log_prediccion(
+                        symbol=symbol, timestamp_15m=i15.get('timestamp', 0),
+                        prob=_prob, decision_sugerida='RECHAZAR' if _prob < 0.35 else 'FIRE',
+                        decision_tomada='IGNORADA',
+                        modo=getattr(CONFIG, 'learning_apply_mode', 'SHADOW'),
+                        direction=direction, score_macro=score_ajustado, regime=_feats['regime'])
+            except Exception as e_learn:
+                print(f"  ⚠️ [LEARN] shadow {symbol}: {e_learn}")
+        # ── fin LEARNING ENGINE Fase 4 ────────────────────────────────────
+
         # FASE 3.2: Alerta pre-disparo (usa score_ajustado)
         if (direction != 'NEUTRAL' and umbral_entrada > 0 and
             score_ajustado >= umbral_entrada * 0.90 and score_ajustado < umbral_entrada):
@@ -1806,6 +1847,41 @@ class SignalGenerator:
 
             await self.emitir_alerta(symbol, 'RECHAZADO', direction, 0, rechazos, None, price)
             return
+
+        # ── LEARNING ENGINE Fase 5 — REFUSAL-FIRST (corrección C-3) ─────────
+        # Se evalúa ANTES de mutar state.estado='FIRE' y antes de log_fire:
+        # un rechazo aquí deja la máquina de estados intacta y registra
+        # RECHAZADO (no FIRE+RECHAZADO contradictorios).
+        if (self.learning_engine is not None and
+                getattr(CONFIG, 'learning_apply_mode', 'OFF') == 'ACTIVE'):
+            try:
+                from coin_config_adapter import get_coin_config as _gcc
+                _umbral = _gcc(symbol).get('learning_refusal_threshold',
+                                          CONFIG.learning_refusal_threshold)
+                _perfil = await self.learning_engine.get_perfil(symbol)
+                _feats = {'regime': self.learning_engine.regime_cls.regimen_actual.get(symbol, 'RANGE'),
+                          'rsi_15m': i15.get('rsi'), 'adx_15m': i15.get('adx'),
+                          'mfm_15m': i15.get('mfm_15m'), 'mfm_sma5': i15.get('mfm_sma5'),
+                          'macd_hist': i15.get('macd_hist')}
+                _prob = self.learning_engine.compute_confidence(_perfil, direction, _feats)
+                if _prob < _umbral:
+                    _razon = f"learning_refusal: prob={_prob:.3f} < {_umbral}"
+                    print(f"  🧠 [LEARN-ACTIVE] {symbol} FIRE RECHAZADO | {_razon}")
+                    await self.audit_logger.log_rechazado(
+                        symbol=symbol, direccion=direction, precio=price,
+                        contexto_1m=i1m, contexto_macro={'score_macro': i15.get('score_macro')},
+                        rechazos=[_razon], score_macro=i15.get('score_macro'))
+                    await self.emitir_alerta(symbol, 'RECHAZADO', direction, 0, [_razon], None, price)
+                    self.learning_engine.log_prediccion(
+                        symbol=symbol, timestamp_15m=i15.get('timestamp', 0),
+                        prob=_prob, decision_sugerida='RECHAZAR',
+                        decision_tomada='REJECT', modo='ACTIVE',
+                        direction=direction, score_macro=i15.get('score_macro'),
+                        regime=_feats['regime'])
+                    return
+            except Exception as e_learn:
+                print(f"  ⚠️ [LEARN] refusal {symbol}: {e_learn}")
+        # ── fin LEARNING ENGINE Fase 5 ─────────────────────────────────────
 
         score = self._calcular_score_disparo(i1m, direction)
 

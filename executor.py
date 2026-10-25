@@ -313,6 +313,8 @@ class GridExecutor:
         self.signal_states = signal_states
         self.queue: asyncio.Queue = asyncio.Queue()
         self.notifier = None  # Inyectado desde fuera si existe
+        # LEARNING ENGINE (Fases 7/8): inyectado desde main.py si CONFIG.learning_enabled
+        self.learning_engine = None
 
         # FASE 4 PLAN 6.3: Executor 100% autónomo. Sin helper externo.
 
@@ -1581,6 +1583,18 @@ class GridExecutor:
             gs.posiciones.append(pos)
             pos_id = pos.id
 
+            # LEARNING ENGINE Fase 7: registrar entrada para exit_outcomes
+            # (sync + RAM-only, corrección C-2 — sin I/O en el hot loop)
+            if self.learning_engine is not None:
+                try:
+                    self.learning_engine.registrar_entrada(
+                        posicion_id=pos_id, symbol=state.symbol,
+                        direccion=pos.tipo, precio=float(price),
+                        qty=float(qty), grid_id=getattr(state, 'grid_id', None),
+                        tipo='REAL')
+                except Exception as e_learn:
+                    print(f"  ⚠️ [LEARN] registrar_entrada {pos_id}: {e_learn}")
+
         gs.fees_totales += fee_d
 
         # Actualizar posicion_neta del executor (para compatibilidad con código existente)
@@ -1685,6 +1699,14 @@ class GridExecutor:
                 del gs.ordenes_tp_pendientes[pos.id]
             pos.orden_cierre_id = None
             gs.trades_completados += 1
+            # LEARNING ENGINE Fase 7: salida por TAKE_PROFIT (sync, RAM-only)
+            if self.learning_engine is not None:
+                try:
+                    self.learning_engine.registrar_salida(
+                        posicion_id=pos.id, precio_salida=float(price),
+                        razon='TAKE_PROFIT')
+                except Exception as e_learn:
+                    print(f"  ⚠️ [LEARN] registrar_salida {pos.id}: {e_learn}")
             print(f"  ✅ [P2] {state.symbol} Pos {pos.id} CERRADA por fill {side} @ ${price:.4f} | "
                   f"Qty: {qty} | PnL tramo: {float(pnl_tramo):+.4f} | Fee: ${fee:.4f}")
         else:
@@ -1758,7 +1780,8 @@ class GridExecutor:
 
     def _cerrar_posicion_por_id(self, state: GridExecutionState, pos_id: str,
                                 precio_cierre: float, fee_cierre: float = 0.0,
-                                binance_order_id: str = None) -> bool:
+                                binance_order_id: str = None,
+                                razon: str = 'DESCONOCIDA') -> bool:
         """
         FASE 2.4: El executor cierra una posición por ID usando precio real.
         Reemplaza a GridSimulator.close_position_by_id().
@@ -1798,6 +1821,15 @@ class GridExecutor:
                 print(f"  [EXECUTOR] {state.symbol} Pos {pos_id} cerrada real "
                       f"@ ${precio_cierre:.4f} | PnL:{pnl:+.4f} | "
                       f"Fee cierre: ${fee_cierre:.4f}")
+                # LEARNING ENGINE Fase 7/8: persistir salida con razón
+                # (sync + RAM-only; el flush lo hace el loop de background)
+                if self.learning_engine is not None:
+                    try:
+                        self.learning_engine.registrar_salida(
+                            posicion_id=pos_id, precio_salida=float(precio_cierre),
+                            razon=razon)
+                    except Exception as e_learn:
+                        print(f"  ⚠️ [LEARN] registrar_salida {pos_id}: {e_learn}")
                 return True
         
         print(f"  [EXECUTOR] {state.symbol} Pos {pos_id} no encontrada para cierre")
@@ -2035,7 +2067,7 @@ class GridExecutor:
             params['niveles'] = [float(n) for n in niveles]
             params['qty_por_orden'] = qty
 
-            # 5. Guardar grid en SQLite
+            # 5. Guardar grid en MySQL/MariaDB
             grid_id = await guardar_grid_ejecucion(
                 symbol=symbol, direction=direction, trading_mode=CONFIG.trading_mode,
                 capital_asignado=CONFIG.trading_capital_max_usdt,
@@ -3253,6 +3285,59 @@ class GridExecutor:
         await self._monitorear_ordenes_abiertas(symbol, state)
 
         # ═══════════════════════════════════════════════════════════════════
+        # LEARNING ENGINE FASE 7/8 (correcciones C-2/C-5): trayectorias MFE/MAE
+        # + política dinámica de salida. Todo sync/RAM; persistencia en background.
+        #   SHADOW → solo log (predictions_log), nunca actúa
+        #   ACTIVE → CERRAR_AHORA (cierre de mercado, razon='TREND_END') /
+        #            TRAILING (cierre por retracción desde el pico — mecanismo
+        #            real de trailing; el TP de Binance no se toca)
+        # Va ANTES del kill switch para poder cerrar antes de una reversión.
+        # ═══════════════════════════════════════════════════════════════════
+        if (self.learning_engine is not None and
+                getattr(CONFIG, 'learning_exit_mode', 'OFF') != 'OFF'):
+            _modo_exit = CONFIG.learning_exit_mode
+            try:
+                _px = self.precios_vivo.get(symbol, 0)
+                _gs = state.grid_state
+                if _px > 0 and _gs:
+                    for _pos in list(_gs.posiciones):
+                        if _pos.estado != 'ABIERTA':
+                            continue
+                        self.learning_engine.track_position_trajectory(
+                            posicion_id=_pos.id, symbol=symbol, precio=float(_px))
+                        _pol = self.learning_engine.compute_exit_policy(
+                            symbol=symbol, posicion_id=_pos.id, precio_actual=float(_px))
+                        if _modo_exit == 'SHADOW':
+                            self.learning_engine.log_exit_shadow(_pos.id, _pol, symbol=symbol)
+                            continue
+                        if _pol['accion'] == 'CERRAR_AHORA':
+                            _ok = self._cerrar_posicion_por_id(
+                                state, _pos.id, float(_px), razon='TREND_END')
+                            if _ok:
+                                print(f"  🧠 [LEARN-EXIT] {symbol} {_pos.id} CERRADO "
+                                      f"por trend-end | prob={_pol.get('prob_reversion', 0):.2f}")
+                            continue
+                        if _pol['accion'] == 'TRAILING':
+                            _pos.trailing_stop_pct = _pol['trailing_stop']
+                            _tray = self.learning_engine.trayectoria(_pos.id)
+                            if _tray and _tray.get('mfe_pct', 0) > 0:
+                                _p0 = float(_pos.precio_ejecucion)
+                                if _pos.tipo == 'LONG':
+                                    _gan = (float(_px) - _p0) / _p0 * 100.0
+                                else:
+                                    _gan = (_p0 - float(_px)) / _p0 * 100.0
+                                _retrace = _tray['mfe_pct'] - _gan
+                                if _retrace >= _pos.trailing_stop_pct:
+                                    _ok = self._cerrar_posicion_por_id(
+                                        state, _pos.id, float(_px), razon='DINAMICA')
+                                    if _ok:
+                                        print(f"  🧠 [LEARN-EXIT] {symbol} {_pos.id} "
+                                              f"TRAILING disparado | retrace={_retrace:.2f}% "
+                                              f">= {_pos.trailing_stop_pct}%")
+            except Exception as e_learn:
+                print(f"  ⚠️ [LEARN-EXIT] {symbol}: {e_learn}")
+
+        # ═══════════════════════════════════════════════════════════════════
         # PASO 4: EVALUAR KILL SWITCH
         # ═══════════════════════════════════════════════════════════════════
         if state.grid_mode == 'NEUTRAL' and state.grid_state:
@@ -3621,7 +3706,7 @@ class GridExecutor:
         Cada trade genera un evento de PnL que se persiste inmediatamente en DB.
 
         FASE 1 FIX: Normaliza mapeo de claves entre API Binance (orderId, id, time)
-        y filas de SQLite (binance_order_id, binance_trade_id, timestamp_ms).
+        y filas de MySQL/MariaDB (binance_order_id, binance_trade_id, timestamp_ms).
         Evita KeyError cuando el trade proviene de fills_tracking (DB).
         """
         # ─── Normalización defensiva de claves (API vs DB) ───
@@ -4605,10 +4690,10 @@ class GridExecutor:
             from database_v5 import _get_db
             db = await _get_db()
 
-            # PnL de grids CERRADOS hoy (FIX: usar date() de SQLite, no string ISO)
+            # PnL de grids CERRADOS hoy (FIX: usar DATE() de MySQL, no string ISO)
             cursor = await db.execute(
                 "SELECT COALESCE(SUM(pnl_real), 0) FROM grid_ejecuciones "
-                "WHERE estado = 'CERRADO' AND date(closed_at) = date('now')"
+                "WHERE estado = 'CERRADO' AND DATE(closed_at) = CURRENT_DATE()"
             )
             row = await cursor.fetchone()
             pnl_cerrado = float(row[0]) if row and row[0] is not None else 0.0

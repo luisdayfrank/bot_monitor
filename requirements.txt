@@ -1,0 +1,40 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Bot Monitor — Dependencias (Windows)
+# Recomendado: Python 3.10 o 3.11 — NO 3.12+
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ─── Base de datos MySQL/MariaDB ───
+aiomysql>=0.2.0
+pymysql>=1.1.0
+
+# ─── Configuración y utilidades ───
+pydantic>=2.0
+pytz
+python-dotenv
+
+# ─── API / servidor web ───
+fastapi
+uvicorn
+websockets
+
+# ─── Trading Binance ───
+python-binance
+
+# ─── Análisis técnico ───
+# ⚠️ VERSIONES PINNEADAS: pandas_ta 0.3.14b0 es de 2021 y NO soporta
+# pandas 2.x (rompe con .append()) ni numpy 1.24+ (rompe con np.NaN).
+numpy>=1.21,<1.24
+pandas>=1.5,<2.0
+
+
+# ─── Notificaciones ───
+python-telegram-bot>=20.0,<22.0
+plyer
+
+
+#pip install "D:\papà\crypto_learning_engine\bot monitor version mysql\pandas-ta-main"
+#pkg_resources
+#pip install --force-reinstall "setuptools==80.9.0"
+#python -c "import pandas_ta as ta; print('pandas_ta OK:', ta.version)"
+
+

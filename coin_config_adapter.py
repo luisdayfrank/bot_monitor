@@ -21,6 +21,8 @@ _RANGOS = {
     'mfm_umbral': (0.05, 0.50),
     'grid_timeout': (5, 60),
     'volume_threshold': (0.1, 2.0),
+    # Learning Engine (Fase 5): umbral de refusal por moneda
+    'learning_refusal_threshold': (0.10, 0.80),
 }
 
 
@@ -57,6 +59,7 @@ def get_coin_config(symbol: str) -> dict:
             'mfm_umbral': CONFIG.mfm_umbral_alineacion,
             'grid_timeout': CONFIG.grid_neutral_timeout_min,
             'volume_threshold': 0.6,
+            'learning_refusal_threshold': CONFIG.learning_refusal_threshold,
         }
 
     if symbol in _CACHE:
@@ -80,6 +83,11 @@ def get_coin_config(symbol: str) -> dict:
         ),
         'base_threshold': _validar(
             raw.get('base_threshold'), int, (30, 95), 70
+        ),
+        # Learning Engine (Fase 5)
+        'learning_refusal_threshold': _validar(
+            raw.get('learning_refusal_threshold'), float,
+            _RANGOS['learning_refusal_threshold'], CONFIG.learning_refusal_threshold
         ),
     }
 
