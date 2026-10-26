@@ -311,7 +311,7 @@ class Config(BaseModel):
     db_port: int = int(os.getenv("DB_PORT", "3306"))
     db_user: str = os.getenv("DB_USER", "admin")
     db_password: str = os.getenv("DB_PASSWORD", "1605584496")
-    db_name: str = os.getenv("DB_NAME", "database-1")
+    db_name: str = os.getenv("DB_NAME", "crypto_monitor")
     db_connect_timeout: int = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))
 
     # Carpeta donde se exportan los reportes JSON de auditoría
