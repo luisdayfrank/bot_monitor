@@ -23,12 +23,23 @@ La capa traduce, de forma centralizada y segura:
     • CREATE INDEX IF NOT EXISTS -> portabilidad MySQL/MariaDB
 
 De este modo las funciones de negocio permanecen intactas.
+
+V6 (pool de conexiones): la conexión única persistente se sustituyó por un
+pool (min 2 / max 8). La API pública no cambia:
+    • `async with _db_lock:` sigue serializando las transacciones
+      multi-sentencia (INSERT + SELECT LAST_INSERT_ID(), batches con varios
+      statements, etc.) y además vincula una conexión del pool al bloque.
+    • El resto de operaciones (una sentencia: lecturas y escrituras sueltas)
+      usan el pool directamente, sin pasar por el lock global.
+    • `_get_db()` conserva la interfaz histórica (execute/executemany/commit/
+      rollback/close) sobre el pool.
 """
 
 import asyncio
 import re
 import time
 import warnings
+from contextlib import asynccontextmanager
 
 import aiomysql
 import pymysql
@@ -45,10 +56,13 @@ warnings.filterwarnings("ignore", message=".*already exists.*")
 warnings.filterwarnings("ignore", message=".*Duplicate entry.*")
 warnings.filterwarnings("ignore", message=".*PRIMARY KEY.*")
 
-# ─── Conexión persistente singleton ───
-_db_conn = None
-_db_lock = asyncio.Lock()          # serializa transacciones (igual que antes)
-_conn_lock = asyncio.Lock()        # protege la creación de la conexión
+# ─── Pool de conexiones (V6) ───
+_pool_q = None                     # asyncio.Queue con conexiones libres
+_pool_live = set()                 # conexiones creadas (para cierre total)
+_pool_crear_lock = asyncio.Lock()  # protege creación/cierre del pool
+_devoluciones_pendientes = []      # devoluciones diferidas (release síncrono)
+_POOL_MIN = 2                      # conexiones iniciales calientes
+_POOL_MAX = 8                      # conexiones simultáneas máximas
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -248,8 +262,8 @@ class _CompatConnection:
             await self._raw.ensure_closed()
 
 
-async def _crear_conexion():
-    """Crea una conexión MySQL/MariaDB con la sesión configurada."""
+async def _crear_conexion_raw():
+    """Crea una conexión MySQL/MariaDB cruda con la sesión configurada."""
     raw = await aiomysql.connect(
         host=CONFIG.db_host,
         port=CONFIG.db_port,
@@ -272,7 +286,12 @@ async def _crear_conexion():
         # Modo permisivo (sin STRICT_*): admite coerciones laxas y evita
         # errores por tipos laxos heredados.
         await cur.execute("SET SESSION sql_mode = 'NO_ENGINE_SUBSTITUTION'")
-    return _CompatConnection(raw)
+    return raw
+
+
+async def _crear_conexion():
+    """Crea una conexión MySQL/MariaDB con la sesión configurada."""
+    return _CompatConnection(await _crear_conexion_raw())
 
 
 # ─── Helpers de zona horaria ───
@@ -312,30 +331,288 @@ def now_utc():
     return datetime.now(pytz.UTC)
 
 
-async def _get_db():
-    """Obtiene o crea la conexión persistente a MySQL/MariaDB."""
-    global _db_conn
-    if _db_conn is not None and _db_conn._alive():
-        return _db_conn
-    async with _conn_lock:
-        if _db_conn is None or not _db_conn._alive():
-            if _db_conn is not None:
+# ═══════════════════════════════════════════════════════════════════════════
+# Pool de conexiones (V6): sustituye a la conexión única persistente
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def _pool_checkout():
+    """Obtiene una conexión cruda del pool (creando el pool si hace falta).
+
+    Las conexiones muertas (timeout del servidor, caídas de red) se descartan
+    y se sustituyen automáticamente por conexiones nuevas.
+    """
+    global _pool_q
+    # Drenar devoluciones diferidas (compat con release() síncrono del guard).
+    while _devoluciones_pendientes:
+        await _pool_devolver(_devoluciones_pendientes.pop(0))
+    while True:
+        if _pool_q is None:
+            async with _pool_crear_lock:
+                if _pool_q is None:
+                    _pool_q = asyncio.Queue()
+                    # Precalentar el mínimo de conexiones calientes.
+                    for _ in range(_POOL_MIN):
+                        raw = await _crear_conexion_raw()
+                        _pool_live.add(raw)
+                        _pool_q.put_nowait(raw)
+        raw = None
+        try:
+            raw = _pool_q.get_nowait()
+        except asyncio.QueueEmpty:
+            async with _pool_crear_lock:
+                if len(_pool_live) < _POOL_MAX:
+                    raw = await _crear_conexion_raw()
+                    _pool_live.add(raw)
+            if raw is None:
+                # Pool saturado: esperar una liberación (con timeout para
+                # revalidar por si hubo descartes de conexiones muertas).
                 try:
-                    await _db_conn.close()
+                    raw = await asyncio.wait_for(_pool_q.get(), 10.0)
+                except asyncio.TimeoutError:
+                    continue
+        if raw is None:
+            continue
+        if raw.closed:
+            # Conexión muerta: descartarla; el bucle creará su sustituta.
+            _pool_live.discard(raw)
+            try:
+                await raw.ensure_closed()
+            except Exception:
+                pass
+            continue
+        # Ping solo a las conexiones que llevan rato ociosas (evita zombies
+        # tras el wait_timeout del servidor) sin penalizar las calientes.
+        if time.time() - getattr(raw, "_ts_devuelta", 0.0) > 30:
+            try:
+                await raw.ping(reconnect=False)
+            except Exception:
+                _pool_live.discard(raw)
+                try:
+                    await raw.ensure_closed()
                 except Exception:
                     pass
-            _db_conn = await _crear_conexion()
-    return _db_conn
+                continue
+        return raw
+
+
+async def _pool_devolver(raw, descartar=False):
+    """Devuelve una conexión al pool tras hacer rollback de lo no confirmado."""
+    if raw is None:
+        return
+    if descartar or raw.closed:
+        try:
+            await raw.ensure_closed()
+        except Exception:
+            pass
+    else:
+        try:
+            await raw.rollback()
+            raw._ts_devuelta = time.time()
+        except Exception:
+            try:
+                await raw.ensure_closed()
+            except Exception:
+                pass
+    # Se devuelve siempre (aunque esté cerrada) para despertar a quien espere
+    # una conexión; el siguiente checkout la descarta y crea su sustituta.
+    if _pool_q is not None:
+        _pool_q.put_nowait(raw)
+
+
+@asynccontextmanager
+async def _conexion():
+    """Reserva una conexión del pool para un bloque de operaciones.
+
+    Dentro de `async with _db_lock` reutiliza la conexión vinculada al bloque
+    (todas las operaciones comparten la misma transacción). Fuera de un bloque,
+    toma una conexión propia del pool y la devuelve al terminar, haciendo
+    rollback de lo que no se haya confirmado explícitamente.
+    """
+    vinculada = _db_lock._conn_de_tarea_actual()
+    if vinculada is not None:
+        yield vinculada
+        return
+    raw = await _pool_checkout()
+    conn = _CompatConnection(raw)
+    descartar = False
+    try:
+        yield conn
+    except Exception as e:
+        descartar = _is_transient(e)
+        raise
+    finally:
+        await _pool_devolver(raw, descartar=descartar)
+
+
+class _TxGuard:
+    """`async with _db_lock:` que serializa transacciones multi-sentencia.
+
+    Mantiene la semántica del asyncio.Lock original (un solo bloque activo a la
+    vez, no reentrante) y además vincula una conexión del pool al bloque: todas
+    las operaciones hechas durante el bloque usan esa misma conexión y, por
+    tanto, la misma transacción. Al salir se hace rollback de lo no confirmado
+    y la conexión vuelve al pool.
+    """
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._owner = None
+        self._conn = None
+
+    # ── API de asyncio.Lock (compatibilidad) ──
+    def locked(self):
+        return self._lock.locked()
+
+    async def acquire(self):
+        await self._lock.acquire()
+        try:
+            conn = _CompatConnection(await _pool_checkout())
+        except BaseException:
+            self._lock.release()
+            raise
+        self._owner = asyncio.current_task()
+        self._conn = conn
+        return True
+
+    def release(self):
+        conn, self._conn = self._conn, None
+        self._owner = None
+        self._lock.release()
+        if conn is not None:
+            # release() es síncrono: la devolución al pool se hace en segundo plano.
+            try:
+                asyncio.get_running_loop().create_task(_pool_devolver(conn._raw))
+            except Exception:
+                _devoluciones_pendientes.append(conn._raw)
+
+    # ── Uso normal ──
+    async def __aenter__(self):
+        await self.acquire()
+        return None
+
+    async def __aexit__(self, exc_type, exc, tb):
+        conn, self._conn = self._conn, None
+        self._owner = None
+        try:
+            if conn is not None:
+                await _pool_devolver(
+                    conn._raw,
+                    descartar=exc_type is not None and _is_transient(exc),
+                )
+        finally:
+            self._lock.release()
+        return False
+
+    def _conn_de_tarea_actual(self):
+        """Conexión vinculada al bloque si la tarea actual lo está ejecutando."""
+        if self._owner is not None and self._owner is asyncio.current_task():
+            return self._conn
+        return None
+
+
+_db_lock = _TxGuard()          # serializa transacciones multi-sentencia
+
+
+_RE_LAST_INSERT_ID = re.compile(
+    r"^\s*SELECT\s+LAST_INSERT_ID\s*\(\s*\)\s*;?\s*$", re.I)
+
+
+class _DbHandle:
+    """Manejador con la interfaz de la conexión histórica, respaldado por el pool.
+
+    • Dentro de `async with _db_lock` usa la conexión vinculada al bloque: los
+      INSERT + SELECT LAST_INSERT_ID() siguen siendo atómicos.
+    • Fuera de un bloque, cada operación usa una conexión del pool y las
+      escrituras de una sentencia se confirman automáticamente.
+    """
+
+    row_factory = Row
+
+    def __init__(self):
+        self._lastrowid = None
+
+    def _vinculada(self):
+        return _db_lock._conn_de_tarea_actual()
+
+    async def execute(self, sql, params=()):
+        conn = self._vinculada()
+        if conn is not None:
+            cur = await conn.execute(sql, params)
+            if cur.lastrowid:
+                self._lastrowid = cur.lastrowid
+            return cur
+        # Compat: SELECT LAST_INSERT_ID() sin transacción abierta devuelve el
+        # último ID observado por este manejador.
+        if _RE_LAST_INSERT_ID.match(sql or ""):
+            return _CompatCursor(("LAST_INSERT_ID()",),
+                                 [(self._lastrowid or 0,)])
+        async with _conexion() as db:
+            cur = await db.execute(sql, params)
+            if cur.lastrowid:
+                self._lastrowid = cur.lastrowid
+            if not cur._cols:
+                await db.commit()   # escritura de una sentencia
+            return cur
+
+    async def executemany(self, sql, seq):
+        conn = self._vinculada()
+        if conn is not None:
+            cur = await conn.executemany(sql, seq)
+            if cur.lastrowid:
+                self._lastrowid = cur.lastrowid
+            return cur
+        async with _conexion() as db:
+            cur = await db.executemany(sql, seq)
+            if cur.lastrowid:
+                self._lastrowid = cur.lastrowid
+            await db.commit()
+            return cur
+
+    async def commit(self):
+        # Fuera de un bloque cada operación ya se confirma por sí misma.
+        conn = self._vinculada()
+        if conn is not None:
+            await conn.commit()
+
+    async def rollback(self):
+        conn = self._vinculada()
+        if conn is not None:
+            await conn.rollback()
+
+    async def close(self):
+        # La conexión vuelve al pool al terminar cada operación / bloque.
+        return None
+
+
+_db_handle = _DbHandle()
+
+
+async def _get_db():
+    """Obtiene el manejador de base de datos (misma interfaz que antes).
+
+    Desde la V6 no existe una única conexión persistente: las operaciones usan
+    un pool de conexiones (ver `_DbHandle` y `_conexion`).
+    """
+    return _db_handle
 
 
 async def close_db():
-    """Cierra la conexión persistente."""
-    global _db_conn
-    if _db_conn:
+    """Cierra el pool de conexiones."""
+    global _pool_q
+    async with _pool_crear_lock:
+        pendientes = list(_devoluciones_pendientes)
+        _devoluciones_pendientes.clear()
+        vivas = list(_pool_live)
+        _pool_live.clear()
+        q, _pool_q = _pool_q, None
+    for raw in vivas + pendientes:
         try:
-            await _db_conn.close()
-        finally:
-            _db_conn = None
+            await raw.ensure_closed()
+        except Exception:
+            pass
+    if q is not None:
+        while not q.empty():
+            q.get_nowait()
 
 
 # Códigos / mensajes transitorios que se reintentan.
@@ -361,28 +638,28 @@ def _is_missing_index(e: Exception) -> bool:
             or (e.args and isinstance(e.args[0], int) and e.args[0] == 1061))
 
 
-async def _execute_with_retry(sql, params=(), max_retries=10):
-    """Ejecuta SQL con retry automático ante bloqueos / desconexiones transitorias."""
+async def _execute_with_retry(sql, params=(), max_retries=10, seq=None):
+    """Ejecuta SQL (una sentencia) con retry automático ante fallos transitorios.
+
+    V6: usa una conexión del pool por intento y NO toma `_db_lock`: una sentencia
+    individual ya es atómica, así que las escrituras de una sentencia y las
+    lecturas ya no se serializan con el resto del bot. Las transacciones
+    multi-sentencia siguen usando `async with _db_lock`.
+    Pasando `seq=[...]` ejecuta `executemany` en lugar de `execute`.
+    """
     for attempt in range(max_retries):
-        db = await _get_db()
         try:
-            async with _db_lock:
-                await db.execute(sql, params)
+            async with _conexion() as db:
+                if seq is not None:
+                    await db.executemany(sql, seq)
+                else:
+                    await db.execute(sql, params)
                 await db.commit()
             return True
         except Exception as e:
             if _is_transient(e) and attempt < max_retries - 1:
                 wait = 0.5 * (2 ** attempt)  # 0.5, 1.0, 2.0, 4.0, 8.0s
                 print(f"  ⚠️ DB transitorio (intento {attempt+1}/{max_retries}), esperando {wait}s...")
-                # Forzar reconexión en el próximo intento si hubo desconexión.
-                if not _is_missing_index(e):
-                    global _db_conn
-                    try:
-                        if _db_conn is not None and not _db_conn._alive():
-                            await _db_conn.close()
-                            _db_conn = None
-                    except Exception:
-                        _db_conn = None
                 await asyncio.sleep(wait)
             else:
                 print(f"  ❌ DB error definitivo: {e}")
@@ -876,30 +1153,26 @@ async def insertar_velas_batch(symbol: str, tf: str, velas: list):
     if not velas:
         return
 
-    db = await _get_db()
-    async with _db_lock:
-        try:
-            await db.executemany(
-                f"""
-                REPLACE INTO {tabla}
-                (symbol, timestamp, open, high, low, close, volume)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                [(symbol, v['timestamp'], v['open'], v['high'], v['low'], v['close'], v['volume']) 
+    try:
+        await _execute_with_retry(
+            f"""
+            REPLACE INTO {tabla}
+            (symbol, timestamp, open, high, low, close, volume)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            seq=[(symbol, v['timestamp'], v['open'], v['high'], v['low'], v['close'], v['volume'])
                  for v in velas]
-            )
-            await db.commit()
-            print(f"  💾 [DB] Batch insert: {len(velas)} velas {tf} para {symbol}")
-        except Exception as e:
-            print(f"  ⚠️ [DB] Error en batch insert {tf} {symbol}: {e}")
+        )
+        print(f"  💾 [DB] Batch insert: {len(velas)} velas {tf} para {symbol}")
+    except Exception as e:
+        print(f"  ⚠️ [DB] Error en batch insert {tf} {symbol}: {e}")
 
 async def cargar_velas_historicas(symbol: str, tf: str, limit: int):
     tabla = _TABLAS_VELAS.get(tf)
     if not tabla:
         print(f"  ⚠️ [DB] Timeframe inválido '{tf}' para {symbol}, no se pueden cargar velas")
         return []
-    db = await _get_db()
-    async with _db_lock:
+    async with _conexion() as db:
         db.row_factory = Row
         cursor = await db.execute(
             f"SELECT * FROM {tabla} WHERE symbol = ? ORDER BY timestamp DESC LIMIT ?",
@@ -928,21 +1201,14 @@ async def actualizar_precios_vivo_batch(precios: dict):
     """Actualiza múltiples precios en una sola transacción (batch)."""
     if not precios:
         return
-    db = await _get_db()
     ts = datetime.utcnow().isoformat()
-    async with _db_lock:
-        try:
-            await db.executemany(
-                "REPLACE INTO precios_vivo (symbol, precio, actualizado) VALUES (?, ?, ?)",
-                [(symbol, precio, ts) for symbol, precio in precios.items()]
-            )
-            await db.commit()
-        except Exception as e:
-            print(f"  ⚠️ Error en batch precios vivo: {e}")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# FASE 4.5: FUNCIONES DE AUDITORÍA
-# ═══════════════════════════════════════════════════════════════════════════════
+    try:
+        await _execute_with_retry(
+            "REPLACE INTO precios_vivo (symbol, precio, actualizado) VALUES (?, ?, ?)",
+            seq=[(symbol, precio, ts) for symbol, precio in precios.items()],
+        )
+    except Exception as e:
+        print(f"  ⚠️ Error en batch precios vivo: {e}")
 
 async def guardar_evento_auditoria(symbol, timestamp_utc, tipo, direccion=None, precio=None,
                                   contexto_json=None, grid_params_json=None, score=None,
@@ -1058,8 +1324,7 @@ async def guardar_disparo_activo(evento_id, symbol, timestamp_utc, precio_entrad
 
 async def cargar_disparos_activos():
     """Carga todos los disparos activos persistentes (útil al reiniciar el bot)."""
-    db = await _get_db()
-    async with _db_lock:
+    async with _conexion() as db:
         db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM auditoria_disparos_activos
@@ -1106,8 +1371,7 @@ async def eliminar_disparo_activo(evento_id):
 
 async def cargar_eventos_dia(fecha_local: str):
     """Carga todos los eventos de auditoría de un día específico (fecha local)."""
-    db = await _get_db()
-    async with _db_lock:
+    async with _conexion() as db:
         db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM auditoria_eventos
@@ -1119,8 +1383,7 @@ async def cargar_eventos_dia(fecha_local: str):
 
 async def cargar_muestras_post_evento(evento_id: int):
     """Carga las muestras post-disparo de un evento específico."""
-    db = await _get_db()
-    async with _db_lock:
+    async with _conexion() as db:
         db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM auditoria_muestras_post
@@ -1132,8 +1395,7 @@ async def cargar_muestras_post_evento(evento_id: int):
 
 async def cargar_eventos_post_evento(evento_id: int):
     """Carga los eventos significativos post-disparo de un evento específico."""
-    db = await _get_db()
-    async with _db_lock:
+    async with _conexion() as db:
         db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM auditoria_eventos_post
@@ -1145,8 +1407,7 @@ async def cargar_eventos_post_evento(evento_id: int):
 
 async def cargar_velas_post_evento(evento_id: int):
     """Carga las velas 15m posteriores de un evento específico."""
-    db = await _get_db()
-    async with _db_lock:
+    async with _conexion() as db:
         db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM auditoria_velas_post
@@ -1231,8 +1492,7 @@ async def finalizar_near_miss_seguimiento(seguimiento_id, timestamp_fin, precio_
 
 async def cargar_near_miss_seguimientos_dia(fecha_local: str):
     """Carga todos los seguimientos de un día específico (fecha local)."""
-    db = await _get_db()
-    async with _db_lock:
+    async with _conexion() as db:
         db.row_factory = Row
         # Convertir fecha local a rango de timestamps UTC para la consulta
         tz = get_tz()
@@ -1253,8 +1513,7 @@ async def cargar_near_miss_seguimientos_dia(fecha_local: str):
 
 async def cargar_near_miss_seguimientos_activos():
     """Carga seguimientos que aún no han finalizado (timestamp_fin IS NULL)."""
-    db = await _get_db()
-    async with _db_lock:
+    async with _conexion() as db:
         db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM near_miss_seguimientos
@@ -1415,8 +1674,7 @@ async def actualizar_grid_simulacion(grid_id, estado=None, timestamp_fin=None, p
 
 async def cargar_grid_activo(symbol):
     """Carga el grid activo más reciente para un símbolo."""
-    db = await _get_db()
-    async with _db_lock:
+    async with _conexion() as db:
         db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM grid_estados
@@ -1429,8 +1687,7 @@ async def cargar_grid_activo(symbol):
 
 async def cargar_simulacion_activa(grid_id):
     """Carga la simulación activa para un grid_id."""
-    db = await _get_db()
-    async with _db_lock:
+    async with _conexion() as db:
         db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM grid_simulaciones
@@ -1443,9 +1700,8 @@ async def cargar_simulacion_activa(grid_id):
 
 async def cargar_grids_huerfanos(timeout_seg):
     """Carga grids ACTIVOS sin simulación activa durante más de timeout_seg."""
-    db = await _get_db()
     ahora = int(datetime.now(pytz.UTC).timestamp())
-    async with _db_lock:
+    async with _conexion() as db:
         db.row_factory = Row
         cursor = await db.execute("""
             SELECT g.id, g.symbol, g.timestamp_inicio
@@ -1538,8 +1794,7 @@ async def guardar_grid_estado_atomico(symbol, timestamp_inicio, precio_inicio, g
 
 async def cargar_todos_grids_activos():
     """Carga todos los grids activos con su simulación."""
-    db = await _get_db()
-    async with _db_lock:
+    async with _conexion() as db:
         db.row_factory = Row
         cursor = await db.execute("""
             SELECT g.id as grid_id, g.symbol, g.timestamp_inicio, g.estado as grid_estado,
@@ -1634,8 +1889,7 @@ async def actualizar_orden_fill(orden_id, binance_trade_id, price, qty, commissi
 
 async def cargar_grid_ejecuciones_activos():
     """Carga grids de ejecución en estado ACTIVO."""
-    db = await _get_db()
-    async with _db_lock:
+    async with _conexion() as db:
         db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM grid_ejecuciones WHERE estado = 'ACTIVO' ORDER BY created_at ASC
@@ -1646,8 +1900,7 @@ async def cargar_grid_ejecuciones_activos():
 
 async def cargar_ordenes_por_grid(grid_ejecucion_id):
     """Carga órdenes de un grid de ejecución."""
-    db = await _get_db()
-    async with _db_lock:
+    async with _conexion() as db:
         db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM grid_ejecucion_ordenes WHERE grid_ejecucion_id = ? ORDER BY id ASC
@@ -1688,8 +1941,7 @@ async def guardar_fill_tracking(grid_ejecucion_id, symbol,
 
 async def cargar_fills_sin_procesar(grid_ejecucion_id):
     """Carga fills no procesados de un grid."""
-    db = await _get_db()
-    async with _db_lock:
+    async with _conexion() as db:
         db.row_factory = Row
         cursor = await db.execute("""
             SELECT * FROM fills_tracking
@@ -1711,8 +1963,7 @@ async def marcar_fill_procesado(fill_id, posicion_id):
 
 async def obtener_ultimo_trade_timestamp(symbol):
     """Obtiene el timestamp del último trade procesado para un símbolo."""
-    db = await _get_db()
-    async with _db_lock:
+    async with _conexion() as db:
         cursor = await db.execute("""
             SELECT MAX(timestamp_ms) FROM fills_tracking WHERE symbol = ?
         """, (symbol,))
@@ -1744,8 +1995,7 @@ async def guardar_pnl_evento(grid_ejecucion_id: int, symbol: str, tipo_evento: s
 
 async def calcular_pnl_acumulado(grid_ejecucion_id: int) -> dict:
     """Calcula PnL acumulado desde la base de datos (fuente de verdad)."""
-    db = await _get_db()
-    async with _db_lock:
+    async with _conexion() as db:
         cursor = await db.execute("""
             SELECT COALESCE(SUM(realized_pnl), 0) as pnl_total,
                    COALESCE(SUM(commission), 0) as fees_total,
@@ -1770,8 +2020,7 @@ async def calcular_pnl_acumulado(grid_ejecucion_id: int) -> dict:
 
 async def obtener_pnl_por_tipo(grid_ejecucion_id: int) -> dict:
     """Desglose de PnL por tipo de evento."""
-    db = await _get_db()
-    async with _db_lock:
+    async with _conexion() as db:
         cursor = await db.execute("""
             SELECT tipo_evento, COALESCE(SUM(realized_pnl), 0), COUNT(*)
             FROM pnl_eventos
@@ -1810,8 +2059,7 @@ async def guardar_niveles_grid(grid_id: int, rows: list):
 
 async def cargar_niveles_grid(grid_id: int) -> list:
     """Carga niveles de un grid desde DB."""
-    db = await _get_db()
-    async with _db_lock:
+    async with _conexion() as db:
         db.row_factory = Row
         cursor = await db.execute(
             "SELECT * FROM grid_niveles WHERE grid_ejecucion_id = ? ORDER BY level_index",
@@ -1822,17 +2070,14 @@ async def cargar_niveles_grid(grid_id: int) -> list:
 
 async def actualizar_nivel_grid(grid_id: int, level_index: int, **campos):
     """Actualiza campos específicos de un nivel."""
-    db = await _get_db()
     sets = [f"{k} = ?" for k in campos.keys()]
     vals = list(campos.values())
     vals.extend([int(time.time()), grid_id, level_index])
 
-    async with _db_lock:
-        await db.execute(
-            f"UPDATE grid_niveles SET {', '.join(sets)}, updated_at = ? WHERE grid_ejecucion_id = ? AND level_index = ?",
-            tuple(vals)
-        )
-        await db.commit()
+    await _execute_with_retry(
+        f"UPDATE grid_niveles SET {', '.join(sets)}, updated_at = ? WHERE grid_ejecucion_id = ? AND level_index = ?",
+        tuple(vals)
+    )
 
 async def actualizar_grid_engine_version(grid_id: int, version: int):
     """Actualiza la versión del engine de un grid."""
@@ -1850,8 +2095,7 @@ async def actualizar_order_id_counter(grid_id: int, counter: int):
 
 async def cargar_order_id_counter(grid_id: int) -> int:
     """Carga el contador de order IDs para un grid."""
-    db = await _get_db()
-    async with _db_lock:
+    async with _conexion() as db:
         cursor = await db.execute(
             "SELECT order_id_counter FROM grid_ejecuciones WHERE id = ?",
             (grid_id,)
@@ -1862,20 +2106,15 @@ async def cargar_order_id_counter(grid_id: int) -> int:
 async def guardar_snapshot_engine(grid_id: int, level_map_json: str,
                                    coverage_report_json: str = None):
     """Guarda snapshot del engine para debugging."""
-    db = await _get_db()
-    async with _db_lock:
-        await db.execute("""
-            INSERT INTO grid_engine_snapshots
-            (grid_ejecucion_id, timestamp_ms, level_map_json, coverage_report_json, created_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (grid_id, int(time.time() * 1000), level_map_json, coverage_report_json, int(time.time())))
-        await db.commit()
-
+    await _execute_with_retry("""
+        INSERT INTO grid_engine_snapshots
+        (grid_ejecucion_id, timestamp_ms, level_map_json, coverage_report_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (grid_id, int(time.time() * 1000), level_map_json, coverage_report_json, int(time.time())))
 
 async def obtener_tamano_db_mb():
     """Tamaño aproximado de la base de datos (MB) desde information_schema."""
-    db = await _get_db()
-    async with _db_lock:
+    async with _conexion() as db:
         cursor = await db.execute(
             "SELECT COALESCE(SUM(data_length + index_length), 0) "
             "FROM information_schema.TABLES WHERE table_schema = DATABASE()"
