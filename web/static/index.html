@@ -336,9 +336,14 @@
                 <div class="flex items-center justify-between mb-2">
                     <div>
                         <h2 class="text-2xl font-bold text-white">Rendimiento del Bot</h2>
-                        <p class="text-xs text-gray-500 mb-6">Datos extraídos directamente de la base de datos SQLite — V6.2</p>
+                        <p class="text-xs text-gray-500 mb-6">Datos extraídos directamente de la base de datos MySQL/MariaDB — V6.2</p>
                     </div>
                     <div class="flex items-center gap-2">
+                        <select id="stats-periodo" class="text-xs px-2 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded-lg transition" onchange="onStatsPeriodoChange()">
+                            <option value="1">Hoy</option>
+                            <option value="7" selected>7 días</option>
+                            <option value="30">30 días</option>
+                        </select>
                         <button onclick="exportStatsCSV()" class="text-xs px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded-lg transition flex items-center gap-1">
                             <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
                             CSV
@@ -352,7 +357,7 @@
                     <div class="bg-gray-800/40 p-4 rounded-xl border border-gray-700/50 hover:border-red-500/30 transition">
                         <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
                             <span class="w-2 h-2 rounded-full bg-red-500"></span>
-                            🔥 Fires Hoy
+                            🔥 <span id="lbl-fires">Fires</span>
                         </div>
                         <div class="text-3xl font-mono text-white" id="stat-fires">--</div>
                         <div class="text-xs text-gray-600 mt-1">Disparos ejecutados</div>
@@ -360,7 +365,7 @@
                     <div class="bg-gray-800/40 p-4 rounded-xl border border-gray-700/50 hover:border-orange-500/30 transition">
                         <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
                             <span class="w-2 h-2 rounded-full bg-orange-500"></span>
-                            ❌ Rechazados Hoy
+                            ❌ <span id="lbl-rechazados">Rechazados</span>
                         </div>
                         <div class="text-3xl font-mono text-orange-400" id="stat-rechazados">--</div>
                         <div class="text-xs text-gray-600 mt-1">Por filtros macro / gatillo 1m</div>
@@ -396,7 +401,7 @@
                     <div class="bg-gray-800/40 p-4 rounded-xl border border-gray-700/50 hover:border-pink-500/30 transition">
                         <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
                             <span class="w-2 h-2 rounded-full bg-pink-500"></span>
-                            💰 PnL Real Hoy
+                            💰 <span id="lbl-pnl">PnL Real</span>
                         </div>
                         <div class="text-3xl font-mono" id="stat-pnl-real">--</div>
                         <div class="text-xs text-gray-600 mt-1">Cerrados + activos (executor)</div>
@@ -404,7 +409,7 @@
                     <div class="bg-gray-800/40 p-4 rounded-xl border border-gray-700/50 hover:border-gray-500/30 transition">
                         <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
                             <span class="w-2 h-2 rounded-full bg-gray-500"></span>
-                            🧾 Fees Reales Hoy
+                            🧾 <span id="lbl-fees">Fees Reales</span>
                         </div>
                         <div class="text-3xl font-mono text-gray-400" id="stat-fees-real">--</div>
                         <div class="text-xs text-gray-600 mt-1">Comisiones pagadas a Binance</div>
@@ -415,7 +420,7 @@
                             ⚡ Circuit Breakers
                         </div>
                         <div class="text-3xl font-mono text-yellow-400" id="stat-cb">--</div>
-                        <div class="text-xs text-gray-600 mt-1">Activaciones hoy</div>
+                        <div class="text-xs text-gray-600 mt-1">Activaciones del período</div>
                     </div>
                 </div>
 
@@ -565,7 +570,7 @@
                         </div>
                         <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
                             <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
-                                <h3 class="text-sm font-bold text-gray-300 mb-2">📊 Distribución de Eventos Hoy</h3>
+                                <h3 class="text-sm font-bold text-gray-300 mb-2">📊 Distribución de Eventos</h3>
                                 <div id="chart-distribucion" class="h-64"></div>
                             </div>
                             <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
@@ -941,12 +946,30 @@
         // ============================================
         // V6.2: RESUMEN GLOBAL (MEJORADO)
         // ============================================
+        function getStatsDias() {
+            const el = document.getElementById('stats-periodo');
+            return el ? parseInt(el.value, 10) || 7 : 7;
+        }
+
+        function onStatsPeriodoChange() {
+            const dias = getStatsDias();
+            const periodo = dias === 1 ? 'Hoy' : `Últimos ${dias} días`;
+            if (document.getElementById('lbl-fires')) document.getElementById('lbl-fires').innerText = `Fires (${periodo})`;
+            if (document.getElementById('lbl-rechazados')) document.getElementById('lbl-rechazados').innerText = `Rechazados (${periodo})`;
+            if (document.getElementById('lbl-pnl')) document.getElementById('lbl-pnl').innerText = `PnL Real (${periodo})`;
+            if (document.getElementById('lbl-fees')) document.getElementById('lbl-fees').innerText = `Fees Reales (${periodo})`;
+            fetchStats();
+            if (!document.getElementById('analysis-resumen').classList.contains('hidden')) loadResumenGlobal();
+            if (!document.getElementById('analysis-filters').classList.contains('hidden')) loadFilters();
+        }
+
         async function loadResumenGlobal() {
+            const dias = getStatsDias();
             try {
                 const [res, scoreRes, dirRes] = await Promise.all([
-                    fetch('/api/stats/extended'),
-                    fetch('/api/stats/score-distribution'),
-                    fetch('/api/stats/direction-pnl?dias=7')
+                    fetch(`/api/stats/extended?dias=${dias}`),
+                    fetch(`/api/stats/score-distribution?dias=${dias}`),
+                    fetch(`/api/stats/direction-pnl?dias=${dias}`)
                 ]);
                 const d = await res.json();
                 const scoreD = await scoreRes.json();
@@ -1314,11 +1337,12 @@
         // V6.2: FILTROS (EFICIENCIA + OPORTUNIDADES)
         // ============================================
         async function loadFilters() {
+            const dias = getStatsDias();
             try {
                 const [feRes, moRes, latRes] = await Promise.all([
-                    fetch('/api/stats/filter-efficiency'),
-                    fetch('/api/stats/missed-opportunities'),
-                    fetch('/api/stats/latency')
+                    fetch(`/api/stats/filter-efficiency?dias=${dias}`),
+                    fetch(`/api/stats/missed-opportunities?dias=${dias}`),
+                    fetch(`/api/stats/latency?dias=${dias}`)
                 ]);
                 const fe = await feRes.json();
                 const mo = await moRes.json();
@@ -1462,11 +1486,12 @@
         }
 
         function exportStatsCSV() {
-            // Exporta resumen de stats
+            const dias = getStatsDias();
+            const periodo = dias === 1 ? 'Hoy' : `${dias}d`;
             const data = [
                 ['Métrica', 'Valor'],
-                ['Fires Hoy', document.getElementById('stat-fires').innerText],
-                ['Rechazados Hoy', document.getElementById('stat-rechazados').innerText],
+                [`Fires (${periodo})`, document.getElementById('stat-fires').innerText],
+                [`Rechazados (${periodo})`, document.getElementById('stat-rechazados').innerText],
                 ['NM Finalizados', document.getElementById('stat-finalizados').innerText],
                 ['Win Rate', document.getElementById('stat-winrate').innerText],
                 ['Grids Activos', document.getElementById('stat-grids-activos').innerText],
@@ -1572,7 +1597,7 @@
         function renderRechazos(d) {
             const container = document.getElementById('rechazos-container');
             if (!d.causas || d.causas.length === 0) {
-                container.innerHTML = '<div class="text-xs text-gray-500 text-center py-4">Sin rechazos hoy</div>';
+                container.innerHTML = '<div class="text-xs text-gray-500 text-center py-4">Sin rechazos en el período</div>';
                 return;
             }
             const total = d.total_rechazos;
@@ -1593,8 +1618,9 @@
         }
 
         async function fetchStats() {
+            const dias = getStatsDias();
             try {
-                const res = await fetch('/api/stats/summary');
+                const res = await fetch(`/api/stats/summary?dias=${dias}`);
                 const data = await res.json();
 
                 if (data.estado === 'success') {
@@ -1666,19 +1692,19 @@
             } catch (e) { console.error("[STATS] Error cargando summary:", e); }
 
             try {
-                const res2 = await fetch('/api/stats/per-coin');
+                const res2 = await fetch(`/api/stats/per-coin?dias=${dias}`);
                 const d2 = await res2.json();
                 if (d2.estado === 'success') renderRanking(d2.data);
             } catch (e) { console.error("[STATS] Error per-coin:", e); }
 
             try {
-                const res3 = await fetch('/api/stats/funnel');
+                const res3 = await fetch(`/api/stats/funnel?dias=${dias}`);
                 const d3 = await res3.json();
                 if (d3.estado === 'success') renderFunnel(d3);
             } catch (e) { console.error("[STATS] Error funnel:", e); }
 
             try {
-                const res4 = await fetch('/api/stats/rechazos');
+                const res4 = await fetch(`/api/stats/rechazos?dias=${dias}`);
                 const d4 = await res4.json();
                 if (d4.estado === 'success') renderRechazos(d4);
             } catch (e) { console.error("[STATS] Error rechazos:", e); }
