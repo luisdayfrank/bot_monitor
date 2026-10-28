@@ -113,6 +113,13 @@ class _CompatCursor:
         self.rowcount = rowcount
         self.lastrowid = lastrowid
 
+    @property
+    def description(self):
+        """DB-API 2.0: None sin resultset, si no secuencia de 7-tuplas por columna."""
+        if not self._cols:
+            return None
+        return tuple((c, None, None, None, None, None, None) for c in self._cols)
+
     def _mk(self, r):
         return Row(self._cols, r)
 

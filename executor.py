@@ -1069,6 +1069,98 @@ class GridExecutor:
     # APALANCAMIENTO ADAPTATIVO
     # ═══════════════════════════════════════════════════════════════════════════════
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # V6.0 PUNTO 3d: HARD STOP POR PRECIO ADVERSO
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _calcular_adverse_price_pct(self, state: GridExecutionState,
+                                    precio_actual: float) -> float:
+        """
+        Calcula el % adverso del precio actual respecto al precio de entrada
+        promedio ponderado por qty de las posiciones abiertas.
+
+        Retorna 0.0 si no hay posiciones abiertas o no hay datos suficientes.
+        Retorna positivo si el precio se movió en CONTRA de las posiciones
+        (LONG con precio bajando, SHORT con precio subiendo).
+
+        Leverage-independiente: mide movimiento de PRECIO, no de PnL.
+
+        NOTA: es una métrica DISTINTA al aborto macro por EMA50
+        (grid_neutral_aborto_precio_pct): éste mide |precio - EMA50| / EMA50.
+        Ambos son complementarios, no comparables uno a uno.
+        """
+        if not state.grid_state:
+            return 0.0
+        gs = state.grid_state
+
+        # Separar piernas por tipo (solo posiciones realmente abiertas)
+        longs = [p for p in gs.posiciones if p.estado == 'ABIERTA' and p.tipo == 'LONG']
+        shorts = [p for p in gs.posiciones if p.estado == 'ABIERTA' and p.tipo == 'SHORT']
+
+        if not longs and not shorts:
+            return 0.0
+
+        precio_d = Decimal(str(precio_actual))
+        if precio_d <= 0:
+            return 0.0
+
+        # Adversidad de los LONGs (precio cae por debajo de la entrada media)
+        adverse_long_pct = 0.0
+        if longs:
+            qty_total = sum((p.qty for p in longs), Decimal('0'))
+            if qty_total > 0:
+                entry_promedio = sum((p.precio_ejecucion * p.qty for p in longs),
+                                     Decimal('0')) / qty_total
+                if entry_promedio > 0 and precio_d < entry_promedio:
+                    adverse_long_pct = float(
+                        (entry_promedio - precio_d) / entry_promedio * Decimal('100'))
+
+        # Adversidad de los SHORTs (precio sube por encima de la entrada media)
+        adverse_short_pct = 0.0
+        if shorts:
+            qty_total = sum((p.qty for p in shorts), Decimal('0'))
+            if qty_total > 0:
+                entry_promedio = sum((p.precio_ejecucion * p.qty for p in shorts),
+                                     Decimal('0')) / qty_total
+                if entry_promedio > 0 and precio_d > entry_promedio:
+                    adverse_short_pct = float(
+                        (precio_d - entry_promedio) / entry_promedio * Decimal('100'))
+
+        # El grid está en riesgo si CUALQUIERA de las piernas sufre adversidad
+        return max(adverse_long_pct, adverse_short_pct)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # V6.0 PUNTO 4: LÍMITE POR MARGEN (reemplaza conteo arbitrario)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _calcular_margen_usado_pct(self, state: GridExecutionState) -> float:
+        """
+        Calcula el % del capital total comprometido como margen en posiciones abiertas.
+
+            margen_requerido = notional_desplegado / leverage
+            margen_usado_pct = margen_requerido / capital_total
+
+        Es independiente del leverage en la forma final: el margen de una posición
+        es notional/leverage, y se compara contra el capital asignado al grid.
+        """
+        if not state.grid_state:
+            return 0.0
+
+        gs = state.grid_state
+        capital_total = float(CONFIG.trading_capital_max_usdt)
+        if capital_total <= 0:
+            return 0.0
+
+        notional_desplegado = 0.0
+        for pos in gs.posiciones:
+            if pos.estado == 'ABIERTA':
+                notional_desplegado += float(pos.qty) * float(pos.precio_ejecucion)
+
+        leverage = getattr(state, 'leverage', 10) or 10
+        margen_requerido = notional_desplegado / float(leverage)
+
+        return min(1.0, margen_requerido / capital_total)
+
     def _calcular_leverage_adaptativo(self, symbol: str, capital: float,
                                        grid_count: int, price: float) -> Optional[int]:
         """
@@ -1440,60 +1532,14 @@ class GridExecutor:
     # FASE 2 PLAN 6.3: LÓGICA OPERATIVA INTERNA (Emparejamiento FIFO autónomo)
     # ═══════════════════════════════════════════════════════════════════════════════
 
-    async def _emparejar_posiciones(self, state: GridExecutionState, timestamp: int):
-        """
-        FASE 2.1: Emparejamiento FIFO de posiciones LONG y SHORT.
-        El LONG más antiguo se empareja primero con el SHORT más antiguo
-        que esté en nivel superior, evitando ocultar pérdidas.
-        """
-        if not state.grid_state:
-            return
-        
-        gs = state.grid_state
-        
-        # Separar y ordenar por timestamp (FIFO)
-        longs_abiertas = [p for p in gs.posiciones if p.estado == 'ABIERTA' and p.tipo == 'LONG']
-        shorts_abiertas = [p for p in gs.posiciones if p.estado == 'ABIERTA' and p.tipo == 'SHORT']
-        
-        longs_abiertas.sort(key=lambda p: p.timestamp_apertura)
-        shorts_abiertas.sort(key=lambda p: p.timestamp_apertura)
-        
-        for long_pos in longs_abiertas:
-            if long_pos.estado != 'ABIERTA':
-                continue
-            
-            for short_pos in shorts_abiertas:
-                if short_pos.estado != 'ABIERTA':
-                    continue
-                
-                # El SHORT debe estar en nivel superior al LONG (take-profit válido)
-                # y haberse abierto después o al mismo tiempo que el LONG
-                if (short_pos.nivel_precio > long_pos.nivel_precio and
-                    short_pos.timestamp_apertura >= long_pos.timestamp_apertura):
-                    
-                    # Cerrar el par
-                    diferencia_niveles = short_pos.nivel_precio - long_pos.nivel_precio
-                    pnl_bruto = diferencia_niveles * long_pos.qty
-                    fee_par = (long_pos.fee_pagada + short_pos.fee_pagada)
-                    pnl_neto = pnl_bruto - fee_par
-                    
-                    long_pos.estado = 'CERRADA'
-                    long_pos.pnl_cierre = pnl_neto / Decimal('2')
-                    short_pos.estado = 'CERRADA'
-                    short_pos.pnl_cierre = pnl_neto / Decimal('2')
-                    
-                    gs.pnl_bruto += pnl_bruto
-                    gs.pnl_neto = gs.pnl_bruto - gs.fees_totales
-                    gs.trades_completados += 1
-                    
-                    # Cancelar órdenes de take-profit pendientes si existen
-                    await self._cancelar_tp_si_existe(state, long_pos)
-                    await self._cancelar_tp_si_existe(state, short_pos)
-                    
-                    print(f"  [EXECUTOR] {state.symbol} PAR CERRADO FIFO | "
-                          f"LONG ${float(long_pos.nivel_precio):.4f} → SELL ${float(short_pos.nivel_precio):.4f} | "
-                          f"Diff: {float(diferencia_niveles):.4f} | PnL: {float(pnl_neto):+.4f}")
-                    break  # Solo emparejar una vez por LONG
+    # ═══════════════════════════════════════════════════════════════════════════
+    # V6.0 PUNTO 2: EMPAREJAMIENTO FIFO ELIMINADO
+    # El método _emparejar_posiciones() cerraba pares LONG+SHORT sintéticamente,
+    # marcando posiciones como CERRADA mientras su TP seguía vivo en Binance.
+    # Resultado: posiciones fantasma y errores -2022 (reduceOnly sin posición).
+    # LONG y SHORT coexistir abiertas en un grid neutral es CORRECTO.
+    # Verificado: 0 llamadas restantes a _emparejar_posiciones en el código.
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def _registrar_cancelacion_propia(self, order_id):
         """P5: Marca una orden como cancelada por el propio bot (anti falsos 'cancelada externamente')."""
@@ -1524,6 +1570,122 @@ class GridExecutor:
                 # Limpiar tracking SIEMPRE, incluso si la cancelación falla
                 if pos.id in state.grid_state.ordenes_tp_pendientes:
                     del state.grid_state.ordenes_tp_pendientes[pos.id]
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # V6.0 PUNTO 1: REPOSICIÓN DE NIVELES (REPLENISH)
+    # Equivalente al ciclo continuo de Binance: todo nivel sin orden vuelve a
+    # recibir su orden LIMIT para que el ciclo entrada→TP→entrada se reinicie.
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _recolocar_nivel(self, state: GridExecutionState, level) -> bool:
+        """
+        V6.0 PUNTO 1: re-coloca una orden LIMIT para un nivel que perdió su orden
+        (por fill del ENTRY o por TP ejecutado). Es el corazón del ciclo continuo.
+
+        Precondición (garantizada por analyze_coverage/_classify_uncovered):
+        el nivel NO tiene orden viva en Binance. Aun así se registran las
+        cancelaciones previas para no disparar falsos 'cancelada externamente'.
+        """
+        symbol = state.symbol
+        try:
+            # Un nivel gap no debe recibir orden (es el hueco intencional del grid)
+            if getattr(level, 'is_gap', False):
+                return False
+
+            # Registrar la orden vieja como cancelada por el propio bot (P5):
+            # evita que el reconciliador la interprete como cancelación externa.
+            if level.binance_order_id:
+                self._registrar_cancelacion_propia(level.binance_order_id)
+
+            ts = int(time.time() * 1000)
+            # Formato CM{grid_id}_REPL_{level}_{ts}:
+            #  - arranca por 'CM' → reconocido por analyze_coverage / barridos
+            #  - los primeros dígitos tras 'CM' son el grid_id → barrido P7 lo
+            #    atribuye correctamente al grid activo
+            #  - '_TP_' no aparece → nunca confundido con una orden take-profit
+            cid = f"CM{state.grid_id}_REPL_{level.level_index}_{ts}"
+
+            # Validar precio contra tick_size / minPrice / maxPrice
+            precio_validado = self._validar_y_redondear_precio(float(level.price), symbol)
+            if precio_validado is None:
+                print(f"  ⚠️ [REPLENISH] {symbol} Nivel {level.level_index}: precio inválido "
+                      f"(${float(level.price)})")
+                return False
+
+            orden = {
+                'symbol': symbol,
+                'side': level.side,
+                'type': 'LIMIT',
+                'quantity': float(level.quantity),
+                'price': precio_validado,   # float: evita notación científica en monedas baratas
+                'timeInForce': 'GTC',
+                'newClientOrderId': cid
+            }
+            if self._hedge_mode:
+                orden['positionSide'] = level.position_side
+
+            res = await self._api_call(asyncio.to_thread(
+                self.client.futures_create_order, **orden
+            ))
+
+            if not res or 'orderId' not in res:
+                print(f"  ❌ [REPLENISH] {symbol} Nivel {level.level_index}: respuesta sin orderId: {res}")
+                return False
+
+            # update_from_order_placed ya muta engine.level_map y lo retorna.
+            # El estado del nivel pasa a ACTIVE (con_order) con last_placed_at_ms = ts,
+            # que es además el 'lag guard' que evita reponer dos veces el mismo nivel.
+            nuevo_mapa = state.grid_engine.update_from_order_placed(
+                level.level_index, cid, str(res['orderId']), ts
+            )
+            # NOTA: update_from_order_placed ya muta state.grid_engine.level_map
+            # internamente (GridEngine.update_from_order_placed → self.level_map =
+            # self.level_map.with_level(...)). No reasignar.
+            nivel_new = nuevo_mapa.levels.get(level.level_index)
+
+            # Persistir en DB (mismos campos que GridLevel.to_row)
+            await actualizar_nivel_grid(
+                state.grid_id, level.level_index,
+                state=(nivel_new.state.value if nivel_new else LevelState.ACTIVE.value),
+                order_id=cid,
+                binance_order_id=str(res['orderId']),
+                last_placed_at_ms=ts,
+                version=(nivel_new.version if nivel_new else level.version + 1)
+            )
+
+            # Guardar la orden en el tracking local (igual que el batch original)
+            await guardar_orden_ejecucion(
+                grid_ejecucion_id=state.grid_id,
+                binance_order_id=str(res['orderId']),
+                client_order_id=cid,
+                symbol=symbol, side=level.side, tipo_orden='ENTRY',
+                price=precio_validado, quantity=float(level.quantity)
+            )
+
+            print(f"  ✅ [REPLENISH] {symbol} Nivel {level.level_index} "
+                  f"{level.side} @ ${precio_validado} re-colocado | {cid}")
+            return True
+
+        except Exception as e:
+            print(f"  ❌ [REPLENISH] {symbol} Nivel {level.level_index}: {e}")
+            return False
+
+    async def _cancelar_por_order_id(self, state: GridExecutionState, order_id) -> bool:
+        """V6.0: cancela una orden por orderId (helper para coverage ACTIVE y P5)."""
+        if order_id in (None, '', 0, '0'):
+            return False
+        try:
+            self._registrar_cancelacion_propia(order_id)
+            await self._api_call(asyncio.to_thread(
+                self.client.futures_cancel_order,
+                symbol=state.symbol,
+                orderId=order_id
+            ))
+            print(f"  ✅ [COVERAGE] {state.symbol} Orden {order_id} cancelada")
+            return True
+        except Exception as e:
+            print(f"  ⚠️ [COVERAGE] {state.symbol} Error cancelando {order_id}: {e}")
+            return False
 
     async def _on_fill_real(self, state: GridExecutionState, side: str, price: float,
                       qty: float, fee: float, timestamp: int,
@@ -1610,9 +1772,9 @@ class GridExecutor:
         # MEJORA 3: Registrar mapeo de orden real a posición
         gs.ordenes_reales[binance_order_id] = pos_id
 
-        # Auto-emparejar inmediatamente si hay par posible
-        await self._emparejar_posiciones(state, timestamp)
-        
+        # V6.0 PUNTO 2: auto-emparejamiento FIFO ELIMINADO (generaba posiciones
+        # fantasma y errores -2022 al cerrar pares con TP todavía vivos).
+
         # FIX FASE 1: pos no definida cuando pos_existente es True
         # Usar pos_id que se definió en ambas ramas (if/else)
         print(f"  [EXECUTOR] {state.symbol} {side} real registrado @ ${price:.4f} | "
@@ -1726,10 +1888,23 @@ class GridExecutor:
         
         gs = state.grid_state
         acciones = []
-        
-        # 1. Emparejar posiciones FIFO primero (si hay LONG + SHORT abiertas)
-        await self._emparejar_posiciones(state, timestamp)
-        
+
+        # V6.0 PUNTO 2: emparejamiento FIFO ELIMINADO (bug de posiciones fantasma).
+
+        # ─── V6.0 PUNTO 3d: HARD STOP por precio adverso ────────────────────
+        # Leverage-independiente. Es una red de seguridad que mide el desplazamiento
+        # de precio contra la entrada media de las piernas abiertas. Se evalúa
+        # ANTES que el resto de condiciones para abortar cuanto antes.
+        adverse_pct = self._calcular_adverse_price_pct(state, precio_actual)
+        if adverse_pct > CONFIG.grid_neutral_max_adverse_price_pct:
+            print(f"  🛑 [HARD-STOP] {state.symbol} Precio adverso "
+                  f"{adverse_pct:.2f}% > {CONFIG.grid_neutral_max_adverse_price_pct}%. Abortando.")
+            await self._abortar_grid(
+                state.symbol,
+                f'hard_stop_adverso_{adverse_pct:.2f}%'
+            )
+            return []
+
         # 2. Verificar timeout de posiciones abiertas
         timeout_seg = CONFIG.grid_neutral_posicion_timeout_min * 60
         
@@ -1751,10 +1926,11 @@ class GridExecutor:
                 print(f"  [EXECUTOR] {state.symbol} Pos {pos.id} vencida: "
                       f"{tiempo_abierta}s > {timeout_seg}s")
         
-        # 3. Verificar max posiciones simultáneas
-        abiertas = gs.contar_posiciones_abiertas()
-        if abiertas > CONFIG.grid_neutral_sim_max_posiciones:
-            # Cerrar la más antigua
+        # 3. V6.0 PUNTO 4: límite por MARGEN comprometido (reemplaza el conteo
+        #    arbitrario de posiciones, que generaba aborts falsos con grids amplios)
+        margen_usado_pct = self._calcular_margen_usado_pct(state)
+        if margen_usado_pct > CONFIG.grid_neutral_max_margin_pct:
+            # Cerrar la más antigua para liberar margen
             mas_antigua = min(
                 (p for p in gs.posiciones if p.estado == 'ABIERTA'),
                 key=lambda p: p.timestamp_apertura,
@@ -1766,11 +1942,12 @@ class GridExecutor:
                     'pos_id': mas_antigua.id,
                     'pos_tipo': mas_antigua.tipo,
                     'qty': float(mas_antigua.qty),
-                    'razon': 'max_posiciones',
+                    'razon': f'margen_critico_{margen_usado_pct:.1%}',
                     'binance_order_id': mas_antigua.binance_order_id
                 })
                 mas_antigua.estado = 'PENDIENTE_CIERRE'
-                print(f"  [EXECUTOR] {state.symbol} Max posiciones ({abiertas}), "
+                print(f"  ⚠️ [MARGEN] {state.symbol} Margen usado "
+                      f"{margen_usado_pct:.1%} > {CONFIG.grid_neutral_max_margin_pct:.0%}, "
                       f"cerrando {mas_antigua.id}")
         
         # 4. Calcular PnL acumulado en RAM
@@ -2101,7 +2278,7 @@ class GridExecutor:
                     'side': side,
                     'type': 'LIMIT',
                     'quantity': str(qty),
-                    'price': str(precio_validado),
+                    'price': precio_validado,   # float: evita notación científica (Binance -1111)
                     'timeInForce': 'GTC',
                     'newClientOrderId': client_order_id
                 }
@@ -2358,7 +2535,7 @@ class GridExecutor:
                 
                 orden_buy = {
                     'symbol': symbol, 'side': 'BUY', 'type': 'LIMIT',
-                    'quantity': str(qty), 'price': str(precio_validado),
+                    'quantity': str(qty), 'price': precio_validado,
                     'timeInForce': 'GTC', 'newClientOrderId': f"CM{grid_id}_BUY_{idx}_{timestamp}"
                 }
                 # FASE B.2 (complemento): HEDGE MODE — BUY abre/cierra lado LONG
@@ -2372,7 +2549,7 @@ class GridExecutor:
 
                 orden_sell = {
                     'symbol': symbol, 'side': 'SELL', 'type': 'LIMIT',
-                    'quantity': str(qty), 'price': str(precio_validado),
+                    'quantity': str(qty), 'price': precio_validado,
                     'timeInForce': 'GTC', 'newClientOrderId': f"CM{grid_id}_SELL_{idx}_{timestamp}"
                 }
                 # FASE B.2 (complemento): HEDGE MODE — SELL abre/cierra lado SHORT
@@ -3179,10 +3356,12 @@ class GridExecutor:
 
         # ─── SYNC: Sincronizar órdenes abiertas de Binance con DB local ───
         open_orders = []  # V8: garantizar variable ligada aunque el SYNC falle (coverage la usa al final)
+        open_orders_ok = False  # V6.0 PUNTO 1: flag de fiabilidad para coverage ACTIVE
         try:
             open_orders = await self._api_call(asyncio.to_thread(
                 self.client.futures_get_open_orders, symbol=symbol
             ))
+            open_orders_ok = True  # V6.0 PUNTO 1: snapshot de órdenes fiable
             db_ordenes = await cargar_ordenes_por_grid(state.grid_id)
             db_order_ids = {str(o['binance_order_id']): o for o in db_ordenes if o.get('binance_order_id')}
 
@@ -3439,8 +3618,8 @@ class GridExecutor:
         if (state.engine_version == 2 and state.grid_engine and
                 CONFIG.grid_engine_enabled):
 
-            ciclo = getattr(self, '_monitoreo_ciclo', 0)
-            self._monitoreo_ciclo = ciclo + 1
+            ciclo = getattr(state, '_coverage_ciclo', 0)
+            state._coverage_ciclo = ciclo + 1
 
             if ciclo % CONFIG.grid_engine_coverage_interval_ticks == 0:
                 try:
@@ -3476,7 +3655,7 @@ class GridExecutor:
                             json.dumps(reporte.diagnostics)
                         )
 
-                    # MODO SHADOW: solo logs
+                    # SHADOW: solo logs -----------------------------------------
                     if CONFIG.grid_engine_coverage_mode == "SHADOW":
                         if not reporte.is_clean():
                             print(f"  [V8-SHADOW] {symbol} Coverage detectado:")
@@ -3484,6 +3663,41 @@ class GridExecutor:
                                 print(f"    {diag}")
                         else:
                             print(f"  [V8-SHADOW] {symbol} Coverage limpio")
+
+                    # V6.0 PUNTO 1: ACTIVE — ejecutar decisiones -----------------
+                    elif CONFIG.grid_engine_coverage_mode == "ACTIVE":
+                        # GUARD DE SEGURIDAD (corrección V6.0):
+                        # sin un snapshot fiable de open_orders, analyze_coverage
+                        # vería TODOS los niveles como huérfanos y repondría órdenes
+                        # duplicadas sobre niveles que sí tienen orden en Binance.
+                        if not open_orders_ok:
+                            print(f"  ⚠️ [V8-ACTIVE] {symbol} open_orders sin confirmar → "
+                                  f"coverage en modo observación este ciclo")
+                        elif not reporte.is_clean():
+                            decisiones = state.grid_engine.generate_decisions(
+                                reporte,
+                                current_price=self.precios_vivo.get(symbol, 0),
+                                position_net=state.posicion_neta,
+                                hedge_mode=self._hedge_mode
+                            )
+
+                            acciones_ok = 0
+                            for d in decisiones:
+                                if d.action == CoverageAction.REPLENISH and d.level is not None:
+                                    if await self._recolocar_nivel(state, d.level):
+                                        acciones_ok += 1
+                                elif d.action in (CoverageAction.KILL_DUPLICATE,
+                                                  CoverageAction.KILL_ORPHAN):
+                                    oid_cancel = (d.order or {}).get('orderId')
+                                    if oid_cancel and await self._cancelar_por_order_id(
+                                            state, oid_cancel):
+                                        acciones_ok += 1
+
+                            if acciones_ok > 0:
+                                print(f"  ✅ [V8-ACTIVE] {symbol} {acciones_ok} "
+                                      f"acción(es) de coverage ejecutadas")
+                        else:
+                            print(f"  [V8-ACTIVE] {symbol} Coverage limpio")
                 except Exception as e_v8:
                     # V8: coverage nunca debe romper el monitoreo principal
                     print(f"  ⚠️ [V8] {symbol} Error en coverage: {e_v8}")
@@ -4001,33 +4215,57 @@ class GridExecutor:
 
         # E.2 FIX: Cancelar orden de entrada conflictiva en ese precio+side
         prefix = f"CM{state.grid_id}"
-        try:
-            open_orders = await self._api_call(asyncio.to_thread(
-                self.client.futures_get_open_orders, symbol=symbol
-            ))
-            open_orders = open_orders or []
-            conflicto = next((
-                o for o in open_orders
-                if o.get('side') == tp_side
-                and abs(float(o.get('price', 0)) - tp_price) < float(tick_size) * 0.5
-                and o.get('clientOrderId', '').startswith(prefix)
-                and '_TP_' not in o.get('clientOrderId', '')
-            ), None)
-            if conflicto:
-                print(f"  [E.2] {symbol} Cancelando orden de entrada {conflicto['side']} @ ${tp_price} "
-                      f"(conflicto con TP) | ID: {conflicto['orderId']}")
-                self._registrar_cancelacion_propia(conflicto['orderId'])  # P5
-                await self._api_call(asyncio.to_thread(
-                    self.client.futures_cancel_order,
-                    symbol=symbol,
-                    orderId=conflicto['orderId']
+
+        # ─── V6.0 PUNTO 5: buscar el conflicto en el LevelMap ─────────────────
+        # Evita la llamada futures_get_open_orders antes de cada TP (~1-2s de
+        # latencia por TP). Fallback a Binance para grids legacy (engine v1).
+        conflicto = None
+        if (state.engine_version == 2 and state.grid_engine
+                and state.grid_engine.level_map is not None):
+            # Guard: no buscar conflictos en niveles recién colocados (<5s),
+            # porque el side-effect async del fill aún puede no haber llegado
+            # al LevelMap (evita cancelar la orden que acabamos de poner).
+            ahora_ms = int(time.time() * 1000)
+            for lvl in state.grid_engine.level_map.levels.values():
+                if (not lvl.is_gap and lvl.state == LevelState.ACTIVE
+                        and lvl.side == tp_side
+                        and abs(lvl.price - Decimal(str(tp_price))) < tick_size * 2
+                        and lvl.order_id and '_TP_' not in (lvl.order_id or '')
+                        and lvl.binance_order_id):
+                    if lvl.last_placed_at_ms and (ahora_ms - lvl.last_placed_at_ms) < 5000:
+                        continue
+                    conflicto = {'orderId': lvl.binance_order_id,
+                                 'clientOrderId': lvl.order_id,
+                                 'side': lvl.side,
+                                 'price': float(lvl.price)}
+                    break
+        else:
+            # Fallback: consultar a Binance (comportamiento original, engine v1)
+            try:
+                open_orders = await self._api_call(asyncio.to_thread(
+                    self.client.futures_get_open_orders, symbol=symbol
                 ))
-                for cid, meta in list(state.ordenes.items()):
-                    if meta.get('binance_order_id') == str(conflicto['orderId']):
-                        del state.ordenes[cid]
-                        break
-        except Exception as e:
-            print(f"  ⚠️ [E.2] {symbol} Error buscando/cancelando orden conflictiva: {e}")
+                open_orders = open_orders or []
+                conflicto = next((
+                    o for o in open_orders
+                    if o.get('side') == tp_side
+                    and abs(float(o.get('price', 0)) - tp_price) < float(tick_size) * 0.5
+                    and o.get('clientOrderId', '').startswith(prefix)
+                    and '_TP_' not in o.get('clientOrderId', '')
+                ), None)
+            except Exception as e:
+                print(f"  ⚠️ [P5] {symbol} Error consultando conflictos: {e}")
+                conflicto = None
+
+        # Cancelar conflicto si existe
+        if conflicto:
+            print(f"  [P5] {symbol} Cancelando orden de entrada {conflicto.get('side')} "
+                  f"@ ${tp_price} (conflicto con TP) | ID: {conflicto.get('orderId')}")
+            await self._cancelar_por_order_id(state, conflicto.get('orderId'))
+            for cid, meta in list(state.ordenes.items()):
+                if meta.get('binance_order_id') == str(conflicto.get('orderId')):
+                    del state.ordenes[cid]
+                    break
 
         client_id = f"CM{state.grid_id}_TP_{int(time.time()*1000)}"
 

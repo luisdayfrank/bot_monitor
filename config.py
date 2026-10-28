@@ -166,8 +166,10 @@ class Config(BaseModel):
     # Grid params base
     grid_min_grids: int = 10             # CAMBIO: antes 5. Alineado con grid_niveles_min más bajo (memecoin=10)
     grid_max_grids_hard: int = 50        # Cap absoluto para evitar saturación API
-    grid_fee_rate: float = 0.0005
-    grid_slippage: float = 0.0005
+    # V6.0 Punto 3c: fees maker con descuento BNB (0.02%) + slippage realista.
+    # Si NO hay BNB para el descuento del 25%, usar grid_fee_rate = 0.00025.
+    grid_fee_rate: float = 0.0002
+    grid_slippage: float = 0.0003
     grid_default_capital: float = 10.0
     grid_default_leverage: int = 15      # CAMBIO: antes 5 → ahora 10
 
@@ -180,7 +182,7 @@ class Config(BaseModel):
     grid_rango_mult_max: float = 10.0     # CAMBIO: antes 6.0 → ahora 10.0
 
     # Breakeven: step_pct debe ser al menos este múltiplo para ser rentable
-    grid_breakeven_mult: float = 1.15     # CAMBIO: antes 1.2 → ahora 1.15
+    grid_breakeven_mult: float = 1.05     # V6.0: antes 1.15 → 1.05 (fees maker reales)
 
     # Auto-compresión: si step_pct < breakeven * mult, reducir grids
     grid_auto_compress: bool = True
@@ -263,10 +265,15 @@ class Config(BaseModel):
     grid_neutral_enabled: bool = True  # Toggle global, sin confirmación manual
     # Tiempo máximo en estado NEUTRAL_GRID antes de aborto automático
     grid_neutral_timeout_min: int = 310          # CAMBIO: antes 75 → ahora 720
-    # Aborto si ADX sube +5 sobre umbral de entrada
-    grid_neutral_aborto_adx_delta: float = 5.0
-    # Aborto si precio se mueve >2% de EMA50/200
-    grid_neutral_aborto_precio_pct: float = 1.8  # CAMBIO: antes 1.2 → ahora 1.8
+    # Aborto si ADX sube +3 sobre umbral de entrada (V6.0 Punto 3b: era +5)
+    grid_neutral_aborto_adx_delta: float = 3.0
+    # Aborto si precio se aleja >1.0% de EMA50 (V6.0 Punto 3b: era 1.8)
+    grid_neutral_aborto_precio_pct: float = 1.0
+    # V6.0 Punto 3d: hard stop por precio adverso respecto al precio de entrada
+    # ponderado de las posiciones abiertas (métrica distinta al aborto por EMA50).
+    # Leverage-independiente: mide movimiento de PRECIO, no de PnL.
+    # 0.8% < 1.0% del aborto macro => actúa como red de seguridad previa.
+    grid_neutral_max_adverse_price_pct: float = 0.8
     # ADX máximo para considerar mercado neutral (sin tendencia fuerte)
     grid_neutral_adx_max: float = 25.0           # CAMBIO: antes 22.0 → ahora 25.0
     # RSI rango para grid neutral (no extremos)
@@ -307,10 +314,10 @@ class Config(BaseModel):
     # ─── Base de datos MySQL / MariaDB ───
     # Conexión local por defecto (MariaDB/MySQL en tu PC). Configurable por
     # variables de entorno para no exponer credenciales en el código.
-    db_host: str = os.getenv("DB_HOST", "database-1.cnqsq0e6cf6z.eu-west-1.rds.amazonaws.com")
+    db_host: str = os.getenv("DB_HOST", "127.0.0.1")
     db_port: int = int(os.getenv("DB_PORT", "3306"))
-    db_user: str = os.getenv("DB_USER", "admin")
-    db_password: str = os.getenv("DB_PASSWORD", "1605584496")
+    db_user: str = os.getenv("DB_USER", "root")
+    db_password: str = os.getenv("DB_PASSWORD", "")
     db_name: str = os.getenv("DB_NAME", "crypto_monitor")
     db_connect_timeout: int = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))
 
@@ -336,9 +343,11 @@ class Config(BaseModel):
     # V5.9.2: PARÁMETROS DE SIMULACIÓN VIRTUAL GRID NEUTRAL
     # ═══════════════════════════════════════════════════════════════════════════════
 
-    # V5.9.2 MEJORA #1: Timeout por posición abierta (FIFO)
+    # V5.9.2 MEJORA #1: Timeout por posición abierta
     # Cerrar posición si lleva N minutos abierta (evita posiciones eternas)
-    grid_neutral_posicion_timeout_min: int = 25  # FASE 2.4: Por posición (antes 30)
+    # V6.0 Punto 3a: elevado a 24h (era 25 min) — el grid neutral necesita
+    # dar tiempo al ciclo entrada→TP en mercado lateral.
+    grid_neutral_posicion_timeout_min: int = 1440
     grid_neutral_sin_ticks_timeout_min: int = 10  # FASE 2.4: Sin ticks (10 min)
 
     # V5.9.2 MEJORA #2: Slippage absoluto de último recurso
@@ -370,7 +379,10 @@ class Config(BaseModel):
     circuit_breaker_afecta_grid_neutral: bool = True
 
     # V5.9.2: Parámetros de simulación virtual
-    grid_neutral_sim_max_posiciones: int = 10  # Max posiciones simultáneas en sim
+    grid_neutral_sim_max_posiciones: int = 50  # V6.0 Punto 4: era 10 (techo blando)
+    # V6.0 Punto 4: límite real por margen comprometido (reemplaza el conteo
+    # arbitrario de posiciones en _evaluar_kill_switch).
+    grid_neutral_max_margin_pct: float = 0.85
     # ═══════════════════════════════════════════════════════════════════════════════
     # FASE 4.2: PERFILES DE MONEDA (categorías adaptativas)
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -420,7 +432,9 @@ class Config(BaseModel):
     # Rate limiting
     trading_batch_max_ordenes: int = 5
     trading_rate_limit_rps: int = 5  # Max 5 requests/segundo (conservador)
-    trading_polling_interval_seg: int = 10
+    # V6.0 Punto 5: 3s (era 10) — TP ~15s más rápido en promedio.
+    # OJO: triplica la frecuencia de llamadas REST (vigilar rate limit / weight).
+    trading_polling_interval_seg: int = 3
 
     # Keys testnet (separadas de las reales para seguridad)
     binance_testnet_api_key: str = os.getenv("BINANCE_TESTNET_API_KEY", "sX7kym5t0AE11IRWWg0Ks84z2K34RH5yirclh5MoyWcPgQVbnW670vTJfDJ1W01m")
@@ -430,7 +444,8 @@ class Config(BaseModel):
     # V8: MOTOR DE NIVELES
     # ═══════════════════════════════════════════════════════════════════════════════
     grid_engine_enabled: bool = True           # Master toggle
-    grid_engine_coverage_mode: str = "SHADOW"   # SHADOW | ACTIVE | OFF
+    # V6.0 Punto 1: ACTIVE = reposición de niveles huérfanos (REPLENISH)
+    grid_engine_coverage_mode: str = "ACTIVE"   # SHADOW | ACTIVE | OFF
     grid_engine_roundtrip: bool = True         # Fase 4: round-trip por nivel
     grid_engine_gap_dynamic: bool = False       # Fase 5: gap dinámico
     grid_engine_lag_guard_ms: int = 10000       # 10s real, 15s testnet
