@@ -314,10 +314,10 @@ class Config(BaseModel):
     # ─── Base de datos MySQL / MariaDB ───
     # Conexión local por defecto (MariaDB/MySQL en tu PC). Configurable por
     # variables de entorno para no exponer credenciales en el código.
-    db_host: str = os.getenv("DB_HOST", "127.0.0.1")
+    db_host: str = os.getenv("DB_HOST", "database-1.cnqsq0e6cf6z.eu-west-1.rds.amazonaws.com")
     db_port: int = int(os.getenv("DB_PORT", "3306"))
-    db_user: str = os.getenv("DB_USER", "root")
-    db_password: str = os.getenv("DB_PASSWORD", "")
+    db_user: str = os.getenv("DB_USER", "admin")
+    db_password: str = os.getenv("DB_PASSWORD", "160558446")
     db_name: str = os.getenv("DB_NAME", "crypto_monitor")
     db_connect_timeout: int = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))
 
