@@ -109,6 +109,66 @@ def _sanitize_numpy(obj):
     return obj
 
 
+def _rango_stats(dias: int = 1):
+    """Rango de fechas para las métricas del dashboard (fecha local del bot).
+
+    dias=1  -> solo hoy. dias=N -> últimos N días incluyendo hoy.
+    Retorna (fecha_desde, fecha_hoy, ts_desde, ts_hasta) donde los timestamps
+    son segundos UTC [desde, hasta) alineados a medianoche LOCAL.
+    """
+    try:
+        dias = int(dias)
+    except (TypeError, ValueError):
+        dias = 1
+    dias = max(1, min(dias, 365))
+
+    tz = get_tz()
+    hoy = now_local()
+    fecha_hoy = hoy.strftime("%Y-%m-%d")
+    fecha_desde = (hoy - timedelta(days=dias - 1)).strftime("%Y-%m-%d")
+
+    dt_desde = tz.localize(datetime.strptime(fecha_desde, "%Y-%m-%d"))
+    dt_hasta = tz.localize(datetime.strptime(fecha_hoy, "%Y-%m-%d")) + timedelta(days=1)
+    ts_desde = dt_desde.astimezone(pytz.UTC).timestamp()
+    ts_hasta = dt_hasta.astimezone(pytz.UTC).timestamp()
+    return fecha_desde, fecha_hoy, ts_desde, ts_hasta
+
+
+def _parse_ts_utc(value):
+    """Convierte timestamp_utc (ISO string o datetime) a datetime aware UTC."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=pytz.UTC)
+    try:
+        dt = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        return dt if dt.tzinfo else dt.replace(tzinfo=pytz.UTC)
+    except Exception:
+        return None
+
+
+def _clasificar_causa(rechazo) -> str:
+    """Clasifica un mensaje de rechazo en una causa agrupada para el dashboard."""
+    s = str(rechazo or "").upper()
+    if "ADX" in s:
+        return "ADX"
+    if "VOLUMEN" in s or "VOLUME" in s:
+        return "VOLUMEN"
+    if "RSI" in s:
+        return "RSI"
+    if "MFM" in s:
+        return "MFM"
+    if "MACD" in s:
+        return "MACD"
+    if "ATR" in s:
+        return "ATR"
+    if "DIRECCION" in s or "NEUTRAL" in s:
+        return "DIRECCION_NEUTRAL"
+    if "CAPITAL" in s or "NOTIONAL" in s:
+        return "CAPITAL"
+    return "OTRO"
+
+
 app = FastAPI(title="Crypto Monitor V6.2 — Multi-Timeframe Sniper Dashboard")
 
 app.add_middleware(
@@ -414,36 +474,37 @@ async def get_snapshot(request: Request):
 # -------------------------------------------------------------------------------
 
 @app.get("/api/stats/summary")
-async def get_stats_summary(request: Request):
+async def get_stats_summary(request: Request, dias: int = 1):
     """Obtiene un resumen de rendimiento usando la base de datos de auditoría.
 
     V6.2: Métricas separadas para near-misses en curso vs finalizados.
     PnL REAL desde grid_ejecuciones (no simulaciones legacy).
     Agregadas métricas de executor y circuit breaker.
     FIX: ultimo_evento_info ahora se asigna correctamente.
+    FIX: param `dias` (1 = hoy, N = últimos N días) + rangos por timestamp
+    en lugar de DATE(FROM_UNIXTIME()) que comparaba fecha UTC vs local.
     """
     try:
         db = await _get_db()
-        hoy_local = now_local().strftime("%Y-%m-%d")
-        ts_inicio_dia = datetime.now(pytz.UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        fecha_desde, _fecha_hoy, ts_desde, ts_hasta = _rango_stats(dias)
 
-        # ─── 1. Fires hoy ───
+        # ─── 1. Fires en el período ───
         cursor = await db.execute(
-            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'FIRE' AND fecha = ?",
-            (hoy_local,)
+            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'FIRE' AND fecha >= ?",
+            (fecha_desde,)
         )
         fires_hoy = (await cursor.fetchone())[0]
 
         # ─── 2. Near Misses: totales, en curso, finalizados ───
         cursor = await db.execute(
-            "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ?",
-            (ts_inicio_dia,)
+            "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND timestamp_inicio < ?",
+            (ts_desde, ts_hasta)
         )
         total_near_miss = (await cursor.fetchone())[0]
 
         cursor = await db.execute(
-            "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND timestamp_fin IS NOT NULL",
-            (ts_inicio_dia,)
+            "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND timestamp_inicio < ? AND timestamp_fin IS NOT NULL",
+            (ts_desde, ts_hasta)
         )
         finalizados_hoy = (await cursor.fetchone())[0]
 
@@ -452,8 +513,8 @@ async def get_stats_summary(request: Request):
         aciertos = 0
         if finalizados_hoy > 0:
             cursor = await db.execute(
-                "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND timestamp_fin IS NOT NULL AND acerto_bot = 1",
-                (ts_inicio_dia,)
+                "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND timestamp_inicio < ? AND timestamp_fin IS NOT NULL AND acerto_bot = 1",
+                (ts_desde, ts_hasta)
             )
             aciertos = (await cursor.fetchone())[0]
 
@@ -467,8 +528,8 @@ async def get_stats_summary(request: Request):
 
         # ─── 3. Grids REALES (executor) ───
         cursor = await db.execute(
-            "SELECT count(*) FROM grid_ejecuciones WHERE date(datetime(timestamp_inicio, 'unixepoch')) = ?",
-            (hoy_local,)
+            "SELECT count(*) FROM grid_ejecuciones WHERE timestamp_inicio >= ? AND timestamp_inicio < ?",
+            (ts_desde, ts_hasta)
         )
         grids_total_hoy = (await cursor.fetchone())[0]
 
@@ -479,8 +540,8 @@ async def get_stats_summary(request: Request):
         grids_reales_activos = (await cursor.fetchone())[0]
 
         cursor = await db.execute(
-            "SELECT COALESCE(SUM(pnl_real), 0), COALESCE(SUM(fees_real), 0) FROM grid_ejecuciones WHERE estado = 'CERRADO' AND date(datetime(timestamp_inicio, 'unixepoch')) = ?",
-            (hoy_local,)
+            "SELECT COALESCE(SUM(pnl_real), 0), COALESCE(SUM(fees_real), 0) FROM grid_ejecuciones WHERE estado = 'CERRADO' AND timestamp_inicio >= ? AND timestamp_inicio < ?",
+            (ts_desde, ts_hasta)
         )
         row = await cursor.fetchone()
         pnl_real_hoy = float(row[0]) if row and row[0] is not None else 0.0
@@ -493,41 +554,39 @@ async def get_stats_summary(request: Request):
         row_activo = await cursor.fetchone()
         pnl_real_activo = float(row_activo[0]) if row_activo and row_activo[0] is not None else 0.0
 
-        # ─── 4. Circuit Breakers hoy ───
+        # ─── 4. Circuit Breakers en el período ───
         cursor = await db.execute(
-            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'CIRCUIT_BREAKER' AND fecha = ?",
-            (hoy_local,)
+            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'CIRCUIT_BREAKER' AND fecha >= ?",
+            (fecha_desde,)
         )
         cb_hoy = (await cursor.fetchone())[0]
 
         # ─── 5. Último evento importante (FIXED) ───
         cursor = await db.execute(
-            "SELECT tipo, symbol, timestamp_utc FROM auditoria_eventos WHERE fecha = ? AND tipo IN ('FIRE', 'CIRCUIT_BREAKER') ORDER BY timestamp_utc DESC LIMIT 1",
-            (hoy_local,)
+            "SELECT tipo, symbol, timestamp_utc FROM auditoria_eventos WHERE fecha >= ? AND tipo IN ('FIRE', 'CIRCUIT_BREAKER') ORDER BY timestamp_utc DESC LIMIT 1",
+            (fecha_desde,)
         )
         ultimo_evento = await cursor.fetchone()
         ultimo_evento_info = None
         if ultimo_evento:
             tipo_ev, sym_ev, ts_ev = ultimo_evento
-            if isinstance(ts_ev, str):
-                ts_ev = datetime.fromisoformat(ts_ev.replace('Z', '+00:00'))
-                if ts_ev.tzinfo is None:
-                    ts_ev = ts_ev.replace(tzinfo=pytz.UTC)
-            if isinstance(ts_ev, datetime) and ts_ev.tzinfo is None:
-                ts_ev = ts_ev.replace(tzinfo=pytz.UTC)
+            ts_ev = _parse_ts_utc(ts_ev)
             mins_ago = int((datetime.now(pytz.UTC).timestamp() - ts_ev.timestamp()) / 60) if ts_ev else None
             # FIX: asignar el dict correctamente
             ultimo_evento_info = {"tipo": tipo_ev, "symbol": sym_ev, "minutos_ago": mins_ago}
 
-        # ─── 6. Rechazados hoy ───
+        # ─── 6. Rechazados en el período ───
         cursor = await db.execute(
-            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'RECHAZADO' AND fecha = ?",
-            (hoy_local,)
+            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'RECHAZADO' AND fecha >= ?",
+            (fecha_desde,)
         )
         rechazados_hoy = (await cursor.fetchone())[0]
 
+        periodo_txt = "hoy" if dias == 1 else f"últimos {dias} días"
         return {
             "estado": "success",
+            "dias": dias,
+            "fecha_desde": fecha_desde,
             "fires_hoy": fires_hoy,
             "rechazados_hoy": rechazados_hoy,
             "total_near_miss": total_near_miss,
@@ -543,7 +602,7 @@ async def get_stats_summary(request: Request):
             "pnl_real_activo": round(pnl_real_activo, 4),
             "cb_hoy": cb_hoy,
             "ultimo_evento": ultimo_evento_info,
-            "mensaje": f"{seguimientos_activos} seguimiento(s) en curso (2h). Win Rate calculable sobre {finalizados_hoy} finalizados.",
+            "mensaje": f"{periodo_txt}: {seguimientos_activos} seguimiento(s) en curso (2h). Win Rate calculable sobre {finalizados_hoy} finalizados.",
         }
 
     except Exception as e:
@@ -552,12 +611,13 @@ async def get_stats_summary(request: Request):
 
 
 @app.get("/api/stats/per-coin")
-async def get_stats_per_coin(request: Request):
+async def get_stats_per_coin(request: Request, dias: int = 1):
     """Ranking de rendimiento por moneda. V6.2: Enriquecido con más métricas."""
     try:
         db = await _get_db()
-        hoy_local = now_local().strftime("%Y-%m-%d")
-        ts_inicio_dia = datetime.now(pytz.UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        fecha_desde, _fecha_hoy, ts_desde, ts_hasta = _rango_stats(dias)
+        ts_desde_ms = int(ts_desde * 1000)
+        ts_hasta_ms = int(ts_hasta * 1000)
 
         result = []
         registry = _load_registry()
@@ -566,48 +626,48 @@ async def get_stats_per_coin(request: Request):
         for sym in symbols:
             # Fires
             cursor = await db.execute(
-                "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'FIRE' AND fecha = ? AND symbol = ?",
-                (hoy_local, sym)
+                "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'FIRE' AND fecha >= ? AND symbol = ?",
+                (fecha_desde, sym)
             )
             fires = (await cursor.fetchone())[0]
 
             # Rechazados
             cursor = await db.execute(
-                "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'RECHAZADO' AND fecha = ? AND symbol = ?",
-                (hoy_local, sym)
+                "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'RECHAZADO' AND fecha >= ? AND symbol = ?",
+                (fecha_desde, sym)
             )
             rechazos = (await cursor.fetchone())[0]
 
             # Near-misses finalizados y aciertos
             cursor = await db.execute(
-                "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND timestamp_fin IS NOT NULL AND symbol = ?",
-                (ts_inicio_dia, sym)
+                "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND timestamp_inicio < ? AND timestamp_fin IS NOT NULL AND symbol = ?",
+                (ts_desde, ts_hasta, sym)
             )
             nm_finalizados = (await cursor.fetchone())[0]
 
             aciertos = 0
             if nm_finalizados > 0:
                 cursor = await db.execute(
-                    "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND timestamp_fin IS NOT NULL AND acerto_bot = 1 AND symbol = ?",
-                    (ts_inicio_dia, sym)
+                    "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND timestamp_inicio < ? AND timestamp_fin IS NOT NULL AND acerto_bot = 1 AND symbol = ?",
+                    (ts_desde, ts_hasta, sym)
                 )
                 aciertos = (await cursor.fetchone())[0]
 
             # PnL real grids
             cursor = await db.execute(
-                "SELECT COALESCE(SUM(pnl_real), 0) FROM grid_ejecuciones WHERE symbol = ? AND date(datetime(timestamp_inicio, 'unixepoch')) = ?",
-                (sym, hoy_local)
+                "SELECT COALESCE(SUM(pnl_real), 0) FROM grid_ejecuciones WHERE symbol = ? AND timestamp_inicio >= ? AND timestamp_inicio < ?",
+                (sym, ts_desde, ts_hasta)
             )
             pnl = float((await cursor.fetchone())[0] or 0)
 
-            # V6.2: Mejor/peor trade del día
+            # V6.2: Mejor/peor trade del período
             cursor = await db.execute(
                 """
                 SELECT MAX(realized_pnl), MIN(realized_pnl), COUNT(*)
                 FROM pnl_eventos 
-                WHERE symbol = ? AND date(datetime(timestamp_ms/1000, 'unixepoch')) = ?
+                WHERE symbol = ? AND timestamp_ms >= ? AND timestamp_ms < ?
                 """,
-                (sym, hoy_local)
+                (sym, ts_desde_ms, ts_hasta_ms)
             )
             row_trade = await cursor.fetchone()
             mejor_trade = float(row_trade[0]) if row_trade and row_trade[0] is not None else None
@@ -616,8 +676,8 @@ async def get_stats_per_coin(request: Request):
 
             # V6.2: Último fire timestamp
             cursor = await db.execute(
-                "SELECT MAX(timestamp_utc) FROM auditoria_eventos WHERE tipo = 'FIRE' AND fecha = ? AND symbol = ?",
-                (hoy_local, sym)
+                "SELECT MAX(timestamp_utc) FROM auditoria_eventos WHERE tipo = 'FIRE' AND fecha >= ? AND symbol = ?",
+                (fecha_desde, sym)
             )
             row_last_fire = await cursor.fetchone()
             ultimo_fire_ts = row_last_fire[0] if row_last_fire and row_last_fire[0] else None
@@ -660,7 +720,7 @@ async def get_stats_per_coin(request: Request):
             })
 
         result.sort(key=lambda x: x["pnl_real"], reverse=True)
-        return {"estado": "success", "data": result}
+        return {"estado": "success", "dias": dias, "fecha_desde": fecha_desde, "data": result}
 
     except Exception as e:
         logger.error(f"Error per-coin stats: {e}")
@@ -668,72 +728,90 @@ async def get_stats_per_coin(request: Request):
 
 
 @app.get("/api/stats/funnel")
-async def get_stats_funnel(request: Request):
-    """Funnel de conversión: MONITOREO -> ARMED -> FIRE. V6.2: Enriquecido con latencias."""
+async def get_stats_funnel(request: Request, dias: int = 1):
+    """Funnel de conversión: MONITOREO -> ARMED -> FIRE. V6.2: Enriquecido con latencias.
+
+    FIX: las latencias se calculan en Python sobre datetimes parseados; la versión
+    anterior restaba columnas VARCHAR (timestamp_utc) en SQL y daba ~0 siempre.
+    """
     try:
         db = await _get_db()
-        hoy_local = now_local().strftime("%Y-%m-%d")
+        fecha_desde, _fecha_hoy, ts_desde, ts_hasta = _rango_stats(dias)
 
         cursor = await db.execute(
-            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'FIRE' AND fecha = ?",
-            (hoy_local,)
+            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'FIRE' AND fecha >= ?",
+            (fecha_desde,)
         )
         fires = (await cursor.fetchone())[0]
 
         cursor = await db.execute(
-            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'CAMBIO_ESTADO' AND fecha = ? AND estado_maquina LIKE '%ARMED%'",
-            (hoy_local,)
+            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'CAMBIO_ESTADO' AND fecha >= ? AND estado_maquina LIKE '%ARMED%'",
+            (fecha_desde,)
         )
         armed = (await cursor.fetchone())[0]
 
         cursor = await db.execute(
-            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'RECHAZADO' AND fecha = ?",
-            (hoy_local,)
+            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'RECHAZADO' AND fecha >= ?",
+            (fecha_desde,)
         )
         rechazados = (await cursor.fetchone())[0]
 
         cursor = await db.execute(
-            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'NEUTRAL_GRID_INICIADO' AND fecha = ?",
-            (hoy_local,)
+            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'NEUTRAL_GRID_INICIADO' AND fecha >= ?",
+            (fecha_desde,)
         )
         neutral_grids = (await cursor.fetchone())[0]
 
         monitoreo_filtro_ok = armed + rechazados
 
-        # V6.2: Tiempo promedio en ARMED antes de FIRE
+        # V6.2: Latencias ARMED -> FIRE / ARMED -> RECHAZADO (parseo en Python)
         cursor = await db.execute(
             """
-            SELECT AVG(
-                (SELECT timestamp_utc FROM auditoria_eventos a2 
-                 WHERE a2.symbol = a1.symbol AND a2.tipo = 'FIRE' AND a2.timestamp_utc > a1.timestamp_utc 
-                 ORDER BY a2.timestamp_utc ASC LIMIT 1) - a1.timestamp_utc
-            )
-            FROM auditoria_eventos a1
-            WHERE a1.tipo = 'CAMBIO_ESTADO' AND a1.fecha = ? AND a1.estado_maquina LIKE '%ARMED%'
+            SELECT symbol, tipo, timestamp_utc, estado_maquina FROM auditoria_eventos
+            WHERE fecha >= ? AND tipo IN ('CAMBIO_ESTADO', 'FIRE', 'RECHAZADO')
+            ORDER BY symbol ASC, timestamp_utc ASC
             """,
-            (hoy_local,)
+            (fecha_desde,)
         )
-        row_latency = await cursor.fetchone()
-        avg_latency_fire = float(row_latency[0]) if row_latency and row_latency[0] is not None else None
+        eventos_ts = await cursor.fetchall()
 
-        # V6.2: Tiempo promedio en ARMED antes de RECHAZO
-        cursor = await db.execute(
-            """
-            SELECT AVG(
-                (SELECT timestamp_utc FROM auditoria_eventos a2 
-                 WHERE a2.symbol = a1.symbol AND a2.tipo = 'RECHAZADO' AND a2.timestamp_utc > a1.timestamp_utc 
-                 ORDER BY a2.timestamp_utc ASC LIMIT 1) - a1.timestamp_utc
-            )
-            FROM auditoria_eventos a1
-            WHERE a1.tipo = 'CAMBIO_ESTADO' AND a1.fecha = ? AND a1.estado_maquina LIKE '%ARMED%'
-            """,
-            (hoy_local,)
-        )
-        row_latency_r = await cursor.fetchone()
-        avg_latency_reject = float(row_latency_r[0]) if row_latency_r and row_latency_r[0] is not None else None
+        por_symbol = {}
+        for ev in eventos_ts:
+            dt = _parse_ts_utc(ev[2])
+            if dt is None:
+                continue
+            por_symbol.setdefault(ev[0], []).append((dt, ev[1], ev[3]))
 
+        lat_fire, lat_reject = [], []
+        for _sym, events in por_symbol.items():
+            armed_dt = None
+            for dt, tipo, estado_maq in events:
+                estado_u = str(estado_maq or '').upper()
+                if tipo == 'CAMBIO_ESTADO':
+                    if 'ARMED' in estado_u:
+                        armed_dt = dt
+                    elif armed_dt is not None and estado_u not in ('FIRE', 'RECHAZADO'):
+                        armed_dt = None  # salió de ARMED sin decisión
+                    continue
+                if armed_dt is None:
+                    continue
+                delta = (dt - armed_dt).total_seconds()
+                if delta >= 0:
+                    if tipo == 'FIRE':
+                        lat_fire.append(delta)
+                    elif tipo == 'RECHAZADO':
+                        lat_reject.append(delta)
+                armed_dt = None
+
+        avg_latency_fire = (sum(lat_fire) / len(lat_fire)) if lat_fire else None
+        avg_latency_reject = (sum(lat_reject) / len(lat_reject)) if lat_reject else None
+
+        periodo_txt = "hoy" if dias == 1 else f"últimos {dias} días"
         return {
             "estado": "success",
+            "dias": dias,
+            "fecha_desde": fecha_desde,
+            "periodo": periodo_txt,
             "funnel": {
                 "monitoreo_filtro_ok": monitoreo_filtro_ok,
                 "armed": armed,
@@ -758,15 +836,15 @@ async def get_stats_funnel(request: Request):
 
 
 @app.get("/api/stats/rechazos")
-async def get_stats_rechazos(request: Request):
+async def get_stats_rechazos(request: Request, dias: int = 1):
     """Rechazos por causa principal."""
     try:
         db = await _get_db()
-        hoy_local = now_local().strftime("%Y-%m-%d")
+        fecha_desde, _fecha_hoy, _ts_desde, _ts_hasta = _rango_stats(dias)
 
         cursor = await db.execute(
-            "SELECT rechazos_json FROM auditoria_eventos WHERE tipo = 'RECHAZADO' AND fecha = ?",
-            (hoy_local,)
+            "SELECT rechazos_json FROM auditoria_eventos WHERE tipo = 'RECHAZADO' AND fecha >= ?",
+            (fecha_desde,)
         )
         rows = await cursor.fetchall()
 
@@ -778,32 +856,15 @@ async def get_stats_rechazos(request: Request):
                 try:
                     rechazos_list = json.loads(msg)
                     msg = "; ".join(rechazos_list) if rechazos_list else ""
-                except:
+                except Exception:
                     pass
-            causa = "OTRO"
-            if msg:
-                if "ADX" in msg.upper():
-                    causa = "ADX"
-                elif "VOLUMEN" in msg.upper() or "VOLUME" in msg.upper():
-                    causa = "VOLUMEN"
-                elif "RSI" in msg.upper():
-                    causa = "RSI"
-                elif "MFM" in msg.upper():
-                    causa = "MFM"
-                elif "MACD" in msg.upper():
-                    causa = "MACD"
-                elif "ATR" in msg.upper():
-                    causa = "ATR"
-                elif "DIRECCION" in msg.upper() or "NEUTRAL" in msg.upper():
-                    causa = "DIRECCION_NEUTRAL"
-                elif "CAPITAL" in msg.upper() or "NOTIONAL" in msg.upper():
-                    causa = "CAPITAL"
+            causa = _clasificar_causa(msg) if msg else "OTRO"
+            if msg and causa == "OTRO":
+                parts = msg.split(':')
+                if len(parts) > 1:
+                    causa = parts[0].strip().upper()[:20]
                 else:
-                    parts = msg.split(':')
-                    if len(parts) > 1:
-                        causa = parts[0].strip().upper()[:20]
-                    else:
-                        causa = msg.split()[0].upper()[:20] if msg.split() else "OTRO"
+                    causa = msg.split()[0].upper()[:20] if msg.split() else "OTRO"
             causas[causa] = causas.get(causa, 0) + 1
             total += 1
 
@@ -811,6 +872,8 @@ async def get_stats_rechazos(request: Request):
 
         return {
             "estado": "success",
+            "dias": dias,
+            "fecha_desde": fecha_desde,
             "total_rechazos": total,
             "causas": lista_causas,
         }
@@ -835,7 +898,7 @@ async def get_stats_equity(request: Request, dias: int = 1):
         cursor = await db.execute(
             """
             SELECT 
-                strftime('%Y-%m-%d %H:00:00', datetime(timestamp_ms/1000, 'unixepoch')) as hora,
+                DATE_FORMAT(FROM_UNIXTIME(timestamp_ms/1000), '%Y-%m-%d %H:00:00') as hora,
                 SUM(realized_pnl) as pnl_hora,
                 COUNT(*) as trades_hora
             FROM pnl_eventos
@@ -865,11 +928,11 @@ async def get_stats_equity(request: Request, dias: int = 1):
 
 
 @app.get("/api/stats/latency")
-async def get_stats_latency(request: Request):
+async def get_stats_latency(request: Request, dias: int = 1):
     """Tiempo promedio que pasa una moneda en ARMED antes de decisión."""
     try:
         db = await _get_db()
-        hoy_local = now_local().strftime("%Y-%m-%d")
+        fecha_desde, _fecha_hoy, _ts_desde, _ts_hasta = _rango_stats(dias)
 
         cursor = await db.execute(
             """
@@ -879,23 +942,19 @@ async def get_stats_latency(request: Request):
                     AND a2.timestamp_utc > a1.timestamp_utc 
                     ORDER BY a2.timestamp_utc ASC LIMIT 1) as t_decision
             FROM auditoria_eventos a1
-            WHERE a1.tipo = 'CAMBIO_ESTADO' AND a1.fecha = ? AND a1.estado_maquina LIKE '%ARMED%'
+            WHERE a1.tipo = 'CAMBIO_ESTADO' AND a1.fecha >= ? AND a1.estado_maquina LIKE '%ARMED%'
             """,
-            (hoy_local,)
+            (fecha_desde,)
         )
         rows = await cursor.fetchall()
 
         latencias = []
         for row in rows:
             if row[2]:
-                try:
-                    t1 = datetime.fromisoformat(str(row[1]).replace('Z', '+00:00')) if isinstance(row[1], str) else row[1]
-                    t2 = datetime.fromisoformat(str(row[2]).replace('Z', '+00:00')) if isinstance(row[2], str) else row[2]
-                    if hasattr(t1, 'timestamp') and hasattr(t2, 'timestamp'):
-                        delta = (t2.timestamp() - t1.timestamp())
-                        latencias.append({"symbol": row[0], "segundos": round(delta, 1)})
-                except Exception:
-                    pass
+                t1 = _parse_ts_utc(row[1])
+                t2 = _parse_ts_utc(row[2])
+                if t1 and t2:
+                    latencias.append({"symbol": row[0], "segundos": round((t2 - t1).total_seconds(), 1)})
 
         if latencias:
             avg = sum(l["segundos"] for l in latencias) / len(latencias)
@@ -906,6 +965,8 @@ async def get_stats_latency(request: Request):
 
         return {
             "estado": "success",
+            "dias": dias,
+            "fecha_desde": fecha_desde,
             "count": len(latencias),
             "avg_segundos": round(avg, 1) if avg is not None else None,
             "max_segundos": round(max_l, 1) if max_l is not None else None,
@@ -918,49 +979,63 @@ async def get_stats_latency(request: Request):
 
 
 @app.get("/api/stats/filter-efficiency")
-async def get_stats_filter_efficiency(request: Request):
-    """Eficiencia por filtro: ¿cuántos rechazos de cada tipo resultaron en near-miss acertado?"""
+async def get_stats_filter_efficiency(request: Request, dias: int = 1):
+    """Eficiencia por filtro: ¿cuántos rechazos de cada tipo resultaron en near-miss acertado?
+
+    FIX: el JOIN anterior comparaba timestamp_utc (VARCHAR ISO) con
+    FROM_UNIXTIME() (datetime) y multiplicaba filas. Ahora se resuelve en
+    Python tomando el RECHAZADO previo más cercano de cada near-miss.
+    """
     try:
         db = await _get_db()
-        hoy_local = now_local().strftime("%Y-%m-%d")
+        fecha_desde, _fecha_hoy, ts_desde, ts_hasta = _rango_stats(dias)
 
-        # Para cada near-miss acertado, buscar el rechazo previo más cercano de la misma moneda
+        # Rechazos del período, por moneda, ordenados por tiempo
         cursor = await db.execute(
-            """
-            SELECT nm.symbol, nm.acerto_bot, nm.timestamp_inicio, ae.rechazos_json
-            FROM near_miss_seguimientos nm
-            LEFT JOIN auditoria_eventos ae ON ae.symbol = nm.symbol 
-                AND ae.tipo = 'RECHAZADO' 
-                AND ae.timestamp_utc < datetime(nm.timestamp_inicio, 'unixepoch')
-            WHERE nm.timestamp_fin IS NOT NULL AND date(datetime(nm.timestamp_inicio, 'unixepoch')) = ?
-            ORDER BY nm.timestamp_inicio ASC
-            """,
-            (hoy_local,)
+            "SELECT symbol, timestamp_utc, rechazos_json FROM auditoria_eventos "
+            "WHERE tipo = 'RECHAZADO' AND fecha >= ? ORDER BY symbol ASC, timestamp_utc ASC",
+            (fecha_desde,)
         )
-        rows = await cursor.fetchall()
+        rechazos_rows = await cursor.fetchall()
 
-        # Agrupar por causa de rechazo
+        rechazos_por_symbol = {}
+        for r in rechazos_rows:
+            dt = _parse_ts_utc(r[1])
+            if dt is None:
+                continue
+            rechazos_por_symbol.setdefault(r[0], []).append((dt, r[2] or ""))
+
+        # Near-misses finalizados del período
+        cursor = await db.execute(
+            "SELECT symbol, acerto_bot, timestamp_inicio FROM near_miss_seguimientos "
+            "WHERE timestamp_fin IS NOT NULL AND timestamp_inicio >= ? AND timestamp_inicio < ? "
+            "ORDER BY timestamp_inicio ASC",
+            (ts_desde, ts_hasta)
+        )
+        nm_rows = await cursor.fetchall()
+
         eficiencia = {}
-        for row in rows:
-            rechazos_json = row[3] or ""
-            acerto = row[1]
+        for row in nm_rows:
+            symbol, acerto, ts_inicio = row[0], row[1], row[2]
+            cand = rechazos_por_symbol.get(symbol)
+            if not cand:
+                continue
+            # Último RECHAZADO de la moneda previo al inicio del near-miss
+            previo = None
+            for dt, rechazos_json in cand:
+                if dt.timestamp() < float(ts_inicio or 0):
+                    previo = rechazos_json
+                else:
+                    break
+            if not previo:
+                continue
             try:
-                rechazos = json.loads(rechazos_json) if rechazos_json else []
-            except:
-                rechazos = [rechazos_json]
+                rechazos = json.loads(previo) if previo else []
+            except Exception:
+                rechazos = [previo]
 
             for r in rechazos:
-                causa = "OTRO"
-                r_str = str(r).upper()
-                if "ADX" in r_str: causa = "ADX"
-                elif "VOLUMEN" in r_str or "VOLUME" in r_str: causa = "VOLUMEN"
-                elif "RSI" in r_str: causa = "RSI"
-                elif "MFM" in r_str: causa = "MFM"
-                elif "MACD" in r_str: causa = "MACD"
-                elif "ATR" in r_str: causa = "ATR"
-                elif "DIRECCION" in r_str or "NEUTRAL" in r_str: causa = "DIRECCION_NEUTRAL"
-                elif "CAPITAL" in r_str or "NOTIONAL" in r_str: causa = "CAPITAL"
-
+                causa = _clasificar_causa(r)
                 if causa not in eficiencia:
                     eficiencia[causa] = {"total": 0, "acertados": 0, "fallados": 0}
                 eficiencia[causa]["total"] += 1
@@ -979,22 +1054,22 @@ async def get_stats_filter_efficiency(request: Request):
                 "precision": round((data["acertados"] / data["total"] * 100), 1) if data["total"] > 0 else 0
             })
 
-        return {"estado": "success", "data": result}
+        return {"estado": "success", "dias": dias, "fecha_desde": fecha_desde, "data": result}
     except Exception as e:
         logger.error(f"Error filter efficiency: {e}")
         return {"estado": "failed", "error": str(e)}
 
 
 @app.get("/api/stats/score-distribution")
-async def get_stats_score_distribution(request: Request):
+async def get_stats_score_distribution(request: Request, dias: int = 1):
     """Distribución de scores en FIRE vs RECHAZADO."""
     try:
         db = await _get_db()
-        hoy_local = now_local().strftime("%Y-%m-%d")
+        fecha_desde, _fecha_hoy, _ts_desde, _ts_hasta = _rango_stats(dias)
 
         cursor = await db.execute(
-            "SELECT score, tipo FROM auditoria_eventos WHERE fecha = ? AND tipo IN ('FIRE', 'RECHAZADO') AND score IS NOT NULL",
-            (hoy_local,)
+            "SELECT score, tipo FROM auditoria_eventos WHERE fecha >= ? AND tipo IN ('FIRE', 'RECHAZADO') AND score IS NOT NULL",
+            (fecha_desde,)
         )
         rows = await cursor.fetchall()
 
@@ -1015,6 +1090,8 @@ async def get_stats_score_distribution(request: Request):
 
         return {
             "estado": "success",
+            "dias": dias,
+            "fecha_desde": fecha_desde,
             "fire": {"count": len(fire_scores), "avg": round(sum(fire_scores)/len(fire_scores), 1) if fire_scores else None, "buckets": buckets(fire_scores)},
             "rechazados": {"count": len(reject_scores), "avg": round(sum(reject_scores)/len(reject_scores), 1) if reject_scores else None, "buckets": buckets(reject_scores)}
         }
@@ -1147,20 +1224,20 @@ async def get_stats_risk_reward(request: Request, dias: int = 7):
 
 
 @app.get("/api/stats/missed-opportunities")
-async def get_stats_missed_opportunities(request: Request):
+async def get_stats_missed_opportunities(request: Request, dias: int = 1):
     """Oportunidades perdidas rentables: near-misses donde hubiera_sido_rentable=1 pero el bot rechazó."""
     try:
         db = await _get_db()
-        hoy_local = now_local().strftime("%Y-%m-%d")
+        fecha_desde, _fecha_hoy, ts_desde, ts_hasta = _rango_stats(dias)
 
         cursor = await db.execute(
             """
             SELECT symbol, score, umbral, movimiento_pct, direccion_nm, filtros_rechazo
             FROM near_miss_seguimientos
-            WHERE hubiera_sido_rentable = 1 AND date(datetime(timestamp_inicio, 'unixepoch')) = ?
+            WHERE hubiera_sido_rentable = 1 AND timestamp_inicio >= ? AND timestamp_inicio < ?
             ORDER BY movimiento_pct DESC
             """,
-            (hoy_local,)
+            (ts_desde, ts_hasta)
         )
         rows = await cursor.fetchall()
 
@@ -1169,7 +1246,7 @@ async def get_stats_missed_opportunities(request: Request):
             filtros = []
             try:
                 filtros = json.loads(row[5]) if row[5] else []
-            except:
+            except Exception:
                 filtros = [str(row[5])] if row[5] else []
             result.append({
                 "symbol": row[0],
@@ -1184,19 +1261,13 @@ async def get_stats_missed_opportunities(request: Request):
         por_filtro = {}
         for r in result:
             for f in r["filtros_rechazo"]:
-                causa = "OTRO"
-                f_str = str(f).upper()
-                if "ADX" in f_str: causa = "ADX"
-                elif "VOLUMEN" in f_str or "VOLUME" in f_str: causa = "VOLUMEN"
-                elif "RSI" in f_str: causa = "RSI"
-                elif "MFM" in f_str: causa = "MFM"
-                elif "MACD" in f_str: causa = "MACD"
-                elif "ATR" in f_str: causa = "ATR"
-                elif "DIRECCION" in f_str or "NEUTRAL" in f_str: causa = "DIRECCION_NEUTRAL"
+                causa = _clasificar_causa(f)
                 por_filtro[causa] = por_filtro.get(causa, 0) + 1
 
         return {
             "estado": "success",
+            "dias": dias,
+            "fecha_desde": fecha_desde,
             "total": len(result),
             "oportunidades": result[:50],  # Limitar
             "por_filtro": [{"causa": k, "count": v} for k, v in sorted(por_filtro.items(), key=lambda x: x[1], reverse=True)]
@@ -1862,56 +1933,80 @@ async def orquestador_eventos(queue_eventos: asyncio.Queue, precios_vivo: dict,
 # -------------------------------------------------------------------------------
 
 @app.get("/api/stats/extended")
-async def get_stats_extended(request: Request):
+async def get_stats_extended(request: Request, dias: int = 1):
     """KPIs globales agregados de toda la base de datos. V6.2: Alineado a grid_ejecuciones."""
     try:
         db = await _get_db()
-        hoy_local = now_local().strftime("%Y-%m-%d")
-        ts_inicio_dia = datetime.now(pytz.UTC).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        fecha_desde, fecha_hoy, ts_desde, _ts_hasta = _rango_stats(dias)
 
-        cursor = await db.execute("SELECT count(*) FROM auditoria_eventos WHERE tipo = 'FIRE' AND fecha = ?", (hoy_local,))
-        fires_hoy = (await cursor.fetchone())[0]
+        cursor = await db.execute(
+            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'FIRE' AND fecha >= ?",
+            (fecha_desde,)
+        )
+        fires_total = (await cursor.fetchone())[0]
 
-        cursor = await db.execute("SELECT count(*) FROM auditoria_eventos WHERE tipo = 'RECHAZADO' AND fecha = ?", (hoy_local,))
-        rechazados_hoy = (await cursor.fetchone())[0]
+        cursor = await db.execute(
+            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'RECHAZADO' AND fecha >= ?",
+            (fecha_desde,)
+        )
+        rechazados_total = (await cursor.fetchone())[0]
 
-        cursor = await db.execute("SELECT count(*) FROM auditoria_eventos WHERE tipo = 'ARMED' AND fecha = ?", (hoy_local,))
-        armed_hoy = (await cursor.fetchone())[0]
+        # FIX: no existe tipo='ARMED'; las entradas a ARMED son CAMBIO_ESTADO
+        cursor = await db.execute(
+            "SELECT count(*) FROM auditoria_eventos WHERE tipo = 'CAMBIO_ESTADO' AND estado_maquina LIKE '%ARMED%' AND fecha >= ?",
+            (fecha_desde,)
+        )
+        armed_total = (await cursor.fetchone())[0]
 
-        cursor = await db.execute("SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ?", (ts_inicio_dia,))
+        cursor = await db.execute(
+            "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ?",
+            (ts_desde,)
+        )
         nm_total = (await cursor.fetchone())[0]
 
-        cursor = await db.execute("SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND timestamp_fin IS NOT NULL", (ts_inicio_dia,))
+        cursor = await db.execute(
+            "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND timestamp_fin IS NOT NULL",
+            (ts_desde,)
+        )
         nm_finalizados = (await cursor.fetchone())[0]
 
-        cursor = await db.execute("SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND timestamp_fin IS NOT NULL AND acerto_bot = 1", (ts_inicio_dia,))
+        cursor = await db.execute(
+            "SELECT count(*) FROM near_miss_seguimientos WHERE timestamp_inicio >= ? AND timestamp_fin IS NOT NULL AND acerto_bot = 1",
+            (ts_desde,)
+        )
         nm_acertados = (await cursor.fetchone())[0]
 
         # V6.2 FIX: Leer desde grid_ejecuciones (real), no grid_estados (legacy)
         cursor = await db.execute(
-            "SELECT count(*) FROM grid_ejecuciones WHERE date(datetime(timestamp_inicio, 'unixepoch')) = ?",
-            (hoy_local,)
+            "SELECT count(*) FROM grid_ejecuciones WHERE timestamp_inicio >= ?",
+            (ts_desde,)
         )
         grids_total = (await cursor.fetchone())[0]
 
         cursor = await db.execute(
-            "SELECT COALESCE(SUM(pnl_real), 0), COALESCE(SUM(fees_real), 0) FROM grid_ejecuciones WHERE date(datetime(timestamp_inicio, 'unixepoch')) = ?",
-            (hoy_local,)
+            "SELECT COALESCE(SUM(pnl_real), 0), COALESCE(SUM(fees_real), 0) FROM grid_ejecuciones WHERE timestamp_inicio >= ?",
+            (ts_desde,)
         )
         row = await cursor.fetchone()
         pnl_total = row[0] or 0
         fees_total = row[1] or 0
         ks_total = 0  # TODO: agregar campo trades_kill_switch a grid_ejecuciones si se necesita
 
-        cursor = await db.execute("SELECT AVG(score) FROM auditoria_eventos WHERE tipo = 'FIRE' AND fecha = ?", (hoy_local,))
+        cursor = await db.execute(
+            "SELECT AVG(score) FROM auditoria_eventos WHERE tipo = 'FIRE' AND fecha >= ?",
+            (fecha_desde,)
+        )
         avg_score_fire = (await cursor.fetchone())[0]
 
+        periodo_txt = "hoy" if dias == 1 else f"últimos {dias} días"
         return {
             "estado": "success",
-            "hoy": hoy_local,
-            "fires_hoy": fires_hoy,
-            "rechazados_hoy": rechazados_hoy,
-            "armed_hoy": armed_hoy,
+            "dias": dias,
+            "fecha_desde": fecha_desde,
+            "periodo": periodo_txt,
+            "fires_hoy": fires_total,
+            "rechazados_hoy": rechazados_total,
+            "armed_hoy": armed_total,
             "near_miss_total": nm_total,
             "near_miss_finalizados": nm_finalizados,
             "near_miss_acertados": nm_acertados,
@@ -2035,7 +2130,7 @@ async def get_grids(request: Request, symbol: str = None, estado_grid: str = Non
 
         query = f"""
             SELECT 
-                g.id AS grid_id, g.symbol, g.timestamp_inicio, timestamp_fin,
+                g.id AS grid_id, g.symbol, g.timestamp_inicio, g.closed_at AS timestamp_fin,
                 g.estado, g.direction, g.precio_entrada, g.grid_params_json,
                 g.pnl_real, g.fees_real, g.razon_cierre, g.trading_mode,
                 COALESCE(SUM(p.realized_pnl), 0) as pnl_verificado,
@@ -2077,7 +2172,7 @@ async def get_grids_legacy(request: Request, symbol: str = None, estado_grid: st
 
         query = f"""
             SELECT 
-                g.id AS grid_id, g.symbol, g.timestamp_inicio, g.closed_at as timestamp_fin,
+                g.id AS grid_id, g.symbol, g.timestamp_inicio, g.timestamp_fin AS timestamp_fin,
                 g.estado AS grid_estado, g.direccion, g.precio_entrada, g.grid_params_json,
                 s.id AS sim_id, s.precio_inicio, s.precio_fin, s.pnl_bruto,
                 s.pnl_neto, s.fees_totales, s.slippage_total, s.trades_completados,
