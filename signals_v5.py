@@ -2069,30 +2069,41 @@ class SignalGenerator:
         comisiones_ciclo = 2 * fee_taker               # 2 órdenes × 0.05% = 0.10%
         slippage_total = 2 * CONFIG.grid_slippage      # 2 órdenes × 0.03% = 0.06%
         breakeven = (comisiones_ciclo + slippage_total) * 100  # 0.16% costo real por round-trip
-        margen_seguridad = breakeven * CONFIG.grid_breakeven_mult
+        # FASE 4.1 (V8.0): el objetivo debe cubrir el ratio mínimo exigido.
+        # Si step < objetivo, comprimir niveles hasta el suelo operativo (5).
+        ratio_min = CONFIG.grid_ratio_rentabilidad_min
+        step_objetivo_pct = max(breakeven * ratio_min * 1.001, min_dist_pct)
+        min_levels = max(2, getattr(CONFIG, 'grid_min_grids_operativo', 5))
 
         auto_compressed = False
-        if CONFIG.grid_auto_compress and step_pct < margen_seguridad and grid_count > 2:
-            step_pct_objetivo = margen_seguridad
-            step_usdt_objetivo = (step_pct_objetivo / 100) * price
-            grid_count_nuevo = max(CONFIG.grid_min_grids, int(rango_total / step_usdt_objetivo))
-            
+        if CONFIG.grid_auto_compress and step_pct < step_objetivo_pct and grid_count > min_levels:
+            step_usdt_objetivo = (step_objetivo_pct / 100) * price
+            grid_count_nuevo = max(min_levels, int(rango_total / step_usdt_objetivo))
+
             if grid_count_nuevo < grid_count:
                 grid_count = grid_count_nuevo
                 step_usdt = rango_total / max(grid_count - 1, 1)
                 step_pct = (step_usdt / price) * 100
                 auto_compressed = True
-                print(f"  [GRID] {symbol} Auto-compresion: {grid_count} grids -> step_pct {step_pct:.3f}%")
+                print(f"  [GRID] {symbol} Auto-compresion: {grid_count} grids -> step_pct {step_pct:.3f}% (objetivo {step_objetivo_pct:.3f}%)")
 
         # FASE 4: Exigir ratio mínimo de rentabilidad (step_pct / breakeven >= ratio_min)
         ratio_rentabilidad = step_pct / breakeven if breakeven > 0 else 0
-        if ratio_rentabilidad < CONFIG.grid_ratio_rentabilidad_min:
-            rechazos.append(
-                f"Ratio rentabilidad {ratio_rentabilidad:.2f} < mín {CONFIG.grid_ratio_rentabilidad_min} "
-                f"(step {step_pct:.3f}% / breakeven {breakeven:.3f}%). Fees devorarían la ganancia")
-            return None, rechazos
+        bypass_testnet = (
+            CONFIG.trading_mode == 'TESTNET'
+            and getattr(CONFIG, 'grid_ratio_bypass_testnet', False)
+        )
+        if ratio_rentabilidad < ratio_min:
+            if bypass_testnet:
+                print(f"  [GRID] {symbol} TESTNET BYPASS ratio {ratio_rentabilidad:.2f} < {ratio_min:.1f} "
+                      f"(step {step_pct:.3f}% / breakeven {breakeven:.3f}%)")
+            else:
+                rechazos.append(
+                    f"Ratio rentabilidad {ratio_rentabilidad:.2f} < mín {ratio_min} "
+                    f"(step {step_pct:.3f}% / breakeven {breakeven:.3f}%). Fees devorarían la ganancia")
+                return None, rechazos
 
-        if step_pct < breakeven:
+        if step_pct < breakeven and not bypass_testnet:
             rechazos.append(f"step_pct {step_pct:.3f}% < breakeven {breakeven:.3f}%. Grid imposible de rentabilizar")
             return None, rechazos
 
@@ -2102,7 +2113,7 @@ class SignalGenerator:
             posicion_alerta = True
             print(f"  [GRID] {symbol} Posicion en rango extrema: {posicion:.1%}")
 
-        rentable = ratio_rentabilidad >= CONFIG.grid_ratio_rentabilidad_min
+        rentable = ratio_rentabilidad >= ratio_min or bypass_testnet
 
         qty_por_orden = round(poder_total / grid_count / price, 4) if grid_count > 0 and price > 0 else 0
 
@@ -2130,6 +2141,8 @@ class SignalGenerator:
             'recent_high': round(float(recent_high), 4),
             'recent_low': round(float(recent_low), 4),
             'auto_compressed': auto_compressed,
+            'step_objetivo_pct': round(step_objetivo_pct, 3),
+            'ratio_bypass_testnet': bypass_testnet,
             'posicion_extrema': posicion_alerta,
             'atr_seguro': round(float(atr_seguro), 6),
             'rango_mult': round(float(mult), 2),
