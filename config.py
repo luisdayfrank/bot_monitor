@@ -317,7 +317,7 @@ class Config(BaseModel):
     db_host: str = os.getenv("DB_HOST", "database-1.cnqsq0e6cf6z.eu-west-1.rds.amazonaws.com")
     db_port: int = int(os.getenv("DB_PORT", "3306"))
     db_user: str = os.getenv("DB_USER", "admin")
-    db_password: str = os.getenv("DB_PASSWORD", "160558446")
+    db_password: str = os.getenv("DB_PASSWORD", "1605584496")
     db_name: str = os.getenv("DB_NAME", "crypto_monitor")
     db_connect_timeout: int = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))
 
