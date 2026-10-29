@@ -1599,26 +1599,32 @@ class SignalGenerator:
             if lower > 0 and upper > 0 and upper > lower:
                 margen = 0.005
                 if price_1m > 0 and (price_1m < lower * (1 - margen) or price_1m > upper * (1 + margen)):
+                    # FASE 2: NO abortar/cerrar inmediatamente. Solo transicionar señal
+                    # a MONITOREO (sin nuevas entradas). El executor maneja los 3 niveles
+                    # de salida via _evaluar_rango_grid (pausa → timeout → hard stop).
                     state.estado = 'MONITOREO'
                     state.neutral_grid_timestamp = 0
-                    state.grid_params_neutral = None
-                    # V7.1 FASE 4: Limpiar debounce al salir de NEUTRAL_GRID
+                    # NO limpiar grid_params_neutral — el executor lo necesita para
+                    # la evaluación de rango en _evaluar_rango_grid.
                     if symbol in self._grid_pending_creation:
                         del self._grid_pending_creation[symbol]
-                    print(f"  [NEUTRAL_GRID] {symbol} -> MONITOREO (aborto emergencia: precio {price_1m:.4f} fuera de grid [{lower:.4f}, {upper:.4f}])")
+                    print(f"  ⚠️ [NEUTRAL_GRID] {symbol} -> MONITOREO (precio {price_1m:.4f} fuera de grid "
+                          f"[{lower:.4f}, {upper:.4f}] + margen 0.5%) — NIVEL 1: coverage pausado, "
+                          f"executor gestiona cierre por timeout/hard-stop")
                     if self.audit_logger:
                         await self.audit_logger.log_cambio_estado(
                             symbol=symbol, de='NEUTRAL_GRID', a='MONITOREO',
                             direccion='NEUTRAL', score_macro=state.score_macro_actual,
-                            contexto_macro={'razon': 'Aborto emergencia 1m: precio fuera de grid + 0.5%'}
+                            contexto_macro={'razon': 'Precio fuera de grid + 0.5% (NIVEL 1, sin cierre inmediato)'}
                         )
                         state._prev_estado = 'MONITOREO'
                         await self.audit_logger.log_evento_grid_simulacion(
-                            symbol=symbol, tipo='NEUTRAL_GRID_ABORT', grid_id=0,
-                            evento_simulacion={'razon': 'aborto_emergencia_1m', 'precio': price_1m, 'lower': lower, 'upper': upper},
+                            symbol=symbol, tipo='NEUTRAL_GRID_RANGO', grid_id=0,
+                            evento_simulacion={'razon': 'precio_fuera_rango_nivel_1', 'precio': price_1m, 'lower': lower, 'upper': upper},
                             pnl_acumulado=0.0
                         )
-                    await self._enviar_aborto_seguro(symbol, 'aborto_emergencia_1m')
+                    # FASE 2: NO enviar aborto al executor — dejar que _evaluar_rango_grid
+                    # gestione el cierre con timeout (grid_rango_timeout_min) o hard stop.
                     return
             elif lower > 0 and upper > 0 and upper <= lower:
                 print(f"  ⚠️ [NEUTRAL_GRID] {symbol} Grid params inválidos: upper({upper}) <= lower({lower}), abortando")
@@ -2037,13 +2043,13 @@ class SignalGenerator:
         perfil_max = coin_cfg.get('grid_niveles_max', CONFIG.grid_max_grids_hard)
         grid_count = min(grid_count, perfil_max)
 
-        step_usdt = rango_total / grid_count if grid_count > 0 else 0
+        step_usdt = rango_total / max(grid_count - 1, 1) if grid_count > 0 else 0
         step_pct = (step_usdt / price) * 100 if price > 0 else 0
 
         # FASE 2.5: Limitar grids para monedas caras (evita qty mínima inválida)
         if price > 100 and grid_count > 6:
             grid_count = 6
-            step_usdt = rango_total / grid_count if grid_count > 0 else 0
+            step_usdt = rango_total / max(grid_count - 1, 1) if grid_count > 0 else 0
             step_pct = (step_usdt / price) * 100 if price > 0 else 0
             print(f"  [GRID] {symbol} Grid limitado a 6 por precio > $100")
 
@@ -2057,9 +2063,12 @@ class SignalGenerator:
             else:
                 print(f"  [GRID] {symbol} TESTNET BYPASS: step_pct {step_pct:.3f}% < {effective_min_dist:.3f}%, forzando creación")
 
-        comisiones_ciclo = 2 * CONFIG.grid_fee_rate          # 0.10% (2 órdenes × 0.05%)
-        slippage_total = 2 * CONFIG.grid_slippage              # 0.10% (2 órdenes × 0.05%)
-        breakeven = (comisiones_ciclo + slippage_total) * 100  # 0.20% costo real por par
+        # FASE 4: Breakeven con taker fee (conservador — TPs y cierres de emergencia son taker)
+        # Antes usaba grid_fee_rate=0.0002 (maker+BNB) que subestimaba el costo real.
+        fee_taker = getattr(CONFIG, 'grid_neutral_sim_fee_rate', 0.0005)  # 0.05% taker
+        comisiones_ciclo = 2 * fee_taker               # 2 órdenes × 0.05% = 0.10%
+        slippage_total = 2 * CONFIG.grid_slippage      # 2 órdenes × 0.03% = 0.06%
+        breakeven = (comisiones_ciclo + slippage_total) * 100  # 0.16% costo real por round-trip
         margen_seguridad = breakeven * CONFIG.grid_breakeven_mult
 
         auto_compressed = False
@@ -2070,10 +2079,18 @@ class SignalGenerator:
             
             if grid_count_nuevo < grid_count:
                 grid_count = grid_count_nuevo
-                step_usdt = rango_total / grid_count
+                step_usdt = rango_total / max(grid_count - 1, 1)
                 step_pct = (step_usdt / price) * 100
                 auto_compressed = True
                 print(f"  [GRID] {symbol} Auto-compresion: {grid_count} grids -> step_pct {step_pct:.3f}%")
+
+        # FASE 4: Exigir ratio mínimo de rentabilidad (step_pct / breakeven >= ratio_min)
+        ratio_rentabilidad = step_pct / breakeven if breakeven > 0 else 0
+        if ratio_rentabilidad < CONFIG.grid_ratio_rentabilidad_min:
+            rechazos.append(
+                f"Ratio rentabilidad {ratio_rentabilidad:.2f} < mín {CONFIG.grid_ratio_rentabilidad_min} "
+                f"(step {step_pct:.3f}% / breakeven {breakeven:.3f}%). Fees devorarían la ganancia")
+            return None, rechazos
 
         if step_pct < breakeven:
             rechazos.append(f"step_pct {step_pct:.3f}% < breakeven {breakeven:.3f}%. Grid imposible de rentabilizar")
@@ -2085,7 +2102,7 @@ class SignalGenerator:
             posicion_alerta = True
             print(f"  [GRID] {symbol} Posicion en rango extrema: {posicion:.1%}")
 
-        rentable = step_pct >= breakeven
+        rentable = ratio_rentabilidad >= CONFIG.grid_ratio_rentabilidad_min
 
         qty_por_orden = round(poder_total / grid_count / price, 4) if grid_count > 0 and price > 0 else 0
 
@@ -2102,6 +2119,7 @@ class SignalGenerator:
             'step_usdt': round(float(step_usdt), 4),
             'step_pct': round(float(step_pct), 3),
             'breakeven_pct': round(breakeven, 3),
+            'ratio_rentabilidad': round(ratio_rentabilidad, 2),
             'capital_sugerido': capital,
             'apalancamiento_sugerido': leverage,
             'notional_por_orden': round(poder_total / grid_count, 2) if grid_count > 0 else 0,

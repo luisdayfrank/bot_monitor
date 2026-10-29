@@ -731,13 +731,15 @@ class GridEngine:
         report.add_diagnostic(f"REPONER: nivel {level.level_index} {level.side} @ {level.price}")
 
     def generate_decisions(self, report: CoverageReport, current_price: float,
-                          position_net: Decimal, hedge_mode: bool) -> List[GridDecision]:
+                          position_net: Decimal, hedge_mode: bool,
+                          lower_limit: float = None, upper_limit: float = None) -> List[GridDecision]:
         """
         Genera decisiones ejecutables a partir de un reporte de coverage.
 
         Filtros aplicados:
         - No reponer si hay posición contraria que sería aumentada
         - No reponer más de max_ops_per_tick por ciclo
+        - FASE 2: No reponer niveles FUERA del rango del grid (rango inmutable)
         - Prioridad: KILL_DUPLICATE > KILL_ORPHAN > REPLENISH
         """
         decisions = []
@@ -769,6 +771,15 @@ class GridEngine:
 
         # 3. Reponer niveles (prioridad 3, con verificaciones)
         for level in report.uncovered_levels:
+            # FASE 2: RANGO INMUTABLE — no reponer niveles fuera del rango original
+            if lower_limit is not None and upper_limit is not None:
+                if level.price < Decimal(str(lower_limit)) or level.price > Decimal(str(upper_limit)):
+                    report.add_diagnostic(
+                        f"SKIP_REPLENISH: nivel {level.level_index} @ {level.price} "
+                        f"fuera de rango [{lower_limit}, {upper_limit}]"
+                    )
+                    continue
+
             # Verificar side correcto dado el precio actual
             side, pos_side = self.level_map.side_for_price(level.price, current_price)
 

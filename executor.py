@@ -189,6 +189,12 @@ class GridExecutionState:
         self.cerrando = False
         self.timestamp_inicio = time.time()
 
+        # ═══ FASE 1-2: Protecciones anti-drenaje ═══
+        self.cierres_fallidos_consecutivos = 0     # FASE 1.4: contador de cierres fallidos
+        self.cierre_cooldown_hasta = 0.0            # FASE 1.4: timestamp de cooldown
+        self.fuera_rango_desde = None               # FASE 2: timestamp cuando precio salió del rango (None = dentro)
+        self._tp_intentos = {}                      # FASE 1.5: intentos fallidos de TP por pos_id
+
         self.pares_abiertos = []
 
         # ═══ FASE 2 PLAN 6.3: GridState propio del executor (autónomo) ═══
@@ -352,6 +358,10 @@ class GridExecutor:
         self._f45_ultimo_barrido: float = 0.0
         self._f45_cierres_hoy: int = 0
         self._f45_dia_contador: str = ""
+        # FASE 4: Contador de fees diarias (anti-drenaje por comisiones)
+        self._fees_diarias: float = 0.0
+        self._fees_dia_contador: str = ""
+        self._fees_pausa_activa: bool = False
 
     def _get_symbol_lock(self, symbol: str) -> asyncio.Lock:
         """Obtiene o crea un lock para un símbolo (V8)."""
@@ -1592,6 +1602,24 @@ class GridExecutor:
             if getattr(level, 'is_gap', False):
                 return False
 
+            # ── FASE 2: RANGO INMUTABLE — no reponer fuera del rango original ──
+            _gp = getattr(state, 'grid_params_neutral', None) or {}
+            if isinstance(_gp, dict) and _gp.get('lower_limit') is not None:
+                _lo = float(_gp['lower_limit'])
+                _hi = float(_gp['upper_limit'])
+                if float(level.price) < _lo or float(level.price) > _hi:
+                    print(f"  ⛔ [REPLENISH] {symbol} Nivel {level.level_index} @ {float(level.price):.6f} "
+                          f"FUERA de rango [{_lo:.6f}, {_hi:.6f}] → SKIP")
+                    return False
+
+            # ── FASE 3: LÍMITE DE POSICIONES simultáneas ──
+            if state.grid_state:
+                _abiertas = state.grid_state.contar_posiciones_abiertas()
+                _max_pos = CONFIG.grid_max_posiciones_simultaneas
+                if _abiertas >= _max_pos:
+                    print(f"  ⛔ [REPLENISH] {symbol} SKIP: {_abiertas}/{_max_pos} posiciones abiertas")
+                    return False
+
             # Registrar la orden vieja como cancelada por el propio bot (P5):
             # evita que el reconciliador la interprete como cancelación externa.
             if level.binance_order_id:
@@ -1684,7 +1712,11 @@ class GridExecutor:
             print(f"  ✅ [COVERAGE] {state.symbol} Orden {order_id} cancelada")
             return True
         except Exception as e:
-            print(f"  ⚠️ [COVERAGE] {state.symbol} Error cancelando {order_id}: {e}")
+            if '-2011' in str(e):
+                # FASE 5.2: -2011 "Unknown order" es ruido normal (la orden ya se llenó/canceló)
+                pass
+            else:
+                print(f"  ⚠️ [COVERAGE] {state.symbol} Error cancelando {order_id}: {e}")
             return False
 
     async def _on_fill_real(self, state: GridExecutionState, side: str, price: float,
@@ -1757,7 +1789,8 @@ class GridExecutor:
                 except Exception as e_learn:
                     print(f"  ⚠️ [LEARN] registrar_entrada {pos_id}: {e_learn}")
 
-        gs.fees_totales += fee_d
+            gs.fees_totales += fee_d
+            self._registrar_fee(float(fee_d))  # FASE 4: fee diaria
 
         # Actualizar posicion_neta del executor (para compatibilidad con código existente)
         if side == 'BUY':
@@ -1830,7 +1863,8 @@ class GridExecutor:
             state.posicion_neta += qty_d
         else:
             state.posicion_neta -= qty_d
-        gs.fees_totales += fee_d
+            gs.fees_totales += fee_d
+            self._registrar_fee(float(fee_d))  # FASE 4: fee diaria
 
         if pos is None:
             # No hay posición interna que matchear (ej: ya cerrada por emparejamiento).
@@ -1982,6 +2016,7 @@ class GridExecutor:
                 
                 gs.pnl_bruto += Decimal(str(pnl))
                 gs.fees_totales += Decimal(str(fee_cierre))
+                self._registrar_fee(float(fee_cierre))  # FASE 4: fee diaria
                 gs.pnl_neto = gs.pnl_bruto - gs.fees_totales
                 gs.trades_kill_switch += 1
                 
@@ -2208,6 +2243,23 @@ class GridExecutor:
                 await self._notificar_rechazo(symbol, "No alcanza notional mínimo ni con max leverage")
                 return
 
+            # FASE SIZING: Usar parámetros de signals para consistencia Telegram↔bot.
+            # Si capital_sugerido / apalancamiento_sugerido están en params, usarlos.
+            capital_sizing = float(params.get('capital_sugerido', CONFIG.trading_capital_max_usdt))
+            leverage_sizing = int(params.get('apalancamiento_sugerido', leverage))
+            _min_not = self._get_symbol_info(symbol).get('minNotional', 5.0)
+            _notional_test = capital_sizing * leverage_sizing / max(int(params['grid_count']), 1)
+            if _notional_test < _min_not * 1.2:
+                print(f"  ⚠️ [SIZING] {symbol} capital_sugerido×apal da notional ${_notional_test:.2f} "
+                      f"< min ${_min_not*1.2:.2f} → usando CONFIG (${CONFIG.trading_capital_max_usdt}×{leverage})")
+                capital_sizing = float(CONFIG.trading_capital_max_usdt)
+                leverage_sizing = leverage
+            else:
+                leverage = leverage_sizing  # Alinear leverage de Binance con el sizing
+                print(f"  ✅ [SIZING] {symbol} Usando params de signals: "
+                      f"capital=${capital_sizing} leverage={leverage_sizing}x "
+                      f"(notional/orden=${_notional_test:.2f})")
+
             # 2. Verificar leverage existente
             if symbol in self._symbol_leverage and self._symbol_leverage[symbol] != leverage:
                 leverage = self._symbol_leverage[symbol]
@@ -2234,7 +2286,7 @@ class GridExecutor:
 
             info = self._get_symbol_info(symbol)
             step_size = Decimal(str(info['stepSize']))
-            notional_total = Decimal(str(CONFIG.trading_capital_max_usdt)) * leverage
+            notional_total = Decimal(str(capital_sizing)) * Decimal(str(leverage_sizing))
             notional_orden = notional_total / int(params['grid_count'])
             qty_raw = notional_orden / Decimal(str(price))
             steps = int(qty_raw / step_size)
@@ -2247,8 +2299,8 @@ class GridExecutor:
             # 5. Guardar grid en MySQL/MariaDB
             grid_id = await guardar_grid_ejecucion(
                 symbol=symbol, direction=direction, trading_mode=CONFIG.trading_mode,
-                capital_asignado=CONFIG.trading_capital_max_usdt,
-                apalancamiento_usado=leverage, precio_entrada=price,
+                capital_asignado=capital_sizing,
+                apalancamiento_usado=leverage_sizing, precio_entrada=price,
                 grid_params_json=json.dumps(params),
                 timestamp_inicio=int(time.time())
             )
@@ -2375,6 +2427,22 @@ class GridExecutor:
                 await self._notificar_rechazo(symbol, "No alcanza notional mínimo ni con max leverage")
                 return
 
+            # FASE SIZING: Usar parámetros de signals para consistencia Telegram↔bot.
+            capital_sizing = float(params.get('capital_sugerido', CONFIG.trading_capital_max_usdt))
+            leverage_sizing = int(params.get('apalancamiento_sugerido', leverage))
+            _min_not = self._get_symbol_info(symbol).get('minNotional', 5.0)
+            _notional_test = capital_sizing * leverage_sizing / max(int(params['grid_count']), 1)
+            if _notional_test < _min_not * 1.2:
+                print(f"  ⚠️ [SIZING] {symbol} capital_sugerido×apal da notional ${_notional_test:.2f} "
+                      f"< min ${_min_not*1.2:.2f} → usando CONFIG (${CONFIG.trading_capital_max_usdt}×{leverage})")
+                capital_sizing = float(CONFIG.trading_capital_max_usdt)
+                leverage_sizing = leverage
+            else:
+                leverage = leverage_sizing  # Alinear leverage de Binance con el sizing
+                print(f"  ✅ [SIZING] {symbol} Usando params de signals: "
+                      f"capital=${capital_sizing} leverage={leverage_sizing}x "
+                      f"(notional/orden=${_notional_test:.2f})")
+
             # 2. Verificar leverage existente
             if symbol in self._symbol_leverage and self._symbol_leverage[symbol] != leverage:
                 leverage = self._symbol_leverage[symbol]
@@ -2413,7 +2481,7 @@ class GridExecutor:
             # 6. Calcular qty
             info = self._get_symbol_info(symbol)
             step_size = Decimal(str(info['stepSize']))
-            notional_total = Decimal(str(CONFIG.trading_capital_max_usdt)) * leverage
+            notional_total = Decimal(str(capital_sizing)) * Decimal(str(leverage_sizing))
             notional_orden = notional_total / int(params['grid_count'])
             qty_raw = notional_orden / Decimal(str(price))
             steps = int(qty_raw / step_size)
@@ -2426,8 +2494,8 @@ class GridExecutor:
             # 7. Guardar grid en DB (igual)
             grid_id = await guardar_grid_ejecucion(
                 symbol=symbol, direction='NEUTRAL', trading_mode=CONFIG.trading_mode,
-                capital_asignado=CONFIG.trading_capital_max_usdt,
-                apalancamiento_usado=leverage, precio_entrada=price,
+                capital_asignado=capital_sizing,
+                apalancamiento_usado=leverage_sizing, precio_entrada=price,
                 grid_params_json=json.dumps(params),
                 timestamp_inicio=int(time.time())
             )
@@ -3197,7 +3265,8 @@ class GridExecutor:
             state.posicion_neta -= Decimal(str(qty))
 
         # Actualizar fees y PnL real
-        state.fees_real += Decimal(str(commission))
+            state.fees_real += Decimal(str(commission))
+            self._registrar_fee(float(commission))  # FASE 4: fee diaria
         if realized_pnl != 0:
             state.pnl_real += Decimal(str(realized_pnl))
 
@@ -3517,6 +3586,18 @@ class GridExecutor:
                 print(f"  ⚠️ [LEARN-EXIT] {symbol}: {e_learn}")
 
         # ═══════════════════════════════════════════════════════════════════
+        # PASO 3.4: FASE 4 — VERIFICAR FEES DIARIAS
+        # ═══════════════════════════════════════════════════════════════════
+        if self._verificar_fees_diarias():
+            print(f"  🛑 [FEES] {symbol} Trading pausado por fees diarias excesivas")
+            return  # No procesar más este ciclo
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PASO 3.5: FASE 2 — EVALUAR RANGO DEL GRID (3 niveles de salida)
+        # ═══════════════════════════════════════════════════════════════════
+        await self._evaluar_rango_grid(symbol, state)
+
+        # ═══════════════════════════════════════════════════════════════════
         # PASO 4: EVALUAR KILL SWITCH
         # ═══════════════════════════════════════════════════════════════════
         if state.grid_mode == 'NEUTRAL' and state.grid_state:
@@ -3674,11 +3755,17 @@ class GridExecutor:
                             print(f"  ⚠️ [V8-ACTIVE] {symbol} open_orders sin confirmar → "
                                   f"coverage en modo observación este ciclo")
                         elif not reporte.is_clean():
+                            # FASE 2: pasar límites del grid para rango inmutable
+                            _gp = getattr(state, 'grid_params_neutral', None) or {}
+                            _lower = _gp.get('lower_limit') if isinstance(_gp, dict) else None
+                            _upper = _gp.get('upper_limit') if isinstance(_gp, dict) else None
                             decisiones = state.grid_engine.generate_decisions(
                                 reporte,
                                 current_price=self.precios_vivo.get(symbol, 0),
                                 position_net=state.posicion_neta,
-                                hedge_mode=self._hedge_mode
+                                hedge_mode=self._hedge_mode,
+                                lower_limit=_lower,
+                                upper_limit=_upper
                             )
 
                             acciones_ok = 0
@@ -3702,6 +3789,143 @@ class GridExecutor:
                     # V8: coverage nunca debe romper el monitoreo principal
                     print(f"  ⚠️ [V8] {symbol} Error en coverage: {e_v8}")
 
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 4: CONTADOR DE FEES DIARIAS + PAUSA AUTOMÁTICA
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    def _registrar_fee(self, monto: float):
+        """Registra una comisión en el contador diario. Reinicia al cambiar de día."""
+        hoy = time.strftime('%Y-%m-%d')
+        if hoy != self._fees_dia_contador:
+            self._fees_diarias = 0.0
+            self._fees_dia_contador = hoy
+            self._fees_pausa_activa = False
+        self._fees_diarias += abs(monto)
+
+    def _verificar_fees_diarias(self) -> bool:
+        """
+        FASE 4: Si las fees diarias superan el % configurado del capital,
+        pausar todo el trading. Retorna True si debe pausar.
+        """
+        hoy = time.strftime('%Y-%m-%d')
+        if hoy != self._fees_dia_contador:
+            self._fees_diarias = 0.0
+            self._fees_dia_contador = hoy
+            self._fees_pausa_activa = False
+
+        # Calcular capital total (suma de capitales de grids activos)
+        capital_total = sum(float(s.capital) for s in self._grids.values() if s.activa)
+        if capital_total <= 0:
+            capital_total = float(CONFIG.trading_capital_max_usdt)
+
+        limite = capital_total * (CONFIG.grid_fees_diarias_max_pct / 100)
+
+        if self._fees_diarias >= limite:
+            if not self._fees_pausa_activa:
+                self._fees_pausa_activa = True
+                print(f"  🛑 [FEES] Fees diarias ${self._fees_diarias:.2f} >= límite ${limite:.2f} "
+                      f"({CONFIG.grid_fees_diarias_max_pct}% de ${capital_total:.0f}) → PAUSA ACTIVADA")
+            return True
+
+        # Log periódico (cada ~$1 en fees)
+        if self._fees_diarias > 0 and int(self._fees_diarias * 2) % 2 == 0:
+            print(f"  💰 [FEES] Día: ${self._fees_diarias:.2f} / ${limite:.2f} "
+                  f"({self._fees_diarias/limite*100:.0f}%)")
+
+        return False
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 2: RANGO INMUTABLE — 3 NIVELES DE SALIDA
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    async def _evaluar_rango_grid(self, symbol: str, state: GridExecutionState):
+        """
+        FASE 2: Estrategia de salida en 3 niveles cuando el precio sale del rango.
+
+        NIVEL 1 (inmediato): Precio fuera del rango → coverage se pausa automáticamente
+            (gate en _recolocar_nivel). Se registra timestamp de salida.
+        NIVEL 2 (timeout): Precio fuera > grid_rango_timeout_min → cerrar posiciones.
+        NIVEL 3 (hard stop): Pérdida flotante > grid_max_perdida_pct → cierre inmediato.
+        """
+        if not state.activa or state.cerrando:
+            return
+
+        # Obtener límites del grid
+        _gp = getattr(state, 'grid_params_neutral', None) or {}
+        if not isinstance(_gp, dict) or _gp.get('lower_limit') is None:
+            return  # Sin parámetros de rango → no evaluar
+
+        lower = float(_gp['lower_limit'])
+        upper = float(_gp['upper_limit'])
+        precio = self.precios_vivo.get(symbol, 0)
+        if precio <= 0:
+            return
+
+        # ── NIVEL 3 (PRIMERO): Hard stop por pérdida flotante ──
+        if state.grid_state:
+            perdida_pct = self._calcular_perdida_flotante_pct(state, precio)
+            if perdida_pct >= CONFIG.grid_max_perdida_pct:
+                print(f"  🛑 [RANGO-N3] {symbol} Hard stop: pérdida flotante "
+                      f"{perdida_pct:.2f}% >= {CONFIG.grid_max_perdida_pct}% → cierre inmediato")
+                state.fuera_rango_desde = None
+                await self._abortar_grid(symbol, f'hard_stop_perdida_{perdida_pct:.2f}pct')
+                return
+
+        # ── Detectar si el precio está dentro del rango ──
+        en_rango = lower <= precio <= upper
+
+        if en_rango:
+            # Precio dentro del rango → resetear timer
+            if state.fuera_rango_desde is not None:
+                tiempo_fuera = time.time() - state.fuera_rango_desde
+                print(f"  ✅ [RANGO] {symbol} precio ${precio:.6f} volvió al rango "
+                      f"[{lower:.6f}, {upper:.6f}] tras {tiempo_fuera:.0f}s")
+                state.fuera_rango_desde = None
+            return
+
+        # ── Precio FUERA del rango ──
+        if state.fuera_rango_desde is None:
+            # NIVEL 1: Primera detección — registrar timestamp
+            state.fuera_rango_desde = time.time()
+            print(f"  ⚠️ [RANGO-N1] {symbol} precio ${precio:.6f} FUERA de rango "
+                  f"[{lower:.6f}, {upper:.6f}] → coverage PAUSADO, esperando retorno")
+            return
+
+        # NIVEL 2: ¿Ya pasó el timeout?
+        tiempo_fuera = time.time() - state.fuera_rango_desde
+        timeout_seg = CONFIG.grid_rango_timeout_min * 60
+
+        if tiempo_fuera > timeout_seg:
+            print(f"  🛑 [RANGO-N2] {symbol} precio fuera del rango por "
+                  f"{tiempo_fuera:.0f}s > {timeout_seg}s → cerrando posiciones")
+            state.fuera_rango_desde = None
+            await self._abortar_grid(symbol, f'timeout_fuera_rango_{int(tiempo_fuera)}s')
+        else:
+            # Todavía dentro del plazo → solo informar
+            restante = timeout_seg - tiempo_fuera
+            if int(tiempo_fuera) % 60 < 15:  # Log cada ~1 minuto
+                print(f"  ⏳ [RANGO-N1] {symbol} fuera de rango {tiempo_fuera:.0f}s "
+                      f"(quedan {restante:.0f}s para cierre)")
+
+    def _calcular_perdida_flotante_pct(self, state: GridExecutionState, precio_actual: float) -> float:
+        """Calcula la pérdida flotante como % del capital del grid."""
+        if not state.grid_state or not state.grid_state.posiciones:
+            return 0.0
+        total_perdida = 0.0
+        for pos in state.grid_state.posiciones:
+            if pos.estado != 'ABIERTA':
+                continue
+            if pos.direccion == 'LONG':
+                pnl = (precio_actual - float(pos.precio_entrada)) * float(pos.qty)
+            else:  # SHORT
+                pnl = (float(pos.precio_entrada) - precio_actual) * float(pos.qty)
+            if pnl < 0:
+                total_perdida += pnl
+        capital = float(state.capital) if state.capital else 1.0
+        if capital <= 0:
+            return 0.0
+        return abs(total_perdida) / capital * 100
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # FASE 4: KILL SWITCH ADAPTATIVO POR MODO
@@ -3735,6 +3959,12 @@ class GridExecutor:
             pos_actual = float(state.posicion_neta)
 
         if tiempo_vida > timeout_grid and pos_actual != 0:
+            # FASE 1.4: Respetar cooldown tras cierre fallido y máximo de intentos
+            cooldown_hasta = getattr(state, 'cierre_cooldown_hasta', 0)
+            if time.time() < cooldown_hasta:
+                return  # En cooldown, no reintentar aún
+            if getattr(state, 'cierres_fallidos_consecutivos', 0) >= CONFIG.grid_cierre_max_intentos:
+                return  # Máximo de intentos alcanzado, requiere intervención manual
             print(f"  🛑 [EXECUTOR] {symbol} Grid {state.grid_mode} vencido: {tiempo_vida}s > {timeout_grid}s")
             await self._abortar_grid(symbol, f'timeout_direccional_{tiempo_vida}s')
             return
@@ -3971,6 +4201,7 @@ class GridExecutor:
 
         # Actualizar estado en RAM (para respuesta rápida)
         state.fees_real += Decimal(str(commission))
+        self._registrar_fee(float(commission))  # FASE 4: fee diaria
 
         # El realized_pnl solo se suma al estado si es un evento de cierre
         # (Las entradas tienen realized_pnl = 0, los cierres tienen el PnL real)
@@ -4152,7 +4383,19 @@ class GridExecutor:
             print(f"  ✅ [E.3] {symbol} TP {side} reduceOnly @ ${tp_price} | Qty:{qty_total} | Origen:{binance_order_id}")
 
         except Exception as e:
-            print(f"  ⚠️ [E.3] {symbol} Error colocando TP {side} @ ${tp_price}: {e}")
+            err_str = str(e)
+            if '-2022' in err_str or 'ReduceOnly' in err_str:
+                # FASE 1.5: -2022 en TP → la posición puede no existir. No reintentar indefinidamente.
+                pos_tp_intentos = getattr(state, '_tp_intentos', {})
+                count = pos_tp_intentos.get(pos_id, 0) + 1
+                pos_tp_intentos[pos_id] = count
+                state._tp_intentos = pos_tp_intentos
+                if count >= 3:
+                    print(f"  🔒 [E.3] {symbol} TP {side} -2022 ×{count} → SKIP definitivo para {pos_id}")
+                else:
+                    print(f"  ⚠️ [E.3] {symbol} TP {side} -2022 (intento {count}/3) para {pos_id}: {e}")
+            else:
+                print(f"  ⚠️ [E.3] {symbol} Error colocando TP {side} @ ${tp_price}: {e}")
 
     async def _colocar_take_profit_neutral(self, symbol: str, state: GridExecutionState,
                                             orden_entry: dict, fill: dict, side_filled: str, pos_id: str):
@@ -4324,7 +4567,18 @@ class GridExecutor:
 
             print(f"  ✅ [E.2] {symbol} TP {tp_side} reduceOnly @ ${tp_price} | Qty:{qty} | Pos:{pos_id}")
         except Exception as e:
-            print(f"  ⚠️ [E.2] {symbol} Error TP neutral {tp_side} reduceOnly @ ${tp_price}: {e}")
+            err_str = str(e)
+            if '-2022' in err_str or 'ReduceOnly' in err_str:
+                pos_tp_intentos = getattr(state, '_tp_intentos', {})
+                count = pos_tp_intentos.get(pos_id, 0) + 1
+                pos_tp_intentos[pos_id] = count
+                state._tp_intentos = pos_tp_intentos
+                if count >= 3:
+                    print(f"  🔒 [E.2] {symbol} TP {tp_side} -2022 ×{count} → SKIP definitivo para {pos_id}")
+                else:
+                    print(f"  ⚠️ [E.2] {symbol} TP {tp_side} -2022 (intento {count}/3) para {pos_id}: {e}")
+            else:
+                print(f"  ⚠️ [E.2] {symbol} Error TP neutral {tp_side} reduceOnly @ ${tp_price}: {e}")
 
     async def _ejecutar_kill_switch_real(self, symbol: str, state: GridExecutionState,
                                           pos_id: str, pos_tipo: str, qty: float, 
@@ -4347,20 +4601,58 @@ class GridExecutor:
         
         print(f"  🛑 [CIERRE] Kill Switch {pos_tipo} {pos_id} | Razón: {razon}")
 
-        # FASE 3: Cancelar take-profit de la posición ANTES de cerrar
-        if state.grid_state:
-            for pos in state.grid_state.posiciones:
-                if pos.id == pos_id and pos.orden_cierre_id:
-                    try:
-                        self._registrar_cancelacion_propia(pos.orden_cierre_id)  # P5
-                        await self._api_call(asyncio.to_thread(
-                            self.client.futures_cancel_order,
-                            symbol=symbol, orderId=pos.orden_cierre_id
-                        ))
-                        print(f"  [CIERRE] TP {pos.orden_cierre_id} cancelado antes de kill switch")
-                    except Exception as e:
-                        print(f"  ⚠️ [CIERRE] Error cancelando TP: {e}")
-                    break
+        # FASE 1.3: Cancelar TODAS las órdenes abiertas del símbolo (no solo el TP)
+        # Esto elimina las órdenes reduceOnly pendientes que bloquean el cierre manual/automático.
+        try:
+            self._registrar_cancelacion_propia(f"KS_ALL_{symbol}")  # P5
+            await self._api_call(asyncio.to_thread(
+                self.client.futures_cancel_all_open_orders,
+                symbol=symbol
+            ))
+            print(f"  ✅ [CIERRE] Kill Switch: todas las órdenes de {symbol} canceladas")
+        except Exception as e_cancel:
+            print(f"  ⚠️ [CIERRE] Kill Switch: error cancelando órdenes: {e_cancel}")
+            # Fallback: cancelar al menos el TP de la posición
+            if state.grid_state:
+                for pos in state.grid_state.posiciones:
+                    if pos.id == pos_id and pos.orden_cierre_id:
+                        try:
+                            self._registrar_cancelacion_propia(pos.orden_cierre_id)
+                            await self._api_call(asyncio.to_thread(
+                                self.client.futures_cancel_order,
+                                symbol=symbol, orderId=pos.orden_cierre_id
+                            ))
+                        except Exception:
+                            pass
+                        break
+
+        # FASE 1.2: Verificar que la posición existe ANTES de enviar MARKET close
+        qty_real = float(qty)
+        try:
+            pos_verify = await self._api_call(asyncio.to_thread(
+                self.client.futures_position_information,
+                symbol=symbol
+            ))
+            if pos_verify:
+                if self._hedge_mode:
+                    amt_l = abs(self._get_position_amt_hedge(pos_verify, 'LONG'))
+                    amt_s = abs(self._get_position_amt_hedge(pos_verify, 'SHORT'))
+                    qty_binance = float(max(amt_l, amt_s))
+                else:
+                    qty_binance = abs(float(pos_verify[0].get('positionAmt', 0)))
+                if qty_binance < 0.0001:
+                    print(f"  ✅ [CIERRE] Kill Switch: posición ya es 0 en Binance, skip cierre")
+                    if state.grid_state:
+                        self._cerrar_posicion_por_id(
+                            state=state, pos_id=pos_id,
+                            precio_cierre=0, fee_cierre=0, binance_order_id=None
+                        )
+                    return
+                # Usar qty REAL de Binance (no el qty interno que puede estar desincronizado)
+                qty_real = qty_binance
+                print(f"  [CIERRE] Kill Switch: qty real Binance = {qty_real:.6f} (interno = {qty})")
+        except Exception as e_ver:
+            print(f"  ⚠️ [CIERRE] Kill Switch: verificación de posición falló: {e_ver}")
 
         # Cerrar con MARKET order (reduceOnly)
         side_cierre = 'SELL' if pos_tipo == 'LONG' else 'BUY'
@@ -4371,7 +4663,7 @@ class GridExecutor:
                 'symbol': symbol,
                 'side': side_cierre,
                 'type': 'MARKET',
-                'quantity': float(qty)
+                'quantity': float(qty_real)
             }
             # FASE D.1: HEDGE MODE — cerrar posición del lado específico
             # P1-A FIX: en HEDGE MODE Binance rechaza reduceOnly (-1106).
@@ -4440,7 +4732,7 @@ class GridExecutor:
                             side=side_cierre,
                             tipo_orden='CIERRE',
                             price=avg_price,
-                            quantity=float(qty)
+                            quantity=float(qty_real)
                         )
                         await _execute_with_retry(
                             "UPDATE grid_ejecucion_ordenes SET status = 'FILLED', quantity_filled = ? WHERE binance_order_id = ?",
@@ -4727,7 +5019,37 @@ class GridExecutor:
                     cierre.fallar("No se obtuvo orderId del cierre")
                     
             except Exception as e:
-                cierre.fallar(f"Error cerrando posición: {e}")
+                # FASE 1.1: Handler dedicado para error -2022 (ReduceOnly rejected)
+                err_str = str(e)
+                if '-2022' in err_str or 'ReduceOnly' in err_str:
+                    # Verificar si la posición realmente ya no existe en Binance
+                    try:
+                        pos_check = await self._api_call(asyncio.to_thread(
+                            self.client.futures_position_information,
+                            symbol=cierre.symbol
+                        ))
+                        qty_check = Decimal('0')
+                        if pos_check:
+                            if self._hedge_mode:
+                                amt_l = abs(self._get_position_amt_hedge(pos_check, 'LONG'))
+                                amt_s = abs(self._get_position_amt_hedge(pos_check, 'SHORT'))
+                                qty_check = max(amt_l, amt_s)
+                            else:
+                                qty_check = abs(Decimal(str(pos_check[0].get('positionAmt', 0))))
+                        if qty_check < Decimal('0.0001'):
+                            # Posición ya cerrada en Binance → no reintentar
+                            cierre.posicion_cerrada = True
+                            print(f"  ✅ [CIERRE] {cierre.symbol} -2022 pero posición ya es 0 en Binance → cerrada")
+                            cierre.avanzar('POSICION_CERRADA')
+                            return
+                        else:
+                            # Posición existe → el lado no coincide, intentar sin reduceOnly
+                            print(f"  ⚠️ [CIERRE] {cierre.symbol} -2022 pero posición={float(qty_check):.4f} → reintentando sin reduceOnly")
+                            cierre.fallar(f"-2022 con posición viva ({float(qty_check):.4f}): {e}")
+                    except Exception as e_check:
+                        cierre.fallar(f"-2022, verificación falló: {e_check}")
+                else:
+                    cierre.fallar(f"Error cerrando posición: {e}")
         
         cierre.avanzar('FALLIDO')
 
@@ -4877,6 +5199,12 @@ class GridExecutor:
         
         print(f"  🚨 [CIERRE] {cierre.symbol} CIERRE FALLIDO — Estado: {cierre.estado}")
         
+        # FASE 1.4: Contador de cierres fallidos consecutivos + cooldown
+        state.cierres_fallidos_consecutivos = getattr(state, 'cierres_fallidos_consecutivos', 0) + 1
+        state.cierre_cooldown_hasta = time.time() + CONFIG.grid_cierre_cooldown_seg
+        print(f"  ⏱️ [CIERRE] {cierre.symbol} Cooldown {CONFIG.grid_cierre_cooldown_seg}s | "
+              f"Fallidos consecutivos: {state.cierres_fallidos_consecutivos}/{CONFIG.grid_cierre_max_intentos}")
+
         # Alerta crítica
         if self.notifier:
             try:
@@ -4885,10 +5213,12 @@ class GridExecutor:
                     f"Razón original: {cierre.razon}\\n"
                     f"Estado final: {cierre.estado}\\n"
                     f"Intentos: {cierre.intentos}/{cierre.MAX_INTENTOS}\\n"
+                    f"Fallidos consecutivos: {state.cierres_fallidos_consecutivos}\\n"
                     f"Órdenes restantes: {cierre.ordenes_restantes or 'N/A'}\\n"
                     f"Posición final: {cierre.posicion_final or 'N/A'}\\n\\n"
                     f"<b>⚠️ INTERVENCIÓN MANUAL REQUERIDA</b>\\n"
-                    f"Verificar en Binance: posición y órdenes abiertas."
+                    f"Para cerrar: cancelar TODAS las órdenes del símbolo en Binance,"
+                    f" luego Cerrar posición con Market."
                 )
             except Exception as e:
                 print(f"  ⚠️ Error enviando alerta: {e}")
@@ -4902,9 +5232,13 @@ class GridExecutor:
             razon_cierre=f"{cierre.razon} | FALLIDO: {cierre.estado}"
         )
         
-        # NO eliminar del diccionario para mantener referencia
-        # state.activa = False  # ← NO, mantener para investigación
-        state.cerrando = False  # Permitir reintentar manualmente
+        # FASE 1.4: Si supera el máximo de intentos, NO permitir reintentar automáticamente
+        if state.cierres_fallidos_consecutivos >= CONFIG.grid_cierre_max_intentos:
+            state.cerrando = True  # Bloquear nuevos intentos automáticos
+            print(f"  🔒 [CIERRE] {cierre.symbol} MÁXIMO de cierres fallidos alcanzado. "
+                  f"NO se reintentará automáticamente. INTERVENCIÓN MANUAL.")
+        else:
+            state.cerrando = False  # Permitir reintento con cooldown
         
         print(f"  [CIERRE] {cierre.symbol} Grid marcado como CIERRE_FALLIDO. "
               f"NO se eliminó de memoria para investigación.")
