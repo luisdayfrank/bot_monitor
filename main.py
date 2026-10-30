@@ -59,6 +59,9 @@ async def lifespan(fastapi_app):
     else:
         print("  ℹ️ [FASE 1] Modo SIMULACIÓN (executor no activado)")
 
+    # PR-A Nota 3: aviso de cambio de contabilidad (el usuario verá el PnL "bajar" a neto)
+    print("  💰 [CONTABILIDAD] PnL mostrado es NETO (realizedPnl - commission). Antes se mostraba gross.")
+
     # F2.8: Crear todas las instancias PRIMERO (antes de inyectar dependencias)
     audit_logger = None
     audit_reporter = None

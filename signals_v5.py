@@ -263,16 +263,17 @@ class SignalGenerator:
     # ═══════════════════════════════════════════════════════════════════════════════
     def evaluar_aborto_neutral_grid(self, symbol: str, i15: dict, state: SignalState, timeout_moneda: int) -> Tuple[bool, str]:
         """
-        Evalua las 5 condiciones de aborto del estado NEUTRAL_GRID.
+        Evalua las condiciones de aborto del estado NEUTRAL_GRID.
         Se ejecuta en cada vela 15m mientras esta en NEUTRAL_GRID.
         Retorna: (abortar, razon)
 
-        Condiciones de aborto:
-        1. Timeout > 30 minutos
-        2. ADX explosivo: ADX > 25 (o +5 sobre entrada)
-        3. RSI extremo: RSI < 35 o RSI > 65
-        4. Ruptura EMAs: Precio se aleja > 2% de EMA50
-        5. ATR explosivo: ATR > p80 * 1.5
+        Condiciones de aborto (Fix E - Bloque 2):
+        1. Timeout > timeout_moneda (única salida no-forzada)
+        2. ATR explosivo: ATR > p80 * 2.5 (umbral elevado, era 1.5)
+
+        ADX y RSI NO deben abortar neutral: son señales direccionales.
+        Si ADX sube, el mecanismo neutral_grid_dir_consec >= 2 ya migra
+        la señal a LONG/SHORT sin cerrar el grid. El executor gestiona salida.
         """
         ahora = int(datetime.now(pytz.UTC).timestamp())
 
@@ -282,35 +283,13 @@ class SignalGenerator:
             if tiempo_min > timeout_moneda:
                 return True, f"Timeout: {tiempo_min:.0f}min > {timeout_moneda}min"
 
-        # 2. ADX explosivo (usa delta configurable sobre el umbral de entrada)
-        adx = i15.get('adx', 0)
-        adx_umbral_entrada = CONFIG.grid_neutral_adx_max
-        adx_umbral_aborto = adx_umbral_entrada + CONFIG.grid_neutral_aborto_adx_delta
-        if adx > adx_umbral_aborto:
-            return True, f"ADX {adx:.1f} > {adx_umbral_aborto:.1f} (umbral entrada {adx_umbral_entrada} + delta {CONFIG.grid_neutral_aborto_adx_delta})"
-
-        # 3. RSI extremo
-        rsi = i15.get('rsi', 50)
-        if rsi < CONFIG.grid_neutral_rsi_min:
-            return True, f"RSI {rsi:.1f} < {CONFIG.grid_neutral_rsi_min} (sobreventa extrema)"
-        if rsi > CONFIG.grid_neutral_rsi_max:
-            return True, f"RSI {rsi:.1f} > {CONFIG.grid_neutral_rsi_max} (sobrecompra extrema)"
-
-        # 4. Ruptura EMAs (> 2% de distancia)
-        price = i15.get('close', 0)
-        ema50 = i15.get('ema50_15m') or price
-        if price > 0 and ema50 > 0:
-            distancia_pct = abs(price - ema50) / ema50 * 100
-            if distancia_pct > CONFIG.grid_neutral_aborto_precio_pct:
-                return True, f"Precio rompe EMA50: {distancia_pct:.2f}% > {CONFIG.grid_neutral_aborto_precio_pct}%"
-
-        # 5. ATR explosivo
+        # 2. ATR explosivo: umbral más alto (2.5 en vez de 1.5)
         atr = i15.get('atr', 0)
         atr_hist = self._atr15m_historico.get(symbol, [])
         if len(atr_hist) >= 20 and atr > 0:
             atr_p80 = np.percentile(atr_hist, 80)
-            if atr_p80 > 0 and atr > atr_p80 * 1.5:
-                return True, f"ATR explosivo: {atr:.6f} > p80*1.5 ({atr_p80*1.5:.6f})"
+            if atr_p80 > 0 and atr > atr_p80 * 2.5:
+                return True, f"ATR explosivo: {atr:.6f} > p80*2.5 ({atr_p80*2.5:.6f})"
 
         return False, ""
 
@@ -1606,6 +1585,10 @@ class SignalGenerator:
                     state.neutral_grid_timestamp = 0
                     # NO limpiar grid_params_neutral — el executor lo necesita para
                     # la evaluación de rango en _evaluar_rango_grid.
+                    # NOTA DE CONSISTENCIA: la ruta de aborto macro (run() 15m, timeout/ATR)
+                    # SÍ lo limpia porque signals abandona el grid por completo. Aquí solo
+                    # se pausa la generación de señales (N1) y el executor sigue gestionando
+                    # el cierre por timeout (N2) o hard stop (N3) con los params intactos.
                     if symbol in self._grid_pending_creation:
                         del self._grid_pending_creation[symbol]
                     print(f"  ⚠️ [NEUTRAL_GRID] {symbol} -> MONITOREO (precio {price_1m:.4f} fuera de grid "
@@ -2063,12 +2046,10 @@ class SignalGenerator:
             else:
                 print(f"  [GRID] {symbol} TESTNET BYPASS: step_pct {step_pct:.3f}% < {effective_min_dist:.3f}%, forzando creación")
 
-        # FASE 4: Breakeven con taker fee (conservador — TPs y cierres de emergencia son taker)
-        # Antes usaba grid_fee_rate=0.0002 (maker+BNB) que subestimaba el costo real.
-        fee_taker = getattr(CONFIG, 'grid_neutral_sim_fee_rate', 0.0005)  # 0.05% taker
-        comisiones_ciclo = 2 * fee_taker               # 2 órdenes × 0.05% = 0.10%
-        slippage_total = 2 * CONFIG.grid_slippage      # 2 órdenes × 0.03% = 0.06%
-        breakeven = (comisiones_ciclo + slippage_total) * 100  # 0.16% costo real por round-trip
+        # FASE 4: Breakeven honesto — entry y TP son LIMIT (maker en ambos lados).
+        # slippage NO aplica al ciclo limit-limit (solo en abortos, ver Fix C).
+        fee_maker = CONFIG.grid_fee_rate                     # 0.02%
+        breakeven = 2 * fee_maker * 100                      # 0.04% (era 0.16%)
         # FASE 4.1 (V8.0): el objetivo debe cubrir el ratio mínimo exigido.
         # Si step < objetivo, comprimir niveles hasta el suelo operativo (5).
         ratio_min = CONFIG.grid_ratio_rentabilidad_min

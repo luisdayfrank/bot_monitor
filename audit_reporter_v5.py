@@ -9,6 +9,10 @@ from database_v5 import (
     cargar_eventos_post_evento, cargar_velas_post_evento,
     # V5.7: Funciones para near-miss seguimientos
     cargar_near_miss_seguimientos_dia,
+    # FIX F (Bloque 4): resumen financiero desde pnl_eventos / grid_ejecuciones
+    calcular_resumen_financiero_dia,
+    calcular_resumen_financiero_dia_por_symbol,
+    resumen_financiero_vacio,
     utc_to_local, now_local, now_utc, local_to_utc
 )
 
@@ -62,6 +66,8 @@ class AuditReporter:
             eventos_raw = await cargar_eventos_dia(fecha_reporte)
             # V5.7: Cargar near-miss seguimientos tambien
             near_miss_seguimientos = await cargar_near_miss_seguimientos_dia(fecha_reporte)
+            # FIX F (Bloque 4): resumen financiero del día (pnl_eventos/grid_ejecuciones)
+            resumen_financiero = await calcular_resumen_financiero_dia(fecha_reporte)
 
             if not eventos_raw and not near_miss_seguimientos:
                 print(f"  [AVISO] Sin eventos para {fecha_reporte}")
@@ -79,12 +85,19 @@ class AuditReporter:
                     eventos_por_moneda[sym] = []
                 eventos_por_moneda[sym].append(ev)
 
-            # Generar JSON por moneda
+            # FIX #4b: UNA sola query con GROUP BY symbol en lugar de N+1 (una por moneda)
+            resumenes_por_symbol = await calcular_resumen_financiero_dia_por_symbol(fecha_reporte)
+
+            # Generar JSON por moneda (resumen financiero POR SÍMBOLO - Fix Bug #3)
             archivos_generados = []
             for symbol, eventos in eventos_por_moneda.items():
                 # V5.7: Filtrar near-miss seguimientos por moneda
                 nm_seguimientos_moneda = [nm for nm in near_miss_seguimientos if nm.get('symbol') == symbol]
-                json_data = await self._generar_json_moneda(symbol, fecha_reporte, eventos, nm_seguimientos_moneda)
+                # Fix Bug #3: resumen financiero filtrado por símbolo, desde mapa precalculado (1 query)
+                resumen_symbol = resumenes_por_symbol.get(symbol, resumen_financiero_vacio())
+                json_data = await self._generar_json_moneda(
+                    symbol, fecha_reporte, eventos, nm_seguimientos_moneda,
+                    resumen_financiero=resumen_symbol)
 
                 db_dir = CONFIG.audit_export_dir
                 os.makedirs(db_dir, exist_ok=True)
@@ -97,7 +110,9 @@ class AuditReporter:
                 archivos_generados.append((filepath, filename))
 
             # Enviar resumen por Telegram
-            resumen = self._generar_resumen_texto(fecha_reporte, eventos_por_moneda, near_miss_seguimientos)
+            resumen = self._generar_resumen_texto(
+                fecha_reporte, eventos_por_moneda, near_miss_seguimientos,
+                resumen_financiero=resumen_financiero)
             await self.notifier.enviar_telegram(resumen)
 
             # Enviar archivos JSON + limpieza post-envio
@@ -151,7 +166,8 @@ class AuditReporter:
             )
 
     async def _generar_json_moneda(self, symbol: str, fecha: str, eventos: List[dict],
-                                    near_miss_seguimientos: List[dict] = None) -> dict:
+                                    near_miss_seguimientos: List[dict] = None,
+                                    resumen_financiero: dict = None) -> dict:
         """Genera el JSON completo para una moneda con auditoria granular."""
 
         near_miss_seguimientos = near_miss_seguimientos or []
@@ -343,7 +359,10 @@ class AuditReporter:
         recomendaciones = self._generar_recomendaciones(eventos, seguimiento_post, eventos_near_miss, eventos_neutral_grid)
 
         # PLAN 3.1: Calcular metricas de exito
-        metricas_exito = self._calcular_metricas_exito(eventos_fire, eventos_rechazados, near_miss_seguimientos)
+        metricas_exito = self._calcular_metricas_exito(
+            eventos_fire, eventos_rechazados, near_miss_seguimientos,
+            resumen_financiero=resumen_financiero,
+            seguimiento_post=seguimiento_post)
 
         resultado = {
             "meta": {
@@ -775,7 +794,8 @@ class AuditReporter:
     # ═══════════════════════════════════════════════════════════════════════════════
     # PLAN 3.1: METRICAS DE EXITO CLARAS
     # ═══════════════════════════════════════════════════════════════════════════════
-    def _calcular_metricas_exito(self, eventos_fire, eventos_rechazados, nm_seguimientos):
+    def _calcular_metricas_exito(self, eventos_fire, eventos_rechazados, nm_seguimientos,
+                                  resumen_financiero: dict = None, seguimiento_post: dict = None):
         """
         PLAN 3.1: Metricas de exito claras.
 
@@ -783,6 +803,13 @@ class AuditReporter:
         win_rate_rechazos: % de rechazos donde el bot acerto al NO disparar
         precision_near_miss: % de near-misses donde el bot acerto al rechazar
         sharpe_approx: ratio aproximado de aciertos / (aciertos + errores)
+
+        FIX F (Bloque 4): resumen_financiero alimentado desde
+        pnl_eventos/grid_ejecuciones (fuente de verdad), no de conteos de
+        eventos. La métrica clave es ratio_win_por_aborto (objetivo < 4).
+
+        PR-A Nota 1: win_rate_disparos se calcula con seguimiento_post
+        (variacion_total_pct vs direccion del FIRE).
         """
         metricas = {
             'win_rate_disparos': None,
@@ -792,6 +819,32 @@ class AuditReporter:
             'total_rechazados': len(eventos_rechazados),
             'total_nm_finalizados': len([nm for nm in nm_seguimientos if nm.get('timestamp_fin')]),
         }
+
+        # FIX F: resumen financiero del día (pnl neto, fees, abortos, ratio)
+        if resumen_financiero:
+            metricas['resumen_financiero'] = resumen_financiero
+
+        # PR-A Nota 1: win_rate_disparos real desde seguimiento_post
+        if seguimiento_post:
+            wins, total = 0, 0
+            for ev in eventos_fire:
+                seg = seguimiento_post.get(ev['timestamp_utc'])
+                if not seg:
+                    continue
+                var_pct = seg.get('estadisticas_recorrido', {}).get('variacion_total_pct', 0)
+                dirn = seg.get('direccion')
+                if dirn == 'SHORT':
+                    correcto = var_pct < 0
+                elif dirn == 'LONG':
+                    correcto = var_pct > 0
+                else:
+                    continue
+                total += 1
+                if correcto:
+                    wins += 1
+            if total > 0:
+                metricas['win_rate_disparos'] = round(wins / total * 100, 1)
+                metricas['fire_evaluados'] = total
 
         # Near-miss precision = win_rate_rechazos (misma métrica: ¿el bot acertó al rechazar?)
         nm_finalizados = [nm for nm in nm_seguimientos if nm.get('timestamp_fin')]
@@ -803,12 +856,13 @@ class AuditReporter:
             metricas['bot_acerto'] = acertados
             metricas['bot_fallo'] = len(nm_finalizados) - acertados
         else:
-            metricas['win_rate_rechazos'] = 0.0  # ← AÑADIR: evitar None
+            metricas['win_rate_rechazos'] = None  # PR-A Nota 1: sin datos ≠ 0% win rate
 
         return metricas
 
     def _generar_resumen_texto(self, fecha: str, eventos_por_moneda: Dict,
-                                near_miss_seguimientos: List[dict] = None) -> str:
+                                near_miss_seguimientos: List[dict] = None,
+                                resumen_financiero: dict = None) -> str:
         near_miss_seguimientos = near_miss_seguimientos or []
         total_eventos = sum(len(e) for e in eventos_por_moneda.values())
         total_fire = sum(len([e for e in evs if e['tipo'] == 'FIRE']) for evs in eventos_por_moneda.values())
@@ -858,6 +912,15 @@ class AuditReporter:
         # FASE 5: Grid neutral info
         if total_neutral_grid > 0:
             lineas.append(f"[N-GRID] Grid Neutral: {total_neutral_grid} eventos")
+
+        # FIX F (Bloque 4): resumen financiero desde pnl_eventos/grid_ejecuciones
+        if resumen_financiero:
+            lineas.append(f"[FIN] PnL neto: {resumen_financiero['pnl_neto_usdt']:+.2f} USDT | "
+                          f"Fees: {resumen_financiero['fees_usdt']:.2f} USDT | "
+                          f"Coste abortos: {resumen_financiero['costo_abortos_usdt']:+.2f} USDT")
+            lineas.append(f"[FIN] Round trips: {resumen_financiero['round_trips']} | "
+                          f"Abortos: {resumen_financiero['abortos']} | "
+                          f"Ratio wins/aborto: {resumen_financiero['ratio_win_por_aborto']}")
 
         if mfm_rechazos > 0:
             lineas.append(f"[MFM] Rechazos MFM: {mfm_rechazos}")

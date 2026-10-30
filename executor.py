@@ -196,6 +196,11 @@ class GridExecutionState:
         self._tp_intentos = {}                      # FASE 1.5: intentos fallidos de TP por pos_id
 
         self.pares_abiertos = []
+        # FIX #2 (Bloqueante): declarado en el constructor para que exista en
+        # TODOS los grids (NEUTRAL y DIRECCIONAL). Los accesos ya usan getattr(..., None),
+        # pero declararlo aquí documenta la intención y previene futuros AttributeError.
+        # Se rellena con params en _crear_grid_neutral_locked y _recuperar_grids_activos.
+        self.grid_params_neutral = None
 
         # ═══ FASE 2 PLAN 6.3: GridState propio del executor (autónomo) ═══
         self.grid_state = None
@@ -2182,8 +2187,8 @@ class GridExecutor:
             'posiciones_vencidas': 0,
             'trades_completados': 0,
             'trades_kill_switch': 0,
-            'pnl_neto': float(state.pnl_real),
-            'pnl_bruto': float(state.pnl_real) + float(state.fees_real),
+            'pnl_bruto': float(state.pnl_real),
+            'pnl_neto': float(state.pnl_real) - float(state.fees_real),
             'fees_totales': float(state.fees_real),
             'max_posiciones_simultaneas': 0,
             'ultimo_tick_segundos_ago': int(time.time()) - int(state.timestamp_inicio),
@@ -2513,6 +2518,7 @@ class GridExecutor:
 
             # 9. INICIAR GridState propio del executor (FASE 2)
             state.init_grid_state(niveles_buy=niveles_buy, niveles_sell=niveles_sell)
+            state.grid_params_neutral = params   # FIX B: revivir FASE 2 (N1, N2, gate coverage)
 
             # ═══════════════════════════════════════════════════════════════════
             # V8: Inicializar engine si toggle activo.
@@ -3265,8 +3271,8 @@ class GridExecutor:
             state.posicion_neta -= Decimal(str(qty))
 
         # Actualizar fees y PnL real
-            state.fees_real += Decimal(str(commission))
-            self._registrar_fee(float(commission))  # FASE 4: fee diaria
+        state.fees_real += Decimal(str(commission))
+        self._registrar_fee(float(commission))  # FASE 4: fee diaria
         if realized_pnl != 0:
             state.pnl_real += Decimal(str(realized_pnl))
 
@@ -3916,10 +3922,10 @@ class GridExecutor:
         for pos in state.grid_state.posiciones:
             if pos.estado != 'ABIERTA':
                 continue
-            if pos.direccion == 'LONG':
-                pnl = (precio_actual - float(pos.precio_entrada)) * float(pos.qty)
+            if pos.tipo == 'LONG':
+                pnl = (precio_actual - float(pos.precio_ejecucion)) * float(pos.qty)
             else:  # SHORT
-                pnl = (float(pos.precio_entrada) - precio_actual) * float(pos.qty)
+                pnl = (float(pos.precio_ejecucion) - precio_actual) * float(pos.qty)
             if pnl < 0:
                 total_perdida += pnl
         capital = float(state.capital) if state.capital else 1.0
@@ -4251,8 +4257,10 @@ class GridExecutor:
             print(f"  ✅ [PnL RECONCILIACIÓN] {state.symbol} Estado corregido desde DB")
 
         # Actualizar GridState con PnL reconciliado
-        state.grid_state.pnl_bruto = pnl_db_val + fees_db_val
-        state.grid_state.pnl_neto = pnl_db_val
+        # PR-A Fix #A2.1: realizedPnl de Binance es GROSS (excluye commission).
+        # neto = gross - fees. Antes se sobrescribía neto con gross cada ciclo.
+        state.grid_state.pnl_bruto = pnl_db_val
+        state.grid_state.pnl_neto = pnl_db_val - fees_db_val
         state.grid_state.fees_totales = fees_db_val
 
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -4655,6 +4663,17 @@ class GridExecutor:
             print(f"  ⚠️ [CIERRE] Kill Switch: verificación de posición falló: {e_ver}")
 
         # Cerrar con MARKET order (reduceOnly)
+        #
+        # DECISIÓN DE DISEÑO (revisión post-fix #6):
+        #   El cierre atómico (_paso_cerrar_posicion) usa LIMIT+fallback porque cubre
+        #   escenarios variados (hard stop, aborto manual, timeout macro 310min). Pero
+        #   _ejecutar_kill_switch_real se dispara SOLO por:
+        #     — timeout de posición (24h) — el mercado pudo moverse mucho
+        #     — margen crítico (>85%) — esperar 2.5s puede agravar la situación
+        #   En ambos, un MARKET directo es la acción correcta: cancel_all previo elimina
+        #   reduceOnly pendientes, y la latencia extra del LIMIT acercaría la liquidación.
+        #   Si en el futuro se necesita LIMIT+fallback aquí, extraer _cerrar_limit_con_fallback
+        #   como método compartido y llamarlo en su lugar.
         side_cierre = 'SELL' if pos_tipo == 'LONG' else 'BUY'
         order_id = None
 
@@ -4895,134 +4914,262 @@ class GridExecutor:
         cierre.avanzar('FALLIDO')
 
     async def _paso_cerrar_posicion(self, state: GridExecutionState, cierre: CierreState):
-        """Cierra la posición con MARKET y verifica el fill."""
+        """Cierra la posición con LIMIT + fallback MARKET (Fix #6 corregido).
+
+        Ciclo:
+          1. LIMIT reduceOnly con banda dura —grid_exit_limit_band_pct (0.1%)
+          2. Retry de trades hasta grid_exit_limit_timeout_seg (2.5s) — el endpoint
+             futures_account_trades puede tardar 3-5s en reflejar el fill (P10-style)
+          3. Si llena completo → cerrada. Si llena parcial → cancelar resto + MARKET
+             por el remanente. Si no llena nada → cancelar + MARKET por el total.
+          4. Fallback a markPrice de la posición si precios_vivo[symbol] <= 0
+        """
         cierre.avanzar('CERRANDO_POSICION')
-        
+
         while cierre.puede_reintentar():
             try:
-                # Consultar posición actual
+                # -- 1. Consultar posición actual --
                 position = await self._api_call(asyncio.to_thread(
                     self.client.futures_position_information,
                     symbol=cierre.symbol
                 ))
-                
                 if not position or len(position) == 0:
                     cierre.posicion_cerrada = True
-                    print(f"  ✅ [CIERRE] {cierre.symbol} Sin posición que cerrar")
+                    print(f"  ? [CIERRE] {cierre.symbol} Sin posición que cerrar")
                     cierre.avanzar('POSICION_CERRADA')
                     return
 
-                # FASE D.3 (corregida): leer posición del lado correcto según modo.
-                # El plan original usaba `side` antes de definirla (NameError).
-                # Se deriva el lado desde state.grid_mode; en NEUTRAL+HEDGE se toma
-                # el lado con mayor posición (el otro se cierra en la siguiente iteración).
                 if self._hedge_mode:
                     if state.grid_mode in ('LONG', 'SHORT'):
                         pos_amt = self._get_position_amt_hedge(position, state.grid_mode)
                     else:
                         amt_long = self._get_position_amt_hedge(position, 'LONG')
                         amt_short = self._get_position_amt_hedge(position, 'SHORT')
-                        if abs(amt_long) >= abs(amt_short):
-                            pos_amt = abs(amt_long)   # positivo → LONG
-                        else:
-                            pos_amt = -abs(amt_short)  # negativo → SHORT
+                        pos_amt = abs(amt_long) if abs(amt_long) >= abs(amt_short) else -abs(amt_short)
                 else:
                     pos_amt = Decimal(str(position[0].get('positionAmt', 0)))
 
                 if abs(pos_amt) < Decimal('0.0001'):
                     cierre.posicion_cerrada = True
-                    print(f"  ✅ [CIERRE] {cierre.symbol} Posición ya es 0")
+                    print(f"  ? [CIERRE] {cierre.symbol} Posición ya es 0")
                     cierre.avanzar('POSICION_CERRADA')
                     return
 
-                # Calcular lado y cantidad
                 side = 'SELL' if pos_amt > 0 else 'BUY'
-                qty = float(abs(pos_amt))
+                pos_tipo_cierre = ('LONG' if side == 'SELL' else 'SHORT') if self._hedge_mode else None
+                qty_total = float(abs(pos_amt))
 
-                # Enviar orden MARKET de cierre
+                # -- 2. Precio de referencia (fallback a markPrice si no hay tick vivo) --
+                precio_ref = self.precios_vivo.get(cierre.symbol, 0)
+                if precio_ref <= 0:
+                    # Fallback: markPrice de la posición (ya lo tenemos en `position`)
+                    try:
+                        if self._hedge_mode:
+                            p_match = next(
+                                (p for p in position if p.get('positionSide') == (pos_tipo_cierre or 'BOTH')),
+                                position[0]
+                            )
+                        else:
+                            p_match = position[0]
+                        precio_ref = float(p_match.get('markPrice', 0) or 0)
+                    except Exception:
+                        precio_ref = 0
+                    if precio_ref <= 0:
+                        cierre.fallar("Sin precio de referencia (ni vivo ni markPrice)")
+                        return
+                    print(f"  [CIERRE-LIMIT] {cierre.symbol} precio_vivo ausente ? usando markPrice ${precio_ref:.6f}")
+
+                # -- 3. LIMIT con banda dura desde config --
+                banda = Decimal(str(CONFIG.grid_exit_limit_band_pct)) / Decimal('100')  # 0.1% = 0.001
+                ref_d = Decimal(str(precio_ref))
+                if side == 'SELL':
+                    precio_limit = float((ref_d * (Decimal('1') - banda)).quantize(Decimal('0.000001')))
+                else:
+                    precio_limit = float((ref_d * (Decimal('1') + banda)).quantize(Decimal('0.000001')))
+
+                orden_limit = {
+                    'symbol': cierre.symbol,
+                    'side': side,
+                    'type': 'LIMIT',
+                    'quantity': qty_total,
+                    'price': precio_limit,
+                    'timeInForce': 'GTC',
+                }
+                if self._hedge_mode:
+                    orden_limit['positionSide'] = pos_tipo_cierre
+                else:
+                    orden_limit['reduceOnly'] = True
+
+                res_limit = await self._api_call(asyncio.to_thread(
+                    self.client.futures_create_order, **orden_limit
+                ))
+                limit_order_id = str(res_limit.get('orderId', ''))
+                if not limit_order_id:
+                    cierre.fallar(f"LIMIT sin orderId en respuesta: {res_limit}")
+                    return
+                print(f"  [CIERRE-LIMIT] {cierre.symbol} LIMIT {side} {qty_total} @ ${precio_limit} | Order: {limit_order_id}")
+
+                # -- 4. Guardar la orden LIMIT en DB ANTES de esperar el fill --
+                # (evita que CR16 la marque como SIN_ORDEN si el poll la ve primero)
+                try:
+                    await guardar_orden_ejecucion(
+                        grid_ejecucion_id=state.grid_id,
+                        binance_order_id=limit_order_id,
+                        client_order_id=f"CM{state.grid_id}_CLOSE_{int(time.time()*1000)}",
+                        symbol=cierre.symbol,
+                        side=side,
+                        tipo_orden='CIERRE',
+                        price=precio_limit,
+                        quantity=qty_total,
+                    )
+                except Exception as e_save:
+                    print(f"  ?? [CIERRE-LIMIT] No se pudo registrar LIMIT en DB: {e_save}")
+
+                # -- 5. Retry de trades hasta timeout (P10-style) --
+                # futures_account_trades(orderId) puede tardar 3-5s ? no un único sleep
+                deadline = time.time() + float(CONFIG.grid_exit_limit_timeout_seg)
+                trades = []
+                while time.time() < deadline:
+                    await asyncio.sleep(0.5)
+                    trades = await self._api_call(asyncio.to_thread(
+                        self.client.futures_account_trades,
+                        symbol=cierre.symbol,
+                        orderId=limit_order_id
+                    ))
+                    if trades:
+                        break
+
+                # -- 6. Evaluar fill --
+                if trades:
+                    total_qty = sum(float(t['qty']) for t in trades)
+                    # 6a. Fill completo (tolerancia 0.1%)
+                    if total_qty >= qty_total * 0.999:
+                        for trade in trades:
+                            await self._procesar_trade_con_pnl(state, trade, 'ABORTO')
+                        avg_price = sum(float(t['price']) * float(t['qty']) for t in trades) / total_qty
+                        total_commission = sum(float(t['commission']) for t in trades)
+                        total_pnl = sum(float(t.get('realizedPnl', 0)) for t in trades)
+                        cierre.posicion_cierre_order_id = limit_order_id
+                        cierre.posicion_cierre_qty = total_qty
+                        cierre.posicion_cierre_precio = avg_price
+                        print(f"  ? [CIERRE-LIMIT] {cierre.symbol} FILL COMPLETO @ ${avg_price:.4f} | "
+                              f"PnL: {total_pnl:+.4f} | Fee: {total_commission:.4f}")
+                        cierre.posicion_cerrada = True
+                        cierre.avanzar('POSICION_CERRADA')
+                        return
+                    # 6b. Fill PARCIAL ? cancelar resto + MARKET por el remanente
+                    print(f"  ?? [CIERRE-LIMIT] {cierre.symbol} Fill PARCIAL {total_qty:.4f}/{qty_total:.4f} ? cancelar resto + MARKET")
+                    try:
+                        await self._api_call(asyncio.to_thread(
+                            self.client.futures_cancel_order,
+                            symbol=cierre.symbol, orderId=limit_order_id
+                        ))
+                    except Exception as e_c:
+                        if '-2011' not in str(e_c) and 'Unknown order' not in str(e_c):
+                            cierre.fallar(f"Cancel resto LIMIT falló (no -2011): {e_c}")
+                            return
+                    for trade in trades:
+                        await self._procesar_trade_con_pnl(state, trade, 'ABORTO')
+                    # Ajustar qty_total al remanente para el MARKET fallback
+                    qty_total = max(0.0, qty_total - total_qty)
+                    if qty_total < 0.0001:
+                        cierre.posicion_cerrada = True
+                        cierre.avanzar('POSICION_CERRADA')
+                        return
+                    # (continúa al MARKET fallback con qty_total reducido)
+
+                else:
+                    # -- 7. Sin trades ? cancelar LIMIT y fallback MARKET --
+                    try:
+                        res_cancel = await self._api_call(asyncio.to_thread(
+                            self.client.futures_cancel_order,
+                            symbol=cierre.symbol, orderId=limit_order_id
+                        ))
+                        ejecutado = float(res_cancel.get('executedQty', 0) or 0)
+                        if ejecutado > 0.0001:
+                            # Se llenó justo ahora: procesar trades reales
+                            trades_final = await self._api_call(asyncio.to_thread(
+                                self.client.futures_account_trades,
+                                symbol=cierre.symbol, orderId=limit_order_id
+                            ))
+                            for trade in trades_final:
+                                await self._procesar_trade_con_pnl(state, trade, 'ABORTO')
+                            qty_total = max(0.0, qty_total - ejecutado)
+                            if qty_total < 0.0001:
+                                cierre.posicion_cerrada = True
+                                cierre.avanzar('POSICION_CERRADA')
+                                return
+                        print(f"  [CIERRE-LIMIT] {cierre.symbol} LIMIT cancelado (executedQty={ejecutado:.4f}) ? MARKET por {qty_total:.4f}")
+                    except Exception as e_cancel:
+                        err_str = str(e_cancel)
+                        if '-2011' not in err_str and 'Unknown order' not in err_str:
+                            # Bug #4: no cancelable + estado indeterminado ? abortar
+                            print(f"  ?? [CIERRE-LIMIT] {cierre.symbol} Cancel falló (no -2011): {e_cancel}")
+                            cierre.fallar(f"Cancel LIMIT falló (no -2011): {e_cancel}")
+                            cierre.avanzar('FALLIDO')
+                            return
+                        # -2011 = orden ya no existe. Verificar si se llenó por lag:
+                        trades_late = await self._api_call(asyncio.to_thread(
+                            self.client.futures_account_trades,
+                            symbol=cierre.symbol, orderId=limit_order_id
+                        ))
+                        if trades_late:
+                            total_qty = sum(float(t['qty']) for t in trades_late)
+                            for trade in trades_late:
+                                await self._procesar_trade_con_pnl(state, trade, 'ABORTO')
+                            qty_total = max(0.0, qty_total - total_qty)
+                            if qty_total < 0.0001:
+                                cierre.posicion_cerrada = True
+                                cierre.avanzar('POSICION_CERRADA')
+                                return
+
+                # -- 8. MARKET fallback por el remanente --
                 orden_cierre = {
                     'symbol': cierre.symbol,
                     'side': side,
                     'type': 'MARKET',
-                    'quantity': qty
+                    'quantity': qty_total,
                 }
-                # FASE D.2: HEDGE MODE — determinar lado de la posición a cerrar
-                # P1-A FIX: en HEDGE MODE Binance rechaza reduceOnly (-1106).
                 if self._hedge_mode:
-                    # side=SELL cierra LONG, side=BUY cierra SHORT
-                    pos_side = 'LONG' if side == 'SELL' else 'SHORT'
-                    orden_cierre['positionSide'] = pos_side
+                    orden_cierre['positionSide'] = pos_tipo_cierre
                 else:
                     orden_cierre['reduceOnly'] = True
                 res_cierre = await self._api_call(asyncio.to_thread(
-                    self.client.futures_create_order,
-                    **orden_cierre
+                    self.client.futures_create_order, **orden_cierre
                 ))
-                
                 cierre.posicion_cierre_order_id = str(res_cierre.get('orderId', ''))
-                cierre.posicion_cierre_qty = qty
-                
-                print(f"  ✅ [CIERRE] {cierre.symbol} Orden MARKET enviada: "
-                      f"{side} {qty} | Order: {cierre.posicion_cierre_order_id}")
-                
-                # Esperar y verificar fill
+                cierre.posicion_cierre_qty = qty_total
+                print(f"  ? [CIERRE-MKT] {cierre.symbol} MARKET {side} {qty_total:.4f} | Order: {cierre.posicion_cierre_order_id}")
+
                 await asyncio.sleep(0.5)
-                
-                # Consultar trades de esta orden
+
                 if cierre.posicion_cierre_order_id:
-                    trades = await self._api_call(asyncio.to_thread(
+                    trades_mkt = await self._api_call(asyncio.to_thread(
                         self.client.futures_account_trades,
-                        symbol=cierre.symbol,
-                        orderId=cierre.posicion_cierre_order_id
+                        symbol=cierre.symbol, orderId=cierre.posicion_cierre_order_id
                     ))
-
-                    if trades:
-                        # CR2 FIX: Procesar cada trade con PnL
-                        for trade in trades:
+                    if trades_mkt:
+                        for trade in trades_mkt:
                             await self._procesar_trade_con_pnl(state, trade, 'ABORTO')
-
-                        total_qty = sum(float(t['qty']) for t in trades)
-                        avg_price = sum(float(t['price']) * float(t['qty']) for t in trades) / total_qty if total_qty > 0 else 0
-                        total_commission = sum(float(t['commission']) for t in trades)
-                        total_pnl = sum(float(t.get('realizedPnl', 0)) for t in trades)
-
+                        total_qty = sum(float(t['qty']) for t in trades_mkt)
+                        avg_price = sum(float(t['price']) * float(t['qty']) for t in trades_mkt) / total_qty
+                        total_commission = sum(float(t['commission']) for t in trades_mkt)
+                        total_pnl = sum(float(t.get('realizedPnl', 0)) for t in trades_mkt)
                         cierre.posicion_cierre_precio = avg_price
-                        # CR2: PnL y fees ya actualizados por _procesar_trade_con_pnl
-
-                        print(f"  ✅ [CIERRE] {cierre.symbol} Posición cerrada @ ${avg_price:.4f} | "
+                        print(f"  ? [CIERRE-MKT] {cierre.symbol} Cerrado @ ${avg_price:.4f} | "
                               f"PnL: {total_pnl:+.4f} | Fee: {total_commission:.4f}")
-
-                        # FASE D.3 (complemento NEUTRAL+HEDGE): un grid neutral puede tener
-                        # posición en AMBOS lados. Si el otro lado sigue abierto, continuar
-                        # el bucle para cerrarlo en la siguiente iteración.
-                        if self._hedge_mode and state.grid_mode not in ('LONG', 'SHORT'):
-                            try:
-                                position_recheck = await self._api_call(asyncio.to_thread(
-                                    self.client.futures_position_information,
-                                    symbol=cierre.symbol
-                                ))
-                                rest_long = abs(self._get_position_amt_hedge(position_recheck, 'LONG'))
-                                rest_short = abs(self._get_position_amt_hedge(position_recheck, 'SHORT'))
-                                if rest_long > Decimal('0.0001') or rest_short > Decimal('0.0001'):
-                                    print(f"  [CIERRE] {cierre.symbol} HEDGE+NEUTRAL: queda otro lado abierto "
-                                          f"(LONG:{float(rest_long):.4f} SHORT:{float(rest_short):.4f}). Cerrando...")
-                                    continue
-                            except Exception as e_re:
-                                print(f"  ⚠️ [CIERRE] {cierre.symbol} Error re-chequeando lados HEDGE: {e_re}")
-
                         cierre.posicion_cerrada = True
                         cierre.avanzar('POSICION_CERRADA')
                         return
                     else:
-                        cierre.fallar("Orden MARKET enviada pero sin trades confirmados")
+                        cierre.fallar("MARKET enviado pero sin trades confirmados")
                 else:
-                    cierre.fallar("No se obtuvo orderId del cierre")
-                    
+                    cierre.fallar("MARKET sin orderId")
+
             except Exception as e:
-                # FASE 1.1: Handler dedicado para error -2022 (ReduceOnly rejected)
                 err_str = str(e)
                 if '-2022' in err_str or 'ReduceOnly' in err_str:
-                    # Verificar si la posición realmente ya no existe en Binance
+                    # Verificar si la posición realmente ya no existe
                     try:
                         pos_check = await self._api_call(asyncio.to_thread(
                             self.client.futures_position_information,
@@ -5031,26 +5178,23 @@ class GridExecutor:
                         qty_check = Decimal('0')
                         if pos_check:
                             if self._hedge_mode:
-                                amt_l = abs(self._get_position_amt_hedge(pos_check, 'LONG'))
-                                amt_s = abs(self._get_position_amt_hedge(pos_check, 'SHORT'))
-                                qty_check = max(amt_l, amt_s)
+                                qty_check = max(
+                                    abs(self._get_position_amt_hedge(pos_check, 'LONG')),
+                                    abs(self._get_position_amt_hedge(pos_check, 'SHORT'))
+                                )
                             else:
                                 qty_check = abs(Decimal(str(pos_check[0].get('positionAmt', 0))))
                         if qty_check < Decimal('0.0001'):
-                            # Posición ya cerrada en Binance → no reintentar
                             cierre.posicion_cerrada = True
-                            print(f"  ✅ [CIERRE] {cierre.symbol} -2022 pero posición ya es 0 en Binance → cerrada")
+                            print(f"  ? [CIERRE] {cierre.symbol} -2022 pero posición ya es 0")
                             cierre.avanzar('POSICION_CERRADA')
                             return
-                        else:
-                            # Posición existe → el lado no coincide, intentar sin reduceOnly
-                            print(f"  ⚠️ [CIERRE] {cierre.symbol} -2022 pero posición={float(qty_check):.4f} → reintentando sin reduceOnly")
-                            cierre.fallar(f"-2022 con posición viva ({float(qty_check):.4f}): {e}")
+                        cierre.fallar(f"-2022 con posición viva ({float(qty_check):.4f}): {e}")
                     except Exception as e_check:
                         cierre.fallar(f"-2022, verificación falló: {e_check}")
                 else:
                     cierre.fallar(f"Error cerrando posición: {e}")
-        
+
         cierre.avanzar('FALLIDO')
 
     async def _paso_verificar_posicion(self, state: GridExecutionState, cierre: CierreState):
@@ -5256,34 +5400,38 @@ class GridExecutor:
     # ═══════════════════════════════════════════════════════════════════════════════
 
     async def _verificar_limite_perdida(self):
-        """FASE 3: Aborta todos los grids si el PnL diario (cerrado + activo) supera el límite."""
-        LIMITE_PERDIDA = -100
+        """FASE 3: Aborta todos los grids si el PnL diario (cerrado + activo) supera el límite.
+
+        PR-A: el PnL medido es NETO (realizedPnl - commission). Antes se medía solo
+        gross y las fees podían drenar el saldo sin que saltara el freno de emergencia.
+        """
+        LIMITE_PERDIDA = CONFIG.grid_limite_perdida_diaria_usdt
         try:
             from database_v5 import _get_db
             db = await _get_db()
 
-            # PnL de grids CERRADOS hoy (FIX: usar DATE() de MySQL, no string ISO)
+            # PnL NETO de grids CERRADOS hoy (FIX: usar DATE() de MySQL, no string ISO)
             cursor = await db.execute(
-                "SELECT COALESCE(SUM(pnl_real), 0) FROM grid_ejecuciones "
+                "SELECT COALESCE(SUM(pnl_real - COALESCE(fees_real, 0)), 0) FROM grid_ejecuciones "
                 "WHERE estado = 'CERRADO' AND DATE(closed_at) = CURRENT_DATE()"
             )
             row = await cursor.fetchone()
             pnl_cerrado = float(row[0]) if row and row[0] is not None else 0.0
 
-            # PnL de grids ACTIVOS en RAM (suma posiciones abiertas actuales)
+            # PnL NETO de grids ACTIVOS en RAM (gross - fees acumuladas)
             pnl_activo = 0.0
             for sym, st in self._grids.items():
                 if st.activa:
-                    pnl_activo += float(st.pnl_real)
+                    pnl_activo += float(st.pnl_real) - float(st.fees_real)
 
             pnl_total = pnl_cerrado + pnl_activo
 
             # Log silencioso cada ciclo para debug (solo si hay actividad)
             if pnl_cerrado != 0 or pnl_activo != 0:
-                print(f"  [EXECUTOR] PnL diario check | Cerrado: {pnl_cerrado:+.4f} | Activo: {pnl_activo:+.4f} | Total: {pnl_total:+.4f}")
+                print(f"  [EXECUTOR] PnL diario neto check | Cerrado: {pnl_cerrado:+.4f} | Activo: {pnl_activo:+.4f} | Total: {pnl_total:+.4f}")
 
             if pnl_total < LIMITE_PERDIDA:
-                print(f"  🛑 [EXECUTOR] LÍMITE DE PÉRDIDA ALCANZADO: {pnl_total:.4f} USDT. Cerrando TODO.")
+                print(f"  🛑 [EXECUTOR] LÍMITE DE PÉRDIDA ALCANZADO (neto): {pnl_total:.4f} USDT. Cerrando TODO.")
                 if self.notifier:
                     try:
                         await self.notifier.enviar_telegram(
@@ -5464,6 +5612,7 @@ class GridExecutor:
                         niveles_buy_rec = [n for n in niveles_rec if n < price_rec * 0.9995]
                         niveles_sell_rec = [n for n in niveles_rec if n > price_rec * 1.0005]
                         state.init_grid_state(niveles_buy=niveles_buy_rec, niveles_sell=niveles_sell_rec)
+                        state.grid_params_neutral = params   # FIX B: revivir FASE 2 en recuperación
                         print(f"  [EXECUTOR] {symbol} GridState neutral reconstruido post-crash")
                     except Exception as e:
                         print(f"  ⚠️ [EXECUTOR] {symbol} Error reconstruyendo grid_state: {e}")

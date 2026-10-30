@@ -2038,6 +2038,168 @@ async def obtener_pnl_por_tipo(grid_ejecucion_id: int) -> dict:
         return {row[0]: {'pnl': float(row[1]), 'count': int(row[2])} for row in rows}
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+# FIX F (Bloque 4): RESUMEN FINANCIERO DESDE pnl_eventos (fuente de verdad)
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def calcular_resumen_financiero_dia(fecha_local: str, symbol: str = None) -> dict:
+    """
+    Calcula el resumen financiero del día desde pnl_eventos (fuente de verdad).
+
+    Fixes aplicados (cuidado con los bugs.txt):
+      - Bug #1: Abortos contados desde UNA sola fuente (pnl_eventos),
+        no duplicados con grid_ejecuciones.
+      - Bug #2: round_trips EXCLUYE cierres F45 (client_order_id LIKE '%_PC_%').
+      - Bug #3: Filtro opcional por symbol para resumen por moneda.
+
+    Returns:
+        dict con pnl_neto_usdt, fees_usdt, pnl_ex_abortos, costo_abortos_usdt,
+        round_trips, abortos, ratio_win_por_aborto, profit_factor,
+        fees_sobre_ganancias_pct.
+    """
+    try:
+        async with _conexion() as db:
+            db.row_factory = Row
+
+            # Rango de timestamps UTC para la fecha local
+            tz = get_tz()
+            fecha_inicio = datetime.strptime(fecha_local, "%Y-%m-%d")
+            fecha_inicio = tz.localize(fecha_inicio)
+            fecha_fin = fecha_inicio + timedelta(days=1)
+            ts_inicio = int(fecha_inicio.astimezone(pytz.UTC).timestamp() * 1000)
+            ts_fin = int(fecha_fin.astimezone(pytz.UTC).timestamp() * 1000)
+
+            # Cláusula WHERE base + filtro opcional por símbolo
+            where_clause = "WHERE timestamp_ms >= ? AND timestamp_ms < ?"
+            params = [ts_inicio, ts_fin]
+            if symbol:
+                where_clause += " AND symbol = ?"
+                params.append(symbol)
+            params_t = tuple(params)
+
+            # PnL y fees reales (todas las operaciones del día)
+            cursor = await db.execute(
+                f"SELECT COALESCE(SUM(realized_pnl),0), COALESCE(SUM(commission),0) "
+                f"FROM pnl_eventos {where_clause}",
+                params_t)
+            row = await cursor.fetchone()
+            pnl_total = float(row[0] or 0)
+            fees_total = float(row[1] or 0)
+
+            # Costo específico de abortos (tipo_evento='ABORTO' o 'KILL_SWITCH')
+            cursor = await db.execute(
+                f"SELECT COALESCE(SUM(realized_pnl),0) FROM pnl_eventos "
+                f"{where_clause} AND tipo_evento IN ('ABORTO','KILL_SWITCH')",
+                params_t)
+            pnl_abortos = float((await cursor.fetchone())[0] or 0)
+
+            # Round trips completados (excluir F45 - cierres de par en grid vivo)
+            cursor = await db.execute(
+                f"SELECT COUNT(*) FROM pnl_eventos "
+                f"{where_clause} AND tipo_evento = 'FILL_SALIDA' "
+                f"AND binance_order_id NOT IN ("
+                f"    SELECT binance_order_id FROM grid_ejecucion_ordenes "
+                f"    WHERE client_order_id LIKE '%_PC_%'"
+                f")",
+                params_t)
+            round_trips = int((await cursor.fetchone())[0] or 0)
+
+            # Abortos: UNA sola fuente (pnl_eventos) — Fix Bug #1
+            cursor = await db.execute(
+                f"SELECT COUNT(*) FROM pnl_eventos "
+                f"{where_clause} AND tipo_evento IN ('ABORTO','KILL_SWITCH')",
+                params_t)
+            abortos = int((await cursor.fetchone())[0] or 0)
+
+        return {
+            'pnl_neto_usdt': pnl_total,
+            'fees_usdt': fees_total,
+            'pnl_ex_abortos': pnl_total - pnl_abortos,
+            'costo_abortos_usdt': pnl_abortos,
+            'round_trips': round_trips,
+            'abortos': abortos,
+            'ratio_win_por_aborto': round_trips / max(1, abortos),
+            'profit_factor': pnl_total / fees_total if fees_total > 0 else None,
+            'fees_sobre_ganancias_pct': fees_total / max(pnl_total, 0.01) * 100,
+        }
+    except Exception as e_db:
+        vacio = {
+            'pnl_neto_usdt': 0, 'fees_usdt': 0,
+            'pnl_ex_abortos': 0, 'costo_abortos_usdt': 0,
+            'round_trips': 0, 'abortos': 0,
+            'ratio_win_por_aborto': 0, 'profit_factor': None,
+            'fees_sobre_ganancias_pct': 0,
+        }
+        print(f"  ?? [FIN-DIA] Error calculando resumen financiero "
+              f"({fecha_local}, symbol={symbol}): {e_db}")
+        print(f"     REPORTE SE ENVIARÁ CON MÉTRICAS EN CERO — revisar conectividad DB")
+        return vacio
+
+
+async def calcular_resumen_financiero_dia_por_symbol(fecha_local: str) -> dict:
+    """
+    Una sola query con GROUP BY symbol. Retorna {symbol: resumen_dict}.
+    Alternativa N+1-friendly a iterar calcular_resumen_financiero_dia(symbol=...).
+    """
+    try:
+        async with _conexion() as db:
+            db.row_factory = Row
+            tz = get_tz()
+            fecha_inicio = tz.localize(datetime.strptime(fecha_local, "%Y-%m-%d"))
+            fecha_fin = fecha_inicio + timedelta(days=1)
+            ts_inicio = int(fecha_inicio.astimezone(pytz.UTC).timestamp() * 1000)
+            ts_fin = int(fecha_fin.astimezone(pytz.UTC).timestamp() * 1000)
+
+            cursor = await db.execute("""
+                SELECT symbol,
+                       COALESCE(SUM(realized_pnl), 0) as pnl,
+                       COALESCE(SUM(commission), 0) as fees,
+                       SUM(CASE WHEN tipo_evento = 'FILL_SALIDA'
+                                AND binance_order_id NOT IN (
+                                    SELECT binance_order_id FROM grid_ejecucion_ordenes
+                                    WHERE client_order_id LIKE '%_PC_%')
+                                THEN 1 ELSE 0 END) as rt,
+                       SUM(CASE WHEN tipo_evento IN ('ABORTO','KILL_SWITCH') THEN 1 ELSE 0 END) as ab,
+                       COALESCE(SUM(CASE WHEN tipo_evento IN ('ABORTO','KILL_SWITCH')
+                                         THEN realized_pnl ELSE 0 END), 0) as ab_pnl
+                FROM pnl_eventos
+                WHERE timestamp_ms >= ? AND timestamp_ms < ?
+                GROUP BY symbol
+            """, (ts_inicio, ts_fin))
+            rows = await cursor.fetchall()
+
+        out = {}
+        for r in rows:
+            pnl = float(r[1] or 0); fees = float(r[2] or 0)
+            rt = int(r[3] or 0); ab = int(r[4] or 0); ab_pnl = float(r[5] or 0)
+            out[r[0]] = {
+                'pnl_neto_usdt': pnl, 'fees_usdt': fees,
+                'pnl_ex_abortos': pnl - ab_pnl, 'costo_abortos_usdt': ab_pnl,
+                'round_trips': rt, 'abortos': ab,
+                'ratio_win_por_aborto': rt / max(1, ab),
+                'profit_factor': pnl / fees if fees > 0 else None,
+                'fees_sobre_ganancias_pct': fees / max(pnl, 0.01) * 100,
+            }
+        return out
+    except Exception as e_db:
+        print(f"  ?? [FIN-DIA] Error calculando resumen financiero por symbol "
+              f"({fecha_local}): {e_db}")
+        return {}
+
+
+def resumen_financiero_vacio() -> dict:
+    """Retorna un resumen financiero con ceros para símbolos sin actividad."""
+    return {
+        'pnl_neto_usdt': 0, 'fees_usdt': 0,
+        'pnl_ex_abortos': 0, 'costo_abortos_usdt': 0,
+        'round_trips': 0, 'abortos': 0,
+        'ratio_win_por_aborto': 0, 'profit_factor': None,
+        'fees_sobre_ganancias_pct': 0,
+    }
+
+
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # V8: FUNCIONES DEL MOTOR DE NIVELES
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -25,7 +25,7 @@ def load_coin_registry():
         active_symbols = [sym for sym, data in registry.items() if data.get("active", 0) == 1]
 
         if not active_symbols:
-            print("âš ï¸ Ninguna moneda activa en registry. Usando defaults.")
+            print("âš ï¸ Ninguna moneda activa en registry. Usando defaults.")
             return default_symbols, registry
 
         return active_symbols, registry
@@ -274,7 +274,13 @@ class Config(BaseModel):
     # ponderado de las posiciones abiertas (mÃ©trica distinta al aborto por EMA50).
     # Leverage-independiente: mide movimiento de PRECIO, no de PnL.
     # 0.8% < 1.0% del aborto macro => actÃºa como red de seguridad previa.
-    grid_neutral_max_adverse_price_pct: float = 0.8
+    grid_neutral_max_adverse_price_pct: float = 2.0
+    # FIX C (Bloque 3): era 0.8 — stop garantizado en cualquier grid neutral
+    # (max de piernas crece monótono con el drift). Ahora solo aplica como
+    # fallback cuando NO se conoce el rango del grid; umbral tolerante 1.5-2%.
+    grid_ruptura_rango_hard_stop_pct: float = 2.5
+    # FIX C (Bloque 3): para NEUTRAL con rango conocido, abortar solo si el
+    # precio rompe lower/upper por más de este % (no drift interno de 0.8%).
     # ADX mÃ¡ximo para considerar mercado neutral (sin tendencia fuerte)
     grid_neutral_adx_max: float = 25.0           # CAMBIO: antes 22.0 â†’ ahora 25.0
     # RSI rango para grid neutral (no extremos)
@@ -463,12 +469,26 @@ class Config(BaseModel):
 
     # â”€â”€ FASE 2: Rango inmutable + estrategia de salida en 3 niveles â”€â”€
     grid_rango_timeout_min: int = 240           # Min fuera del rango antes de cerrar posiciones (4h)
-    grid_max_perdida_pct: float = 2.0           # % mÃ¡x pÃ©rdida flotante por grid (hard stop)
+    grid_max_perdida_pct: float = 8.0           # % máx pérdida flotante por grid (hard stop)
+                                                # FIX Bloque 1: era 2.0. Con $750 desplegado
+                                                # 2% de capital = 0.27% de movimiento de precio
+                                                # → abortaba a los minutos una vez revivido el
+                                                # NIVEL 3 (Fix A+B). 8% junto a los typos, nunca separados.
+    grid_exit_limit_band_pct: float = 0.1       # FIX #6 (Bloque 4): banda dura (±0.1%) del precio
+                                                # límite en cierres LIMIT con fallback MARKET
+    grid_exit_limit_timeout_seg: float = 2.5    # FIX #6 (Bloque 4): espera máx del intento LIMIT
+                                                # antes de fallback MARKET (2-3s; esperar más en
+                                                # mercado cayendo cuesta más que el taker fee)
 
     # â”€â”€ FASE 4: Filtro de fees y rentabilidad â”€â”€
-    grid_ratio_rentabilidad_min: float = 2.0    # Ratio mÃ­n profit/fees por round-trip (1.0 = breakeven)
+    grid_ratio_rentabilidad_min: float = 1.5    # Ratio mín profit/fees por round-trip (1.0 = breakeven)
+                                                # FIX D (Bloque 2): era 2.0. Con breakeven honesto
+                                                # (0.04%) y piso real de step = min_dist_pct ≈ 0.17%,
+                                                # exigir 2.0 solo restringía el universo de grids
+                                                # hacia ATRs altos (más riesgo de aborto).
     grid_ratio_bypass_testnet: bool = True      # V8.0: bypass temporal del ratio en TESTNET (warning en log)
     grid_fees_diarias_max_pct: float = 0.5      # % capital mÃ¡x en fees diarias (0.5% = $25 en $5000)
+    grid_limite_perdida_diaria_usdt: float = -100.0  # PR-A: PnL NETO diario (realizedPnl - commission) que aborta todos los grids
 
     # â”€â”€ FASE 1: ReduceOnly fix â”€â”€
     grid_cierre_cooldown_seg: int = 300         # Cooldown tras CIERRE_FALLIDO (5 min)
@@ -496,4 +516,3 @@ class Config(BaseModel):
 
 
 CONFIG = Config()
-
