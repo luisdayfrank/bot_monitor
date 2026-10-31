@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PR-B: Backfill de income_eventos (ESCRITURA — separado del diagnóstico read-only).
+PR-B: Backfill de income_eventos (ESCRITURA — separado del diagnóstico read-only).income = client.futures_income_history
 
 Crea la tabla income_eventos si no existe (mismo schema que database_v5.init_db)
 y rellena los últimos N días desde futures_income: FUNDING_FEE, REALIZED_PNL
@@ -113,7 +113,7 @@ def main():
                 while cursor_ts < ts_fin:
                     fin_ventana = min(cursor_ts + 7 * 86400_000, ts_fin)
                     try:
-                        income = client.futures_income(
+                        income = client.futures_income_history(
                             incomeType=income_type,
                             symbol=symbol,
                             startTime=cursor_ts,
