@@ -83,18 +83,16 @@ def main():
     try:
         with conn.cursor() as cur:
             cur.execute(DDL)
+            for sql in DDL_IDX:
+                try:
+                    cur.execute(sql)
+                except (pymysql.err.InternalError, pymysql.err.OperationalError) as e:
+                    if e.args and e.args[0] == 1061:  # duplicate key name = índice ya existe
+                        print(f"  [SKIP] índice ya existe")
+                    else:
+                        raise
         conn.commit()
-        for sql in DDL_IDX:
-            try:
-                cur.execute(sql)
-                conn.commit()
-            except (pymysql.err.InternalError, pymysql.err.OperationalError) as e:
-                if e.args and e.args[0] == 1061:  # duplicate key name = índice ya existe
-                    print(f"  [SKIP] índice ya existe")
-                else:
-                    raise
         print("[OK] Tabla income_eventos lista")
-
         ahora = datetime.now(timezone.utc)
         inicio = ahora - timedelta(days=args.dias)
 
