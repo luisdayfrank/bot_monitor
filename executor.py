@@ -2767,7 +2767,7 @@ class GridExecutor:
                     continue
                 try:
                     income = await self._api_call(asyncio.to_thread(
-                        self.client.futures_income,
+                        self.client.futures_income_history,
                         incomeType=income_type,
                         symbol=symbol,
                         startTime=start,
