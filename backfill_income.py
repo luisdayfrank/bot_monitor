@@ -42,10 +42,11 @@ CREATE TABLE IF NOT EXISTS income_eventos (
 )
 """
 
+# DDL_IDX sin IF NOT EXISTS (MySQL no lo soporta en CREATE INDEX)
 DDL_IDX = [
-    "CREATE INDEX IF NOT EXISTS idx_income_ts ON income_eventos(timestamp_ms)",
-    "CREATE INDEX IF NOT EXISTS idx_income_symbol_ts ON income_eventos(symbol, timestamp_ms)",
-    "CREATE INDEX IF NOT EXISTS idx_income_type_ts ON income_eventos(income_type, timestamp_ms)",
+    "CREATE INDEX idx_income_ts ON income_eventos(timestamp_ms)",
+    "CREATE INDEX idx_income_symbol_ts ON income_eventos(symbol, timestamp_ms)",
+    "CREATE INDEX idx_income_type_ts ON income_eventos(income_type, timestamp_ms)",
 ]
 
 INSERT_SQL = """
@@ -82,12 +83,17 @@ def main():
     try:
         with conn.cursor() as cur:
             cur.execute(DDL)
-            for sql in DDL_IDX:
-                try:
-                    cur.execute(sql)
-                except pymysql.err.InternalError:
-                    pass  # índice ya existe
         conn.commit()
+        for sql in DDL_IDX:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(sql)
+                conn.commit()
+            except pymysql.err.InternalError as e:
+                if e.args[0] == 1061:  # duplicate key name = índice ya existe
+                    pass
+                else:
+                    raise
         print("[OK] Tabla income_eventos lista")
 
         ahora = datetime.now(timezone.utc)
