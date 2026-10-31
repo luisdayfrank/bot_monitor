@@ -190,7 +190,7 @@ def diag_funding(client, symbols, dias=30):
         while cursor_ts < ts_fin:
             fin_ventana = min(cursor_ts + 7 * 86400_000, ts_fin)
             try:
-                income = client.futures_income(
+                income = client.futures_income_history(
                     incomeType='FUNDING_FEE',
                     symbol=symbol,
                     startTime=cursor_ts,
