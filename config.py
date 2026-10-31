@@ -167,8 +167,11 @@ class Config(BaseModel):
     grid_min_grids: int = 10             # CAMBIO: antes 5. Alineado con grid_niveles_min mÃ¡s bajo (memecoin=10)
     grid_min_grids_operativo: int = 5    # V8.0: suelo de auto-compresiÃ³n (permite cumplir ratio 2.0)
     grid_max_grids_hard: int = 50        # Cap absoluto para evitar saturaciÃ³n API
-    # V6.0 Punto 3c: fees maker con descuento BNB (0.02%) + slippage realista.
-    # Si NO hay BNB para el descuento del 25%, usar grid_fee_rate = 0.00025.
+    # V6.0 Punto 3c: fees maker Binance Futures = 0.02% base (0.0002).
+    # Descuento BNB actual (2024-2025) = 10% → 0.018% (0.00018) si hay BNB.
+    # El descuento del 25% fue el histórico y ya NO aplica.
+    # Si la tasa efectiva difiere de 0.0002 (verificar con futures_income),
+    # recalibrar este valor. No asumir.
     grid_fee_rate: float = 0.0002
     grid_slippage: float = 0.0003
     grid_default_capital: float = 10.0
@@ -487,7 +490,9 @@ class Config(BaseModel):
                                                 # exigir 2.0 solo restringía el universo de grids
                                                 # hacia ATRs altos (más riesgo de aborto).
     grid_ratio_bypass_testnet: bool = True      # V8.0: bypass temporal del ratio en TESTNET (warning en log)
-    grid_fees_diarias_max_pct: float = 0.5      # % capital mÃ¡x en fees diarias (0.5% = $25 en $5000)
+    grid_fees_diarias_max_pct: float = 1.5      # PR-B (transitorio): 0.5→1.5 durante la
+                                                # transición PR-C/D/E. Volver a 0.5 al terminar
+                                                # PR-F. Hot: /set_threshold grid_fees_diarias_max_pct
     grid_limite_perdida_diaria_usdt: float = -100.0  # PR-A: PnL NETO diario (realizedPnl - commission) que aborta todos los grids
 
     # â”€â”€ FASE 1: ReduceOnly fix â”€â”€

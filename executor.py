@@ -2679,6 +2679,13 @@ class GridExecutor:
                     await self._barrido_posiciones_huerfanas(contexto="periodico")
                     await self._detectar_piernas_atascadas()
 
+                # PR-B: pull incremental de income (funding/realized/commission) ~1 min
+                if ciclo % 20 == 0:
+                    try:
+                        await self._poll_income_eventos()
+                    except Exception as e_inc:
+                        print(f"  ⚠️ [INCOME] Error en polling: {e_inc}")
+
                 for symbol in list(self._grids.keys()):
                     try:
                         # P6 FIX: usar .get() — _abortar_grid (otra tarea) puede eliminar
@@ -2733,6 +2740,59 @@ class GridExecutor:
 
             except Exception as e_loop:
                 print(f"  🚨 [P6] Error en ciclo de monitoreo #{ciclo} (la tarea sobrevive): {e_loop}")
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # PR-B: POLLING DE INCOME DE BINANCE (funding / realized / commission)
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    async def _poll_income_eventos(self):
+        """PR-B: Pull incremental de income de Binance → income_eventos.
+
+        Cubre FUNDING_FEE (hueco #1 del veredicto: realizedPnl de Binance excluye
+        commission Y funding) + REALIZED_PNL/COMMISSION para calibración.
+        Watermark por (symbol, income_type) vía cargar_watermark_income.
+        Nota: futures_income tiene ventana máx. de 7 días por request — irrelevante
+        con polling cada minuto, documentado para backfills (ver backfill_income.py).
+        """
+        if not self.client:
+            return
+        from database_v5 import guardar_income_batch, cargar_watermark_income
+
+        ahora_ms = int(time.time() * 1000)
+        for symbol in CONFIG.symbols:
+            for income_type in ('FUNDING_FEE', 'REALIZED_PNL', 'COMMISSION'):
+                wm = await cargar_watermark_income(symbol, income_type)
+                start = (wm + 1) if wm > 0 else (ahora_ms - 24 * 3600_000)
+                if start >= ahora_ms:
+                    continue
+                try:
+                    income = await self._api_call(asyncio.to_thread(
+                        self.client.futures_income,
+                        incomeType=income_type,
+                        symbol=symbol,
+                        startTime=start,
+                        limit=1000,
+                    ))
+                except Exception as e:
+                    print(f"  ⚠️ [INCOME] {symbol} {income_type} futures_income: {e}")
+                    continue
+
+                if not income:
+                    continue
+
+                filas = [{
+                    'symbol': symbol,
+                    'income_type': ev.get('incomeType', income_type),
+                    'income': float(ev.get('income', 0)),
+                    'asset': ev.get('asset', 'USDT'),
+                    'tran_id': int(ev.get('tranId', 0)),
+                    'trade_id': str(ev.get('tradeId', '')) or None,
+                    'timestamp_ms': int(ev.get('time', 0)),
+                    'info': (ev.get('info') or '')[:255],
+                } for ev in income]
+                n = await guardar_income_batch(filas)
+                if n > 0:
+                    print(f"  [INCOME] {symbol} {income_type}: {n} eventos nuevos")
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # V7.1 FASE 4: VERIFICACIÓN DE INTEGRIDAD DEL GRID

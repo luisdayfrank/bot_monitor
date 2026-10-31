@@ -1085,6 +1085,32 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_ordenes_client_id ON grid_ejecucion_ordenes(client_order_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_ordenes_grid_id ON grid_ejecucion_ordenes(grid_ejecucion_id)")
 
+        # ═══════════════════════════════════════════════════════════════════════════════
+        # PR-B: TABLA DE INCOME DE BINANCE (funding / realized / commission)
+        # Fuente: endpoint futures_income. pnl_eventos NO cubre funding — esta tabla sí.
+        # UNIQUE (tran_id, income_type, symbol): Binance puede reusar tranId entre
+        # símbolos, y un mismo trade genera REALIZED_PNL y COMMISSION con el mismo
+        # tranId. La tripleta es la clave natural (idempotencia con INSERT IGNORE).
+        # ═══════════════════════════════════════════════════════════════════════════════
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS income_eventos (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                symbol VARCHAR(32) NOT NULL,
+                income_type VARCHAR(24) NOT NULL,
+                income DOUBLE NOT NULL,
+                asset VARCHAR(16) NOT NULL,
+                tran_id BIGINT NOT NULL,
+                trade_id VARCHAR(64) NULL,
+                timestamp_ms BIGINT NOT NULL,
+                info VARCHAR(255) NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY uk_income_tran_type (tran_id, income_type, symbol)
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_income_ts ON income_eventos(timestamp_ms)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_income_symbol_ts ON income_eventos(symbol, timestamp_ms)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_income_type_ts ON income_eventos(income_type, timestamp_ms)")
+
         await db.commit()
 
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -1976,6 +2002,63 @@ async def obtener_ultimo_trade_timestamp(symbol):
         """, (symbol,))
         row = await cursor.fetchone()
         return row[0] if row and row[0] else 0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PR-B: FUNCIONES DE INCOME DE BINANCE (funding / realized / commission)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def guardar_income_batch(rows: list) -> int:
+    """Inserta eventos de income de Binance de forma idempotente (INSERT IGNORE).
+
+    rows: dicts con symbol, income_type, income, asset, tran_id,
+    trade_id, timestamp_ms, info. Devuelve el nº de filas intentadas.
+    """
+    if not rows:
+        return 0
+    cols = ('symbol', 'income_type', 'income', 'asset', 'tran_id',
+            'trade_id', 'timestamp_ms', 'info')
+    filas = [tuple(r.get(c) for c in cols) for r in rows]
+    ph = ", ".join(["?"] * len(cols))
+    sql = f"INSERT IGNORE INTO income_eventos ({', '.join(cols)}) VALUES ({ph})"
+    try:
+        await _execute_with_retry(sql, seq=filas)
+        return len(filas)
+    except Exception as e:
+        print(f"  ⚠️ Error guardando income_eventos: {e}")
+        return 0
+
+
+async def cargar_watermark_income(symbol: str, income_type: str) -> int:
+    """Último timestamp_ms persistido para (symbol, income_type). 0 si no hay datos."""
+    async with _conexion() as db:
+        cursor = await db.execute(
+            "SELECT COALESCE(MAX(timestamp_ms), 0) FROM income_eventos "
+            "WHERE symbol = ? AND income_type = ?",
+            (symbol, income_type)
+        )
+        row = await cursor.fetchone()
+        return int(row[0] or 0) if row else 0
+
+
+async def calcular_resumen_funding_dia(fecha_local: str) -> dict:
+    """Total de FUNDING_FEE del día (UTC) agrupado por symbol. PR-B hueco #1."""
+    tz = get_tz()
+    fecha_inicio = tz.localize(datetime.strptime(fecha_local, "%Y-%m-%d"))
+    fecha_fin = fecha_inicio + timedelta(days=1)
+    ts_inicio = int(fecha_inicio.astimezone(pytz.UTC).timestamp() * 1000)
+    ts_fin = int(fecha_fin.astimezone(pytz.UTC).timestamp() * 1000)
+
+    async with _conexion() as db:
+        db.row_factory = Row
+        cursor = await db.execute("""
+            SELECT symbol, COALESCE(SUM(income), 0) AS funding
+            FROM income_eventos
+            WHERE income_type = 'FUNDING_FEE'
+              AND timestamp_ms >= ? AND timestamp_ms < ?
+            GROUP BY symbol
+        """, (ts_inicio, ts_fin))
+        rows = await cursor.fetchall()
+    return {r['symbol']: float(r['funding']) for r in rows}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CR2: FUNCIONES DE ACCESO A EVENTOS DE PnL
