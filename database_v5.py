@@ -2169,6 +2169,20 @@ async def calcular_resumen_financiero_dia(fecha_local: str, symbol: str = None) 
             pnl_total = float(row[0] or 0)
             fees_total = float(row[1] or 0)
 
+            # PR-C: funding del día desde income_eventos (income firmado:
+            # + = cobrado / − = pagado). realizedPnl de Binance NO incluye
+            # commission ni funding — ambos se descuentan por separado.
+            where_fund = ("WHERE income_type = 'FUNDING_FEE' "
+                          "AND timestamp_ms >= ? AND timestamp_ms < ?")
+            params_f = [ts_inicio, ts_fin]
+            if symbol:
+                where_fund += " AND symbol = ?"
+                params_f.append(symbol)
+            cursor = await db.execute(
+                f"SELECT COALESCE(SUM(income), 0) FROM income_eventos {where_fund}",
+                tuple(params_f))
+            funding_total = float((await cursor.fetchone())[0] or 0)
+
             # Costo específico de abortos (tipo_evento='ABORTO' o 'KILL_SWITCH')
             cursor = await db.execute(
                 f"SELECT COALESCE(SUM(realized_pnl),0) FROM pnl_eventos "
@@ -2194,20 +2208,27 @@ async def calcular_resumen_financiero_dia(fecha_local: str, symbol: str = None) 
                 params_t)
             abortos = int((await cursor.fetchone())[0] or 0)
 
+        # PR-C: neto real = realizedPnl (gross) − commission + funding firmado.
+        # El wallet delta de Binance (totalWalletBalance) suma el funding — criterio (c) PR-G.
+        pnl_bruto = pnl_total
+        pnl_neto = pnl_bruto - fees_total + funding_total
         return {
-            'pnl_neto_usdt': pnl_total,
+            'pnl_neto_usdt': pnl_neto,
+            'pnl_bruto_usdt': pnl_bruto,
             'fees_usdt': fees_total,
-            'pnl_ex_abortos': pnl_total - pnl_abortos,
+            'funding_usdt': funding_total,
+            'pnl_ex_abortos': pnl_neto - pnl_abortos,
             'costo_abortos_usdt': pnl_abortos,
             'round_trips': round_trips,
             'abortos': abortos,
             'ratio_win_por_aborto': round_trips / max(1, abortos),
-            'profit_factor': pnl_total / fees_total if fees_total > 0 else None,
-            'fees_sobre_ganancias_pct': fees_total / max(pnl_total, 0.01) * 100,
+            'profit_factor': pnl_bruto / fees_total if fees_total > 0 else None,
+            'fees_sobre_ganancias_pct': (fees_total / pnl_bruto * 100) if pnl_bruto > 0 else None,
         }
     except Exception as e_db:
         vacio = {
-            'pnl_neto_usdt': 0, 'fees_usdt': 0,
+            'pnl_neto_usdt': 0, 'pnl_bruto_usdt': 0,
+            'fees_usdt': 0, 'funding_usdt': 0,
             'pnl_ex_abortos': 0, 'costo_abortos_usdt': 0,
             'round_trips': 0, 'abortos': 0,
             'ratio_win_por_aborto': 0, 'profit_factor': None,
@@ -2251,17 +2272,31 @@ async def calcular_resumen_financiero_dia_por_symbol(fecha_local: str) -> dict:
             """, (ts_inicio, ts_fin))
             rows = await cursor.fetchall()
 
+            # PR-C: funding por symbol del mismo día (income firmado: +cobrado/−pagado)
+            cursor = await db.execute("""
+                SELECT symbol, COALESCE(SUM(income), 0)
+                FROM income_eventos
+                WHERE income_type = 'FUNDING_FEE'
+                  AND timestamp_ms >= ? AND timestamp_ms < ?
+                GROUP BY symbol
+            """, (ts_inicio, ts_fin))
+            funding_rows = await cursor.fetchall()
+            funding_por_sym = {r[0]: float(r[1] or 0) for r in funding_rows}
+
         out = {}
         for r in rows:
             pnl = float(r[1] or 0); fees = float(r[2] or 0)
             rt = int(r[3] or 0); ab = int(r[4] or 0); ab_pnl = float(r[5] or 0)
+            funding = funding_por_sym.get(r[0], 0.0)
+            neto = pnl - fees + funding
             out[r[0]] = {
-                'pnl_neto_usdt': pnl, 'fees_usdt': fees,
-                'pnl_ex_abortos': pnl - ab_pnl, 'costo_abortos_usdt': ab_pnl,
+                'pnl_neto_usdt': neto, 'pnl_bruto_usdt': pnl,
+                'fees_usdt': fees, 'funding_usdt': funding,
+                'pnl_ex_abortos': neto - ab_pnl, 'costo_abortos_usdt': ab_pnl,
                 'round_trips': rt, 'abortos': ab,
                 'ratio_win_por_aborto': rt / max(1, ab),
                 'profit_factor': pnl / fees if fees > 0 else None,
-                'fees_sobre_ganancias_pct': fees / max(pnl, 0.01) * 100,
+                'fees_sobre_ganancias_pct': (fees / pnl * 100) if pnl > 0 else None,
             }
         return out
     except Exception as e_db:
@@ -2273,7 +2308,8 @@ async def calcular_resumen_financiero_dia_por_symbol(fecha_local: str) -> dict:
 def resumen_financiero_vacio() -> dict:
     """Retorna un resumen financiero con ceros para símbolos sin actividad."""
     return {
-        'pnl_neto_usdt': 0, 'fees_usdt': 0,
+        'pnl_neto_usdt': 0, 'pnl_bruto_usdt': 0,
+        'fees_usdt': 0, 'funding_usdt': 0,
         'pnl_ex_abortos': 0, 'costo_abortos_usdt': 0,
         'round_trips': 0, 'abortos': 0,
         'ratio_win_por_aborto': 0, 'profit_factor': None,

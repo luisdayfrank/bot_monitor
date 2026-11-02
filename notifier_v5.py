@@ -963,8 +963,8 @@ class Notifier:
                             poder_total = capital * leverage
                             notional_por_orden = poder_total / grid_count
                             qty_por_orden = notional_por_orden / precio if precio > 0 else 0
-                            fee_rate = 0.0005
-                            breakeven = (2 * fee_rate + 2 * 0.0005) * 100
+                            fee_rate = CONFIG.grid_fee_taker
+                            breakeven = CONFIG.breakeven_taker_pct  # PR-C: fuente única (worst-case taker+slippage)
 
                             params = {
                                 'direction': direction,

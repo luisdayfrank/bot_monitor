@@ -1028,6 +1028,21 @@ class GridExecutor:
             'minPrice': 0.0, 'maxPrice': 999999.0
         })
 
+    async def _fetch_book_ticker(self, symbol: str):
+        """PR-D: mejor bid/ask vivo vía futures_orderbook_ticker.
+
+        Devuelve (bid, ask) como float; (0.0, 0.0) si el fetch falla
+        (el caller debe caer al fallback con banda sobre precio_ref).
+        """
+        try:
+            tk = await self._api_call(asyncio.to_thread(
+                self.client.futures_orderbook_ticker, symbol=symbol
+            ))
+            return float(tk.get('bidPrice', 0) or 0), float(tk.get('askPrice', 0) or 0)
+        except Exception as e:
+            print(f"  ⚠️ [BOOK] {symbol} orderbook_ticker falló: {e}")
+            return 0.0, 0.0
+
     def _validar_y_redondear_precio(self, precio: float, symbol: str) -> Optional[float]:
         """Valida y redondea un precio según tick_size, minPrice y maxPrice de Binance."""
         info = self._get_symbol_info(symbol)
@@ -4974,15 +4989,21 @@ class GridExecutor:
         cierre.avanzar('FALLIDO')
 
     async def _paso_cerrar_posicion(self, state: GridExecutionState, cierre: CierreState):
-        """Cierra la posición con LIMIT + fallback MARKET (Fix #6 corregido).
+        """Cierra la posición con LIMIT maker-first + fallback MARKET (PR-D).
 
-        Ciclo:
-          1. LIMIT reduceOnly con banda dura —grid_exit_limit_band_pct (0.1%)
-          2. Retry de trades hasta grid_exit_limit_timeout_seg (2.5s) — el endpoint
+        Ciclo (3 niveles, de más a menos maker):
+          1. LIMIT GTX (post-only) en el lado maker del libro: SELL a
+             best_ask+tick / BUY a best_bid−tick → fill maker (0.02%).
+             ANTES la banda era marketable (cruzaba el libro) → fill taker (0.05%).
+          2. Single-retry (Matiz 1): si GTX rechaza (el libro se movió entre el
+             fetch y el place), re-fetch del book y re-precio UNA vez.
+          3. Si GTX es inviable → GTC marketable con banda grid_exit_limit_band_pct
+             (taker con tope de precio). Último recurso: MARKET (paso 8).
+          4. Retry de trades hasta grid_exit_limit_timeout_seg (5s) — el endpoint
              futures_account_trades puede tardar 3-5s en reflejar el fill (P10-style)
-          3. Si llena completo → cerrada. Si llena parcial → cancelar resto + MARKET
+          5. Si llena completo → cerrada. Si llena parcial → cancelar resto + MARKET
              por el remanente. Si no llena nada → cancelar + MARKET por el total.
-          4. Fallback a markPrice de la posición si precios_vivo[symbol] <= 0
+          6. Fallback a markPrice de la posición si precios_vivo[symbol] <= 0
         """
         cierre.avanzar('CERRANDO_POSICION')
 
@@ -5039,13 +5060,31 @@ class GridExecutor:
                         return
                     print(f"  [CIERRE-LIMIT] {cierre.symbol} precio_vivo ausente ? usando markPrice ${precio_ref:.6f}")
 
-                # -- 3. LIMIT con banda dura desde config --
+                # -- 3. LIMIT maker-first (PR-D): 3 niveles --
+                # Nivel 1-2: GTX post-only en el lado maker del libro
+                #   SELL a best_ask+tick / BUY a best_bid−tick → maker garantizado
+                #   (antes: banda marketable que cruzaba el libro → fill taker 0.05%).
+                # Nivel 3 (solo si GTX rechaza 2 veces): GTC marketable con banda
+                #   (taker con tope de precio). Paso 8 MARKET queda como último recurso.
+                tick = Decimal(str(self._get_symbol_info(cierre.symbol)['tickSize']))
                 banda = Decimal(str(CONFIG.grid_exit_limit_band_pct)) / Decimal('100')  # 0.1% = 0.001
                 ref_d = Decimal(str(precio_ref))
-                if side == 'SELL':
-                    precio_limit = float((ref_d * (Decimal('1') - banda)).quantize(Decimal('0.000001')))
+
+                def _precio_maker(bid_, ask_):
+                    return (float(Decimal(str(ask_)) + tick) if side == 'SELL'
+                            else float(Decimal(str(bid_)) - tick))
+
+                def _precio_marketable():
+                    return (float((ref_d * (Decimal('1') - banda)).quantize(Decimal('0.000001')))
+                            if side == 'SELL'
+                            else float((ref_d * (Decimal('1') + banda)).quantize(Decimal('0.000001'))))
+
+                bid, ask = await self._fetch_book_ticker(cierre.symbol)
+                if bid > 0 and ask > 0:
+                    precio_limit = _precio_maker(bid, ask)
                 else:
-                    precio_limit = float((ref_d * (Decimal('1') + banda)).quantize(Decimal('0.000001')))
+                    print(f"  ⚠️ [CIERRE-LIMIT] {cierre.symbol} sin book ticker → banda marketable sobre precio_ref")
+                    precio_limit = _precio_marketable()
 
                 orden_limit = {
                     'symbol': cierre.symbol,
@@ -5053,21 +5092,45 @@ class GridExecutor:
                     'type': 'LIMIT',
                     'quantity': qty_total,
                     'price': precio_limit,
-                    'timeInForce': 'GTC',
+                    'timeInForce': 'GTX',
                 }
                 if self._hedge_mode:
                     orden_limit['positionSide'] = pos_tipo_cierre
                 else:
                     orden_limit['reduceOnly'] = True
 
-                res_limit = await self._api_call(asyncio.to_thread(
-                    self.client.futures_create_order, **orden_limit
-                ))
+                # Niveles 1-2: GTX con single-retry (Matiz 1) — si el libro se movió
+                # entre el fetch y el place, re-fetch + re-precio UNA vez.
+                res_limit = None
+                for intento in range(2):
+                    try:
+                        res_limit = await self._api_call(asyncio.to_thread(
+                            self.client.futures_create_order, **orden_limit
+                        ))
+                        break
+                    except Exception as e_place:
+                        print(f"  ⚠️ [CIERRE-LIMIT] {cierre.symbol} GTX rechazado (intento {intento+1}/2): {e_place}")
+                        if intento == 0:
+                            bid, ask = await self._fetch_book_ticker(cierre.symbol)
+                            if bid > 0 and ask > 0:
+                                precio_limit = _precio_maker(bid, ask)
+                                orden_limit['price'] = precio_limit
+
+                if res_limit is None:
+                    # Nivel 3: GTC marketable con banda (taker con tope de precio)
+                    precio_limit = _precio_marketable()
+                    orden_limit['price'] = precio_limit
+                    orden_limit['timeInForce'] = 'GTC'
+                    print(f"  ⚠️ [CIERRE-LIMIT] {cierre.symbol} GTX inviable → GTC marketable @ ${precio_limit}")
+                    res_limit = await self._api_call(asyncio.to_thread(
+                        self.client.futures_create_order, **orden_limit
+                    ))
+
                 limit_order_id = str(res_limit.get('orderId', ''))
                 if not limit_order_id:
                     cierre.fallar(f"LIMIT sin orderId en respuesta: {res_limit}")
                     return
-                print(f"  [CIERRE-LIMIT] {cierre.symbol} LIMIT {side} {qty_total} @ ${precio_limit} | Order: {limit_order_id}")
+                print(f"  [CIERRE-LIMIT] {cierre.symbol} LIMIT({orden_limit['timeInForce']}) {side} {qty_total} @ ${precio_limit} | Order: {limit_order_id}")
 
                 # -- 4. Guardar la orden LIMIT en DB ANTES de esperar el fill --
                 # (evita que CR16 la marque como SIN_ORDEN si el poll la ve primero)

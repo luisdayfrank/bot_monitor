@@ -2049,7 +2049,7 @@ class SignalGenerator:
         # FASE 4: Breakeven honesto — entry y TP son LIMIT (maker en ambos lados).
         # slippage NO aplica al ciclo limit-limit (solo en abortos, ver Fix C).
         fee_maker = CONFIG.grid_fee_rate                     # 0.02%
-        breakeven = 2 * fee_maker * 100                      # 0.04% (era 0.16%)
+        breakeven = CONFIG.breakeven_maker_pct               # PR-C: fuente única (2 × maker = 0.04%)
         # FASE 4.1 (V8.0): el objetivo debe cubrir el ratio mínimo exigido.
         # Si step < objetivo, comprimir niveles hasta el suelo operativo (5).
         ratio_min = CONFIG.grid_ratio_rentabilidad_min

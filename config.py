@@ -174,6 +174,20 @@ class Config(BaseModel):
     # recalibrar este valor. No asumir.
     grid_fee_rate: float = 0.0002
     grid_slippage: float = 0.0003
+    grid_fee_taker: float = 0.0005   # PR-C: fee taker Binance Futures (0.05%)
+
+    # ── PR-C: Breakeven unificado — única fuente para motor (signals_v5) y UI
+    # (notifier_v5 / web). Ambos escenarios etiquetados:
+    @property
+    def breakeven_maker_pct(self) -> float:
+        """Round-trip LIMIT→LIMIT (entrada + TP maker): 2 × maker."""
+        return 2 * self.grid_fee_rate * 100
+
+    @property
+    def breakeven_taker_pct(self) -> float:
+        """Round-trip worst-case (cierres taker + slippage en abortos)."""
+        return (2 * self.grid_fee_taker + 2 * self.grid_slippage) * 100
+
     grid_default_capital: float = 10.0
     grid_default_leverage: int = 15      # Leverage sugerido en senales (rango adaptativo 5-15) â†’ ahora 10
 
@@ -184,9 +198,6 @@ class Config(BaseModel):
     # Rango simÃ©trico: price Â± (atr * multiplicador / 2)
     grid_rango_mult_min: float = 4.0     # CAMBIO: antes 2.0 â†’ ahora 4.0
     grid_rango_mult_max: float = 10.0     # CAMBIO: antes 6.0 â†’ ahora 10.0
-
-    # Breakeven: step_pct debe ser al menos este mÃºltiplo para ser rentable
-    grid_breakeven_mult: float = 1.05     # V6.0: antes 1.15 â†’ 1.05 (fees maker reales)
 
     # Auto-compresiÃ³n: si step_pct < breakeven * mult, reducir grids
     grid_auto_compress: bool = True
@@ -479,9 +490,9 @@ class Config(BaseModel):
                                                 # NIVEL 3 (Fix A+B). 8% junto a los typos, nunca separados.
     grid_exit_limit_band_pct: float = 0.1       # FIX #6 (Bloque 4): banda dura (±0.1%) del precio
                                                 # límite en cierres LIMIT con fallback MARKET
-    grid_exit_limit_timeout_seg: float = 2.5    # FIX #6 (Bloque 4): espera máx del intento LIMIT
-                                                # antes de fallback MARKET (2-3s; esperar más en
-                                                # mercado cayendo cuesta más que el taker fee)
+    grid_exit_limit_timeout_seg: float = 5.0    # PR-D: antes 2.5s — debe ser >= lag del endpoint
+                                                # futures_account_trades (3-5s). Con 2.5s el fallback
+                                                # MARKET se disparaba prematuramente (taker innecesario).
 
     # â”€â”€ FASE 4: Filtro de fees y rentabilidad â”€â”€
     grid_ratio_rentabilidad_min: float = 1.5    # Ratio mín profit/fees por round-trip (1.0 = breakeven)

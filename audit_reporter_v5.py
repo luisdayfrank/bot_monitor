@@ -913,12 +913,16 @@ class AuditReporter:
         if total_neutral_grid > 0:
             lineas.append(f"[N-GRID] Grid Neutral: {total_neutral_grid} eventos")
 
-        # FIX F (Bloque 4): resumen financiero desde pnl_eventos/grid_ejecuciones
+        # FIX F (Bloque 4): resumen financiero desde pnl_eventos/income_eventos
+        # PR-C Nota 3: 'Ganancia neta tras fees' como línea explícita — el usuario
+        # debe poder reconciliar el cambio de contabilidad gross → neto.
         if resumen_financiero:
-            lineas.append(f"[FIN] PnL neto: {resumen_financiero['pnl_neto_usdt']:+.2f} USDT | "
-                          f"Fees: {resumen_financiero['fees_usdt']:.2f} USDT | "
-                          f"Coste abortos: {resumen_financiero['costo_abortos_usdt']:+.2f} USDT")
-            lineas.append(f"[FIN] Round trips: {resumen_financiero['round_trips']} | "
+            lineas.append(f"[FIN] Ganancia neta tras fees: {resumen_financiero['pnl_neto_usdt']:+.2f} USDT | "
+                          f"Bruto: {resumen_financiero.get('pnl_bruto_usdt', 0.0):+.2f} | "
+                          f"Fees: {resumen_financiero['fees_usdt']:.2f} | "
+                          f"Funding: {resumen_financiero.get('funding_usdt', 0.0):+.2f} (+cobrado/-pagado)")
+            lineas.append(f"[FIN] Coste abortos: {resumen_financiero['costo_abortos_usdt']:+.2f} USDT | "
+                          f"Round trips: {resumen_financiero['round_trips']} | "
                           f"Abortos: {resumen_financiero['abortos']} | "
                           f"Ratio wins/aborto: {resumen_financiero['ratio_win_por_aborto']}")
 

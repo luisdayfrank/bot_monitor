@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-PR-B: Backfill de income_eventos (ESCRITURA — separado del diagnóstico read-only).income = client.futures_income_history
+PR-B: Backfill de income_eventos (ESCRITURA — separado del diagnóstico read-only).
+Fix VPS: income = client.futures_income_history (nombre real en python-binance).
 
 Crea la tabla income_eventos si no existe (mismo schema que database_v5.init_db)
 y rellena los últimos N días desde futures_income: FUNDING_FEE, REALIZED_PNL
