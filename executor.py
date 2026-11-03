@@ -1177,7 +1177,7 @@ class GridExecutor:
             return 0.0
 
         gs = state.grid_state
-        capital_total = float(CONFIG.trading_capital_max_usdt)
+        capital_total = float(state.capital) if state.capital else 0.0
         if capital_total <= 0:
             return 0.0
 
