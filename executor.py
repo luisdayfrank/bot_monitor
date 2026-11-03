@@ -2375,7 +2375,7 @@ class GridExecutor:
             # 9. Crear estado en RAM
             state = GridExecutionState(
                 grid_id=grid_id, symbol=symbol, direction=direction,
-                capital=CONFIG.trading_capital_max_usdt, leverage=leverage,
+                capital=capital_sizing, leverage=leverage,
                 precio_entrada=price, niveles=niveles, qty_por_orden=qty
             )
             self._grids[symbol] = state
@@ -2527,7 +2527,7 @@ class GridExecutor:
             # 8. Crear estado del executor
             state = GridExecutionState(
                 grid_id=grid_id, symbol=symbol, direction='NEUTRAL',
-                capital=CONFIG.trading_capital_max_usdt, leverage=leverage,
+                capital=capital_sizing, leverage=leverage,
                 precio_entrada=price, niveles=niveles, qty_por_orden=qty
             )
 
@@ -4463,7 +4463,8 @@ class GridExecutor:
                         print(f"  [E.3] {symbol} TP asociado a posición {pos_id}")
                         break
 
-            print(f"  ✅ [E.3] {symbol} TP {side} reduceOnly @ ${tp_price} | Qty:{qty_total} | Origen:{binance_order_id}")
+            _modo_txt = "positionSide" if self._hedge_mode else "reduceOnly"
+            print(f"  ✅ [E.3] {symbol} TP {side} {_modo_txt} @ ${tp_price} | Qty:{qty_total} | Origen:{binance_order_id}")
 
         except Exception as e:
             err_str = str(e)
@@ -4648,7 +4649,8 @@ class GridExecutor:
                     pos.orden_cierre_id = tp_order_id
                     break
 
-            print(f"  ✅ [E.2] {symbol} TP {tp_side} reduceOnly @ ${tp_price} | Qty:{qty} | Pos:{pos_id}")
+            _modo_txt = "positionSide" if self._hedge_mode else "reduceOnly"
+            print(f"  ✅ [E.2] {symbol} TP {tp_side} {_modo_txt} @ ${tp_price} | Qty:{qty} | Pos:{pos_id}")
         except Exception as e:
             err_str = str(e)
             if '-2022' in err_str or 'ReduceOnly' in err_str:
@@ -4661,7 +4663,7 @@ class GridExecutor:
                 else:
                     print(f"  ⚠️ [E.2] {symbol} TP {tp_side} -2022 (intento {count}/3) para {pos_id}: {e}")
             else:
-                print(f"  ⚠️ [E.2] {symbol} Error TP neutral {tp_side} reduceOnly @ ${tp_price}: {e}")
+                print(f"  ⚠️ [E.2] {symbol} Error TP neutral {tp_side} {_modo_txt} @ ${tp_price}: {e}")
 
     async def _ejecutar_kill_switch_real(self, symbol: str, state: GridExecutionState,
                                           pos_id: str, pos_tipo: str, qty: float, 
