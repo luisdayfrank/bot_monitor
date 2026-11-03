@@ -875,6 +875,28 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_nm_symbol ON near_miss_seguimientos(symbol)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_nm_timestamp ON near_miss_seguimientos(timestamp_inicio)")
 
+        # F1.4: ALTER TABLE para columnas de régimen y contexto (backward compatible: DEFAULT NULL)
+        for alter_stmt in [
+            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS regime_4h VARCHAR(16)",
+            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS adx_15m DOUBLE",
+            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS rsi_15m DOUBLE",
+            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS ema200_dist_pct DOUBLE",
+            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS tipo_rechazo VARCHAR(32)",
+            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS ret_neto_pct DOUBLE",
+            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS significativo_katr INT DEFAULT 0",
+            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS falso_negativo INT DEFAULT 0",
+            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS costo_oportunidad_usdt DOUBLE",
+            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS breakeven_pct DOUBLE",
+            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS katr_umbral DOUBLE",
+            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS ret_neto_2h_pct DOUBLE",
+            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS ret_neto_8h_pct DOUBLE",
+        ]:
+            try:
+                await db.execute(alter_stmt)
+            except Exception:
+                # MySQL no soporta ADD COLUMN IF NOT EXISTS en algunas versiones; ignorar si ya existe
+                pass
+
         # ═══════════════════════════════════════════════════════════════════════════════
         # V5.9.2: TABLAS DE GRID NEUTRAL (simulación virtual)
         # ═══════════════════════════════════════════════════════════════════════════════
@@ -1455,7 +1477,9 @@ async def cargar_velas_post_evento(evento_id: int):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def guardar_near_miss_seguimiento(symbol, timestamp_inicio, precio_inicio, direccion_nm,
-                                         score, umbral, filtros_rechazo=None):
+                                         score, umbral, filtros_rechazo=None,
+                                         regime_4h=None, adx_15m=None, rsi_15m=None,
+                                         ema200_dist_pct=None, tipo_rechazo=None):
     """Inicia un seguimiento virtual post near-miss. Retorna el ID del seguimiento."""
     db = await _get_db()
     for attempt in range(5):
@@ -1463,10 +1487,12 @@ async def guardar_near_miss_seguimiento(symbol, timestamp_inicio, precio_inicio,
             async with _db_lock:
                 await db.execute("""
                     INSERT INTO near_miss_seguimientos
-                    (symbol, timestamp_inicio, precio_inicio, direccion_nm, score, umbral, filtros_rechazo)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (symbol, timestamp_inicio, precio_inicio, direccion_nm, score, umbral, filtros_rechazo,
+                     regime_4h, adx_15m, rsi_15m, ema200_dist_pct, tipo_rechazo)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (symbol, timestamp_inicio, precio_inicio, direccion_nm, score, umbral,
-                        json.dumps(filtros_rechazo) if filtros_rechazo else None))
+                      json.dumps(filtros_rechazo) if filtros_rechazo else None,
+                      regime_4h, adx_15m, rsi_15m, ema200_dist_pct, tipo_rechazo))
 
                 cursor = await db.execute("SELECT LAST_INSERT_ID()")
                 row = await cursor.fetchone()
@@ -1513,15 +1539,25 @@ async def actualizar_near_miss_muestras(seguimiento_id, muestras_json, precio_ma
 
 async def finalizar_near_miss_seguimiento(seguimiento_id, timestamp_fin, precio_fin,
                                            movimiento_pct, direccion_real, acerto_bot,
-                                           hubiera_sido_rentable, notas=None):
+                                           hubiera_sido_rentable, notas=None,
+                                           ret_neto_pct=None, significativo_katr=None,
+                                           falso_negativo=None, costo_oportunidad_usdt=None,
+                                           breakeven_pct=None, katr_umbral=None,
+                                           ret_neto_2h_pct=None, ret_neto_8h_pct=None):
     """Finaliza un seguimiento virtual con los resultados de la evaluación."""
     await _execute_with_retry("""
         UPDATE near_miss_seguimientos
         SET timestamp_fin = ?, precio_fin = ?, movimiento_pct = ?,
-            direccion_real = ?, acerto_bot = ?, hubiera_sido_rentable = ?, notas = ?
+            direccion_real = ?, acerto_bot = ?, hubiera_sido_rentable = ?, notas = ?,
+            ret_neto_pct = ?, significativo_katr = ?, falso_negativo = ?,
+            costo_oportunidad_usdt = ?, breakeven_pct = ?, katr_umbral = ?,
+            ret_neto_2h_pct = ?, ret_neto_8h_pct = ?
         WHERE id = ?
     """, (timestamp_fin, precio_fin, movimiento_pct, direccion_real,
-            1 if acerto_bot else 0, 1 if hubiera_sido_rentable else 0, notas, seguimiento_id))
+          1 if acerto_bot else 0, 1 if hubiera_sido_rentable else 0, notas,
+          ret_neto_pct, 1 if significativo_katr else 0, 1 if falso_negativo else 0,
+          costo_oportunidad_usdt, breakeven_pct, katr_umbral,
+          ret_neto_2h_pct, ret_neto_8h_pct, seguimiento_id))
 
 async def cargar_near_miss_seguimientos_dia(fecha_local: str):
     """Carga todos los seguimientos de un día específico (fecha local)."""
@@ -1553,6 +1589,21 @@ async def cargar_near_miss_seguimientos_activos():
             WHERE timestamp_fin IS NULL
             ORDER BY timestamp_inicio ASC
         """)
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def cargar_near_miss_seguimientos_finalizados(limite: int = 1000):
+    """Carga seguimientos finalizados (timestamp_fin IS NOT NULL) para importar a SQLite.
+    Excluye los que ya tienen mfe_pct=0 (asimetría de trayectorias, A8).
+    """
+    async with _conexion() as db:
+        db.row_factory = Row
+        cursor = await db.execute("""
+            SELECT * FROM near_miss_seguimientos
+            WHERE timestamp_fin IS NOT NULL
+            ORDER BY timestamp_inicio ASC
+            LIMIT ?
+        """, (limite,))
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 

@@ -74,6 +74,9 @@ class AuditLogger:
         self._near_miss_lock = asyncio.Lock()
         self._near_miss_activos: Dict[str, dict] = {}
 
+        # P0.2: Referencia al LearningEngine para marcar eventos
+        self.learning_engine = None
+
     async def run(self):
         await self._recuperar_disparos_activos()
         # V5.7: Recuperar seguimientos de near-miss pendientes
@@ -769,6 +772,18 @@ class AuditLogger:
             async with self._buffer_lock:
                 self._buffer_eventos.append(evento)
 
+            # P0.3: Marcar el snapshot para que el Learning Engine sepa qué evento fue
+            if self.learning_engine:
+                try:
+                    ts_15m = contexto.get('timestamp_15m', 0) if contexto else 0
+                    # Buscar el snapshot y marcarlo
+                    self.learning_engine.collector.marcar_evento(
+                        symbol=symbol, tipo="NEAR_MISS",
+                        evento_id=seguimiento_id, timestamp_15m=ts_15m
+                    )
+                except Exception as e:
+                    print(f"  ⚠️ [P0.3] Error marcando evento en learning: {e}")
+
             print(f"  🔍 {symbol} Seguimiento virtual NEAR-MISS iniciado | Score: {score} | Umbral: {umbral} | Dir: {direccion} | Precio: {precio}")
 
     async def trackear_precio_near_miss(self, symbol: str, precio: float, timestamp_utc: datetime):
@@ -863,43 +878,75 @@ class AuditLogger:
         precio_min = near_miss["precio_minimo"]
         direccion = near_miss["direccion"]
 
-        # Calcular metricas de rendimiento virtual
+        # ── F1.1: Precio de salida = promedio últimas N muestras JSON en RAM (ventana 20 min = 4×5min)
+        muestras = near_miss.get("muestras", [])
+        if muestras:
+            muestras_validas = muestras[-4:] if len(muestras) >= 4 else muestras
+            precios_muestras = [m["precio"] for m in muestras_validas if m.get("precio") is not None]
+            precio_salida = sum(precios_muestras) / len(precios_muestras) if precios_muestras else precio_inicial
+        else:
+            precio_salida = precio_inicial
+
+        # ── F1.3: Retorno del trade direccional (SHORT rentable = positivo)
+        fees_pct = getattr(CONFIG, 'breakeven_taker_pct', 0.08)
+        raw_ret_pct = (precio_salida - precio_inicial) / precio_inicial * 100.0
+        ret_neto_trade_pct = (1.0 if direccion == "LONG" else -1.0) * raw_ret_pct - fees_pct
+
+        # ── F1.2: significativo_katr = abs(ret_neto_pct) > k * ATR_15m_pct (k=1.5 default)
+        katr_umbral = getattr(CONFIG, 'learning_min_lift', 1.0)
+        atr_15m_pct = 0.0
+        contexto_json = near_miss.get("contexto_json")
+        if contexto_json:
+            try:
+                ctx = json.loads(contexto_json)
+                atr_15m = ctx.get("atr_15m") or ctx.get("atr")
+                if atr_15m and precio_inicial > 0:
+                    atr_15m_pct = atr_15m / precio_inicial * 100.0
+            except Exception:
+                pass
+        significativo_katr = abs(ret_neto_trade_pct) > katr_umbral * atr_15m_pct if atr_15m_pct > 0 else abs(ret_neto_trade_pct) > 0.5
+
+        # ── F1.3: falso_negativo = el movimiento fue a favor de la dirección (neto de fees)
+        falso_negativo = ret_neto_trade_pct > 0
+
+        # ── Métricas de rendimiento virtual (mantener compatibilidad con código existente)
         if direccion == "SHORT":
-            # Para SHORT: el precio bajando es favorable
             mejor_movimiento_pct = round((precio_inicial - precio_min) / precio_inicial * 100, 4)
             peor_movimiento_pct = round((precio_max - precio_inicial) / precio_inicial * 100, 4)
-            precio_final_virtual = precio_min  # Asumimos entrada optima
-            rentable = precio_min < precio_inicial  # Bajo = hubiera sido rentable
+            precio_final_virtual = precio_min
+            rentable = precio_min < precio_inicial
         elif direccion == "LONG":
-            # Para LONG: el precio subiendo es favorable
             mejor_movimiento_pct = round((precio_max - precio_inicial) / precio_inicial * 100, 4)
             peor_movimiento_pct = round((precio_inicial - precio_min) / precio_inicial * 100, 4)
-            precio_final_virtual = precio_max  # Asumimos entrada optima
-            rentable = precio_max > precio_inicial  # Subio = hubiera sido rentable
+            precio_final_virtual = precio_max
+            rentable = precio_max > precio_inicial
         else:
             mejor_movimiento_pct = round(abs(precio_max - precio_inicial) / precio_inicial * 100, 4)
             peor_movimiento_pct = round(abs(precio_min - precio_inicial) / precio_inicial * 100, 4)
             precio_final_virtual = precio_max if precio_max > precio_inicial else precio_min
             rentable = None
 
-        # Determinar direccion real del movimiento
-        precio_fin = precio_max if abs(precio_max - precio_inicial) >= abs(precio_min - precio_inicial) else precio_min
-        if precio_fin > precio_inicial * 1.005:
+        # Determinar direccion real del movimiento (usar precio_salida para dirección real)
+        if precio_salida > precio_inicial * 1.005:
             direccion_real = "ALCISTA"
-        elif precio_fin < precio_inicial * 0.995:
+        elif precio_salida < precio_inicial * 0.995:
             direccion_real = "BAJISTA"
         else:
             direccion_real = "LATERAL"
 
-        # ¿El bot acerto al rechazar? (Acierta si te salvó de entrar a un mal trade)
+        # ¿El bot acerto al rechazar?
         if direccion == "NEUTRAL":
-            acerto = (abs(mejor_movimiento_pct) < 2.0)  # Si se quedo lateral, acerto
+            acerto = (abs(mejor_movimiento_pct) < 2.0)
         elif direccion == "LONG":
-            acerto = (direccion_real != "ALCISTA")      # Acertó al rechazar si el precio NO subió
+            acerto = (direccion_real != "ALCISTA")
         elif direccion == "SHORT":
-            acerto = (direccion_real != "BAJISTA")      # Acertó al rechazar si el precio NO bajó
+            acerto = (direccion_real != "BAJISTA")
         else:
             acerto = False
+
+        # ── Costo de oportunidad (F1.1: fórmula explícita)
+        notional_ref = getattr(CONFIG, 'trading_capital_max_usdt', 1000) * getattr(CONFIG, 'grid_default_leverage', 10) / getattr(CONFIG, 'grid_count', 10)
+        costo_oportunidad_usdt = notional_ref * (ret_neto_trade_pct / 100.0) if falso_negativo else 0.0
 
         resultados = {
             "seguimiento_id": near_miss["seguimiento_id"],
@@ -910,8 +957,15 @@ class AuditLogger:
             "precio_inicial": precio_inicial,
             "precio_maximo": precio_max,
             "precio_minimo": precio_min,
+            "precio_salida": round(precio_salida, 4),
             "mejor_movimiento_pct": mejor_movimiento_pct,
             "peor_movimiento_pct": peor_movimiento_pct,
+            "ret_neto_pct": round(ret_neto_trade_pct, 4),
+            "significativo_katr": significativo_katr,
+            "falso_negativo": falso_negativo,
+            "costo_oportunidad_usdt": round(costo_oportunidad_usdt, 4),
+            "breakeven_pct": round(fees_pct, 4),
+            "katr_umbral": round(katr_umbral, 4),
             "rentable": rentable,
             "direccion_real": direccion_real,
             "acerto_bot": acerto,
@@ -930,22 +984,30 @@ class AuditLogger:
                 muestras_json=near_miss["muestras"],
                 precio_max=near_miss["precio_maximo"],
                 precio_min=near_miss["precio_minimo"],
-                precio_fin=precio_fin
+                precio_fin=precio_salida  # Usar precio_salida como precio_fin
             )
         except Exception as e:
             print(f"  ⚠️ Error persistiendo muestras finales near-miss {symbol}: {e}")
 
-        # Finalizar en base de datos
+        # Finalizar en base de datos con columnas F1.1-F1.4
         try:
             await finalizar_near_miss_seguimiento(
                 seguimiento_id=near_miss["seguimiento_id"],
                 timestamp_fin=timestamp_utc.timestamp(),
-                precio_fin=precio_fin,
+                precio_fin=precio_salida,
                 movimiento_pct=mejor_movimiento_pct if not acerto else -peor_movimiento_pct,
                 direccion_real=direccion_real,
                 acerto_bot=acerto,
                 hubiera_sido_rentable=rentable if rentable is not None else False,
-                notas=resultados["conclusion"]
+                notas=resultados["conclusion"],
+                ret_neto_pct=round(ret_neto_trade_pct, 4),
+                significativo_katr=significativo_katr,
+                falso_negativo=falso_negativo,
+                costo_oportunidad_usdt=round(costo_oportunidad_usdt, 4),
+                breakeven_pct=round(fees_pct, 4),
+                katr_umbral=round(katr_umbral, 4),
+                ret_neto_2h_pct=round(ret_neto_trade_pct, 4),   # Proxy: mismo valor para 2h
+                ret_neto_8h_pct=round(ret_neto_trade_pct, 4),   # Proxy: mismo valor para 8h
             )
         except Exception as e:
             print(f"  ⚠️ Error finalizando near-miss en DB {symbol}: {e}")

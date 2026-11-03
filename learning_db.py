@@ -381,6 +381,43 @@ async def guardar_trend_end_labels_batch(rows: list):
     return await _run(_op)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# near_miss_labels — import desde MySQL (F1.6)
+# ═════════════════════════════════════════════════════════════════════════════
+async def guardar_near_miss_labels_batch(rows: list):
+    if not rows:
+        return 0
+    cols = ['seguimiento_id', 'symbol', 'timestamp_inicio', 'timestamp_fin',
+            'regime', 'tipo_rechazo', 'adx_15m', 'rsi_15m', 'ema200_dist_pct',
+            'ret_neto_2h_pct', 'ret_neto_8h_pct', 'mfe_neto_pct', 'mae_neto_pct',
+            'breakeven_pct', 'katr_umbral', 'rentable_neto_2h', 'rentable_neto_8h',
+            'bloqueo_correcto', 'falso_negativo', 'significativo_katr',
+            'costo_oportunidad_usdt']
+    filas = [tuple(r.get(c) for c in cols) for r in rows]
+    ph = ", ".join(["?"] * len(cols))
+    sql = f"INSERT OR REPLACE INTO near_miss_labels ({', '.join(cols)}) VALUES ({ph})"
+
+    def _op():
+        conn = _get_conn()
+        conn.executemany(sql, filas)
+        conn.commit()
+        return len(filas)
+
+    return await _run(_op)
+
+
+async def contar_near_miss_labels():
+    """Retorna (total, ultimo_timestamp_ms) para health monitor NMI."""
+    def _op():
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT COUNT(*) as total, MAX(timestamp_inicio) as ultimo_ts FROM near_miss_labels"
+        ).fetchone()
+        return row[0], row[1]
+
+    return await _run(_op)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # predictions_log
 # ═══════════════════════════════════════════════════════════════════════════

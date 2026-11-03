@@ -423,3 +423,46 @@ CREATE TABLE IF NOT EXISTS model_experiments (
     promovido BOOLEAN DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_me_exp ON model_experiments(experimento_id, symbol);
+
+-- ----------------------------------------------------------------------------
+-- Fase 1: near_miss_labels — etiquetas de near-miss con medición honesta
+-- Fuente única: MySQL near_miss_seguimientos importadas por NearMissOutcomeImporter
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS near_miss_labels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    seguimiento_id INTEGER NOT NULL UNIQUE,      -- FK a MySQL near_miss_seguimientos.id
+    symbol TEXT NOT NULL,
+    timestamp_inicio INTEGER NOT NULL,           -- epoch_ms UTC
+    timestamp_fin INTEGER,
+    
+    -- Contexto de régimen y filtro (F1.4)
+    regime TEXT NOT NULL,                        -- BEARISH|BULLISH|NEUTRAL
+    tipo_rechazo TEXT NOT NULL,                  -- ADX_EXTREMO|RSI_EXTREMO|MFM_BAJO|ATR_COMPRIMIDO|...
+    adx_15m REAL,
+    rsi_15m REAL,
+    ema200_dist_pct REAL,
+    
+    -- Retornos (F1.1: medición honesta, neto de fees, desde muestras RAM)
+    ret_neto_2h_pct REAL,
+    ret_neto_8h_pct REAL,
+    mfe_neto_pct REAL,
+    mae_neto_pct REAL,
+    breakeven_pct REAL,
+    katr_umbral REAL,
+    
+    -- Flags de etiquetado (F1.3)
+    rentable_neto_2h INTEGER DEFAULT 0,
+    rentable_neto_8h INTEGER DEFAULT 0,
+    bloqueo_correcto INTEGER DEFAULT 0,          -- ¿El bot acerto al rechazar?
+    falso_negativo INTEGER DEFAULT 0,            -- ¿Se perdió una oportunidad rentable?
+    significativo_katr INTEGER DEFAULT 0,
+    
+    -- Economía (F1.1)
+    costo_oportunidad_usdt REAL DEFAULT 0,
+    
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_nml_symbol_ts ON near_miss_labels(symbol, timestamp_inicio);
+CREATE INDEX IF NOT EXISTS idx_nml_regime ON near_miss_labels(regime);
+CREATE INDEX IF NOT EXISTS idx_nml_tipo_rechazo ON near_miss_labels(tipo_rechazo);
+CREATE INDEX IF NOT EXISTS idx_nml_falso_negativo ON near_miss_labels(falso_negativo);

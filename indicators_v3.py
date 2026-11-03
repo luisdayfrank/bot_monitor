@@ -402,7 +402,7 @@ class IndicatorEngineV3:
         }
 
     # ================================================================
-    # CAPA SESIÓN: calcular_4h (sin cambios)
+    # CAPA SESIÓN: calcular_4h (P0.6: EMA50 añadida para régimen 4H)
     # ================================================================
     def calcular_4h(self, symbol: str) -> dict:
         df = self.buffers_4h[symbol].copy()
@@ -413,10 +413,12 @@ class IndicatorEngineV3:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
         df.ta.ema(length=200, append=True)
+        df.ta.ema(length=50, append=True)   # P0.6: EMA50 para régimen 4H
         last = df.iloc[-1]
 
         return {
             'timestamp': int(last['timestamp']),
             'close': float(last['close']),
             'ema200_4h': float(last['EMA_200']) if not pd.isna(last['EMA_200']) else None,
+            'ema50_4h': float(last['EMA_50']) if not pd.isna(last.get('EMA_50')) else None,  # P0.6
         }

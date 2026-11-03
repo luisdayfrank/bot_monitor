@@ -39,6 +39,8 @@ from typing import Callable, Optional
 
 import learning_db as ldb
 
+from database_v5 import cargar_near_miss_seguimientos_finalizados  # F1.6
+
 MODEL_VERSION = "patterns_v1"
 
 # Features minables (todas numéricas en feature_snapshots)
@@ -259,6 +261,8 @@ class SnapshotCollector:
         self._buffer: list = []
         self.transiciones_pendientes: list = []   # filas regime_transitions (flush batch)
         self._lock = threading.Lock()
+        # P0.3: Para marcar eventos en buffer o pendientes si flush ya ocurrió
+        self._pending_markings: list = []
         # Historiales ligeros para features de pendiente / divergencia
         self._ema50_hist: dict = defaultdict(lambda: deque(maxlen=6))
         self._adx_hist: dict = defaultdict(lambda: deque(maxlen=6))
@@ -295,6 +299,20 @@ class SnapshotCollector:
         with self._lock:
             filas, self.transiciones_pendientes = self.transiciones_pendientes, []
         return filas
+
+    # P0.3: Marcar evento en buffer RAM o en pending si flush ya ocurrió
+    def marcar_evento(self, symbol: str, tipo: str, evento_id: int, timestamp_15m: int):
+        """P0.3: Marca el snapshot en el buffer RAM (o pending) para enlazar near-miss."""
+        with self._lock:
+            # 1. Buscar en el buffer actual
+            for fila in self._buffer:
+                if fila['symbol'] == symbol and fila['timestamp_15m'] == timestamp_15m:
+                    fila['evento_asociado'] = tipo
+                    fila['evento_id'] = evento_id
+                    return True
+            # 2. Si no está (ya se hizo flush), añadir a pendientes
+            self._pending_markings.append((symbol, tipo, evento_id, timestamp_15m))
+            return False
 
     # ── extracción de features ────────────────────────────────────────────
     def _extraer_features(self, symbol: str) -> Optional[dict]:
@@ -1352,6 +1370,9 @@ class LearningEngine:
         self.drift_detector = DriftDetector()
         self.notifier = None               # inyectado desde main.py
 
+        # F1.6: NearMissOutcomeImporter (MySQL → SQLite)
+        self.nmi_importer = self.NearMissOutcomeImporter(self)
+
         self.learner_hora_local = learner_hora_local
         self.tz_offset = timezone_offset_horas
 
@@ -1367,6 +1388,7 @@ class LearningEngine:
         self._last_outcomes_run = 0.0
         self._last_guardrails_run = 0.0
         self._last_drift_run = 0.0
+        self._last_nmi_import = 0.0     # F1.6: último run del importador
         self._drift_notificado: dict = {}   # symbol -> ts (anti-spam 24h)
 
     # ── loader por defecto: database_v5 (MySQL del trading) ───────────────
@@ -1535,10 +1557,17 @@ class LearningEngine:
             self._last_transiciones_run = ahora
             await self.transition_tracker.validar_transiciones_maduras()
 
-        # 6) Completar outcomes en predictions_log (cada hora)
+# 6) Completar outcomes en predictions_log (cada hora)
         if ahora - self._last_outcomes_run > 3600:
             self._last_outcomes_run = ahora
             await ldb.completar_outcomes_predicciones(_now_ms())
+
+            # P0.5: Agendar etiquetado de trend-ends (cada 6 horas)
+            if ahora - getattr(self, '_last_trend_ends_run', 0) > 21600:
+                self._last_trend_ends_run = ahora
+                n_te = await self.etiquetar_trend_ends(list(self.cfg.symbols))
+                if n_te > 0:
+                    print(f"  🧠 [LEARN] {n_te} trend-end labels generados")
 
         # 6b) ANEXO A §5: drift detection (cada hora, solo alerta)
         if ahora - self._last_drift_run > 3600:
@@ -1572,6 +1601,24 @@ class LearningEngine:
             self._last_guardrails_run = ahora
             self.guardrails.notifier = self.notifier
             await self.guardrails.evaluar()
+
+        # F1.6: NearMissOutcomeImporter — MySQL → SQLite (cada 15 min)
+        await self.nmi_importer.run(ahora)
+
+        # F1.7: Health NMI monitor (cada hora)
+        if ahora - getattr(self, '_last_nmi_health_run', 0) > 3600:
+            self._last_nmi_health_run = ahora
+            try:
+                total, ultimo_ts = await ldb.contar_near_miss_labels()
+                stale_h = (ahora - ultimo_ts) / 3600_000 if ultimo_ts else float('inf')
+                print(f"  💓 [NMI-HEALTH] labels_total={total} | labels_stale_h={stale_h:.1f}")
+                if stale_h > 48 and self.notifier:
+                    await self.notifier.enviar_telegram(
+                        f"⚠️ <b>NMI STALE</b>\n"
+                        f"Último near_miss_label hace {stale_h:.1f}h (>48h). "
+                        f"Revisar pipeline MySQL→SQLite.")
+            except Exception as e:
+                print(f"  ⚠️ [NMI-HEALTH] Error: {e}")
 
         # 7) Learner diario a la hora configurada
         if self._es_hora_learner() and (ahora - self._last_learner_run > 20 * 3600):
@@ -1635,6 +1682,71 @@ class LearningEngine:
         if filas:
             await ldb.guardar_trend_end_labels_batch(filas)
         return len(filas)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # F1.6: NearMissOutcomeImporter — MySQL → SQLite (idempotente)
+    # ══════════════════════════════════════════════════════════════════════════
+    class NearMissOutcomeImporter:
+        """
+        Importa seguimientos finalizados de MySQL (near_miss_seguimientos)
+        a SQLite (near_miss_labels). Idempotente por seguimiento_id.
+        Excluye filas con mfe_pct=0 (asimetría de trayectorias, A8).
+        """
+        def __init__(self, learning_engine):
+            self.le = learning_engine
+            self._importados = set()  # seguimiento_ids ya importados
+            self._last_run = 0
+
+        async def run(self, ahora: float):
+            """Ejecuta import cada 15 min."""
+            if ahora - self._last_run < 900:
+                return
+            self._last_run = ahora
+
+            try:
+                rows = await cargar_near_miss_seguimientos_finalizados(limite=1000)
+                if not rows:
+                    return
+
+                filas = []
+                for r in rows:
+                    sid = r["id"]
+                    if sid in self._importados:
+                        continue
+                    # Excluir asimetría de trayectorias (A8): mfe_pct=0
+                    if r.get("precio_max") == r.get("precio_inicio") and r.get("precio_min") == r.get("precio_inicio"):
+                        continue
+
+                    filas.append({
+                        "seguimiento_id": sid,
+                        "symbol": r["symbol"],
+                        "timestamp_inicio": int(r["timestamp_inicio"] * 1000),
+                        "timestamp_fin": int(r["timestamp_fin"] * 1000) if r.get("timestamp_fin") else None,
+                        "regime": r.get("regime_4h") or "NEUTRAL",
+                        "tipo_rechazo": r.get("tipo_rechazo") or "DESCONOCIDO",
+                        "adx_15m": r.get("adx_15m"),
+                        "rsi_15m": r.get("rsi_15m"),
+                        "ema200_dist_pct": r.get("ema200_dist_pct"),
+                        "ret_neto_2h_pct": r.get("ret_neto_pct"),
+                        "ret_neto_8h_pct": r.get("ret_neto_pct"),   # Proxy: mismo valor
+                        "mfe_neto_pct": r.get("ret_neto_pct"),       # Proxy
+                        "mae_neto_pct": None,
+                        "breakeven_pct": r.get("breakeven_pct"),
+                        "katr_umbral": r.get("katr_umbral"),
+                        "rentable_neto_2h": 1 if (r.get("ret_neto_pct") or 0) > 0 else 0,
+                        "rentable_neto_8h": 1 if (r.get("ret_neto_pct") or 0) > 0 else 0,
+                        "bloqueo_correcto": 1 if r.get("acerto_bot") else 0,
+                        "falso_negativo": 1 if r.get("falso_negativo") else 0,
+                        "significativo_katr": 1 if r.get("significativo_katr") else 0,
+                        "costo_oportunidad_usdt": r.get("costo_oportunidad_usdt"),
+                    })
+                    self._importados.add(sid)
+
+                if filas:
+                    n = await ldb.guardar_near_miss_labels_batch(filas)
+                    print(f"  🧠 [NMI-IMPORTER] {n} near_miss_labels importados de MySQL")
+            except Exception as e:
+                print(f"  ⚠️ [NMI-IMPORTER] Error: {e}")
 
     def stop(self):
         self._stop.set()

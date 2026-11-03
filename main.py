@@ -98,6 +98,11 @@ async def lifespan(fastapi_app):
         print(f"  🧠 [LEARN] engine inyectado | apply={CONFIG.learning_apply_mode} "
               f"exit={CONFIG.learning_exit_mode}")
 
+    # P0.1: Inyectar learning_engine en audit_logger (después de crear el engine)
+    if learning_engine and audit_logger:
+        audit_logger.learning_engine = learning_engine
+        print("  🧠 [LEARN] LearningEngine inyectado en AuditLogger")
+
 
     print("⏳ Cold start en progreso...")
     await collector.cold_start()
