@@ -62,10 +62,14 @@ async def init_learning_db(db_path: str = "crypto_learning.db"):
     def _add_snapshot_id_col():
         try:
             _conn.execute("ALTER TABLE predictions_log ADD COLUMN snapshot_id INTEGER")
-            _conn.execute("CREATE INDEX IF NOT EXISTS idx_predlog_snapshot ON predictions_log(snapshot_id)")
             _conn.commit()
         except Exception:
             pass  # columna ya existe
+        try:
+            _conn.execute("CREATE INDEX IF NOT EXISTS idx_predlog_snapshot ON predictions_log(snapshot_id)")
+            _conn.commit()
+        except Exception:
+            pass  # indice ya existe
     await _run(_add_snapshot_id_col)
     print(f"  🧠 [LEARN-DB] crypto_learning.db abierta ({db_path}) | journal_mode={modo}")
     return modo

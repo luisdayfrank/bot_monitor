@@ -375,9 +375,9 @@ CREATE TABLE IF NOT EXISTS predictions_log (
 CREATE INDEX IF NOT EXISTS idx_predlog_symbol_ts ON predictions_log(symbol, timestamp_15m);
 CREATE INDEX IF NOT EXISTS idx_predlog_modo ON predictions_log(modo);
 CREATE INDEX IF NOT EXISTS idx_predlog_decision ON predictions_log(decision_tomada);
--- F4.3: snapshot_id para join directo con pattern_labels (evita ambiguedad por timestamp)
-ALTER TABLE predictions_log ADD COLUMN snapshot_id INTEGER;
-CREATE INDEX IF NOT EXISTS idx_predlog_snapshot ON predictions_log(snapshot_id);
+-- F4.3: snapshot_id para join directo con pattern_labels (se añade via ALTER en Python, no aqui)
+-- ALTER TABLE predictions_log ADD COLUMN snapshot_id INTEGER;
+-- CREATE INDEX IF NOT EXISTS idx_predlog_snapshot ON predictions_log(snapshot_id);  -- se crea en Python despues del ALTER
 
 -- ----------------------------------------------------------------------------
 -- 3.10 models — registro versionado de modelos (Fase 9+)
