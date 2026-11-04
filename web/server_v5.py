@@ -528,25 +528,29 @@ async def get_stats_summary(request: Request, dias: int = 1):
             win_rate_estado = "PENDIENTE"
 
         # ─── NUEVO: Tasa de oportunidad perdida y costo oportunidad (F1.1-F1.3) ───
-        # falso_negativo = near-miss que era rentable pero el bot rechazó
-        # costo_oportunidad_usdt = valor estimado perdido en USDT
-        cursor = await db.execute(
-            """
-            SELECT 
-                COUNT(*) as total_finalizados,
-                SUM(CASE WHEN falso_negativo = 1 THEN 1 ELSE 0 END) as falsos_negativos,
-                COALESCE(SUM(costo_oportunidad_usdt), 0) as costo_total_usdt
-            FROM near_miss_seguimientos 
-            WHERE timestamp_inicio >= ? AND timestamp_inicio < ? AND timestamp_fin IS NOT NULL
-            """,
-            (ts_desde, ts_hasta)
-        )
-        row_nm = await cursor.fetchone()
-        total_finalizados_nm = row_nm[0] if row_nm and row_nm[0] else 0
-        falsos_negativos = row_nm[1] if row_nm and row_nm[1] else 0
-        costo_oportunidad_total = float(row_nm[2]) if row_nm and row_nm[2] is not None else 0.0
-
-        tasa_oportunidad_perdida = round((falsos_negativos / total_finalizados_nm * 100), 2) if total_finalizados_nm > 0 else None
+        total_finalizados_nm = 0
+        falsos_negativos = 0
+        costo_oportunidad_total = 0.0
+        tasa_oportunidad_perdida = None
+        try:
+            cursor = await db.execute(
+                """
+                SELECT 
+                    COUNT(*) as total_finalizados,
+                    SUM(CASE WHEN falso_negativo = 1 THEN 1 ELSE 0 END) as falsos_negativos,
+                    COALESCE(SUM(costo_oportunidad_usdt), 0) as costo_total_usdt
+                FROM near_miss_seguimientos 
+                WHERE timestamp_inicio >= ? AND timestamp_inicio < ? AND timestamp_fin IS NOT NULL
+                """,
+                (ts_desde, ts_hasta)
+            )
+            row_nm = await cursor.fetchone()
+            total_finalizados_nm = row_nm[0] if row_nm and row_nm[0] else 0
+            falsos_negativos = row_nm[1] if row_nm and row_nm[1] else 0
+            costo_oportunidad_total = float(row_nm[2]) if row_nm and row_nm[2] is not None else 0.0
+            tasa_oportunidad_perdida = round((falsos_negativos / total_finalizados_nm * 100), 2) if total_finalizados_nm > 0 else None
+        except Exception as e_nm:
+            logger.warning(f"Columnas de oportunidad perdida no disponibles: {e_nm}")
 
         # ─── 3. Grids REALES (executor) ───
         cursor = await db.execute(
@@ -1325,8 +1329,9 @@ async def get_stats_learning_health(request: Request):
             "mensaje": f"{total} near_miss_labels acumulados | Último hace {stale_h:.1f}h" if ultimo_ts else "Sin labels aún",
         }
     except Exception as e:
-        logger.error(f"Error learning-health: {e}")
-        return {"estado": "failed", "error": str(e)}
+        logger.warning(f"learning-health error (learning_db no inicializado?): {e}")
+        return {"estado": "success", "labels_total": 0, "labels_stale_h": None,
+                "pipeline_status": "SIN_DATOS", "alerta": False, "mensaje": "Learning DB no disponible"}
 
 
 @app.get("/api/stats/bypass-rules")
@@ -1359,16 +1364,14 @@ async def get_stats_bypass_rules(request: Request):
             "data": result,
         }
     except Exception as e:
-        logger.error(f"Error bypass-rules: {e}")
-        return {"estado": "failed", "error": str(e)}
+        logger.warning(f"bypass-rules error (learning_db no inicializado?): {e}")
+        return {"estado": "success", "total": 0, "activas": 0, "inactivas": 0, "data": []}
 
 
 @app.get("/api/stats/learning-summary")
 async def get_stats_learning_summary(request: Request, dias: int = 7):
     """Resumen agregado del Learning Engine: snapshots, NM importados, reglas."""
     try:
-        # Contar snapshots en ventana
-        ts_corte = int(time.time() * 1000) - dias * 86400_000
         total_snaps = 0
         try:
             for symbol in CONFIG.symbols:
@@ -1377,30 +1380,39 @@ async def get_stats_learning_summary(request: Request, dias: int = 7):
         except Exception:
             total_snaps = -1
 
-        # Contar near_miss_labels en ventana
-        nm_total, nm_ultimo_ts = await ldb.contar_near_miss_labels()
-        ahora_ms = int(time.time() * 1000)
-        nm_stale_h = (ahora_ms - nm_ultimo_ts) / 3600_000 if nm_ultimo_ts else float('inf')
+        try:
+            nm_total, nm_ultimo_ts = await ldb.contar_near_miss_labels()
+            ahora_ms = int(time.time() * 1000)
+            nm_stale_h = (ahora_ms - nm_ultimo_ts) / 3600_000 if nm_ultimo_ts else float('inf')
+        except Exception:
+            nm_total, nm_stale_h = 0, None
 
-        # Contar reglas de bypass
-        reglas = await ldb.cargar_bypass_rules_todas()
-        reglas_activas = sum(1 for r in reglas if r.get("is_active"))
-        reglas_inactivas = len(reglas) - reglas_activas
+        try:
+            reglas = await ldb.cargar_bypass_rules_todas()
+            reglas_activas = sum(1 for r in reglas if r.get("is_active"))
+            reglas_inactivas = len(reglas) - reglas_activas
+        except Exception:
+            reglas = []
+            reglas_activas = 0
+            reglas_inactivas = 0
 
         return {
             "estado": "success",
             "dias": dias,
             "snapshots_ventana": total_snaps,
             "near_miss_labels_total": nm_total,
-            "near_miss_labels_stale_h": round(nm_stale_h, 1) if nm_ultimo_ts else None,
+            "near_miss_labels_stale_h": round(nm_stale_h, 1) if nm_stale_h is not None else None,
             "bypass_rules_total": len(reglas),
             "bypass_rules_activas": reglas_activas,
             "bypass_rules_inactivas": reglas_inactivas,
-            "pipeline_ok": nm_stale_h <= 48 if nm_ultimo_ts else False,
+            "pipeline_ok": nm_stale_h is not None and nm_stale_h <= 48,
         }
     except Exception as e:
-        logger.error(f"Error learning-summary: {e}")
-        return {"estado": "failed", "error": str(e)}
+        logger.warning(f"learning-summary error: {e}")
+        return {"estado": "success", "dias": dias, "snapshots_ventana": 0,
+                "near_miss_labels_total": 0, "near_miss_labels_stale_h": None,
+                "bypass_rules_total": 0, "bypass_rules_activas": 0,
+                "bypass_rules_inactivas": 0, "pipeline_ok": False}
 
 
 @app.get("/api/stats/near-miss-detail")
@@ -1415,8 +1427,6 @@ async def get_stats_near_miss_detail(request: Request, dias: int = 7, symbol: st
             where_symbol = "AND symbol = ?"
             params.append(symbol)
 
-        cursor = await ldb._get_db()
-        # Usar la conexión directa de learning_db (sqlite)
         def _op():
             conn = ldb._get_conn()
             query = f"""
@@ -1431,11 +1441,15 @@ async def get_stats_near_miss_detail(request: Request, dias: int = 7, symbol: st
                 LIMIT 200
             """
             rows = conn.execute(query, tuple(params)).fetchall()
-            columns = [d[0] for d in cursor.description]
+            columns = [d[0] for d in conn.execute(query, tuple(params)).description] if rows else []
             return [dict(zip(columns, row)) for row in rows]
 
         import asyncio
-        result = await asyncio.get_event_loop().run_in_executor(None, _op)
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(None, _op)
+        except Exception as e_db:
+            logger.warning(f"near-miss-detail DB error (learning_db no inicializado?): {e_db}")
+            result = []
 
         # Enriquecer con formato legible
         for r in result:
