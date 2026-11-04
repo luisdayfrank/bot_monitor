@@ -1,0 +1,22 @@
+Para que el Learning Engine acumule datos sin operar, configura estos parámetros en config.py:
+# Master switch: ENCENDIDO para recolectar datos
+learning_enabled: bool = True
+
+# Modos en OFF para que NO tome decisiones de trading:
+learning_apply_mode: str = "OFF"     # Sin refusals/bloqueos de entrada
+learning_exit_mode: str = "OFF"      # Sin política dinámica de salida
+learning_bypass_mode: str = "OFF"    # Sin bypass de filtros estáticos
+
+# Auditoría activa para capturar near-misses
+modo_auditoria: bool = True
+Qué hace esta configuración:
+Comportamiento	Estado	Por qué
+Captura snapshots de features	? Sí	learning_enabled = True
+Seguimiento de near-misses	? Sí	modo_auditoria = True
+Importar MySQL ? SQLite (near_miss_labels)	? Sí	NearMissOutcomeImporter corre cada 15 min
+Minería de patrones bypass	? Sí (en entreno diario)	Guarda reglas candidatas en bypass_rules
+Aplicar bypass en señales	? No	learning_bypass_mode = "OFF"
+Bloquear entradas por learning	? No	learning_apply_mode = "OFF"
+Ajustar política de salida	? No	learning_exit_mode = "OFF"
+Cuando termines de probar en el VPS, solo cambias a SHADOW (para observar) y luego a ACTIVE (para ejecutar) cuando los datos acumulados tengan suficiente poder estadístico (n=30 por regla, Wilson =0.55).
+Nota: Como estás en modo plan (read-only), no edité los archivos. Cuando estés listo, aplica los cambios en config.py y reinicia el bot.

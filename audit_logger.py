@@ -296,7 +296,9 @@ class AuditLogger:
             self._buffer_eventos.append(evento)
 
         # V5.7: Iniciar seguimiento virtual persistente para near-misses de alto score
-        if tipo == "SCORE_PASA_OTRO_FILTRO_NO" and score_macro >= umbral:
+        # F4.2: Cuando tipo == "SCORE_PASA_OTRO_FILTRO_NO", score_macro >= umbral es siempre
+        # True (el tier se asigna precisamente porque score >= umbral). Se simplifica.
+        if tipo == "SCORE_PASA_OTRO_FILTRO_NO":
             await self.iniciar_seguimiento_near_miss(
                 symbol=symbol,
                 score=score_macro,
@@ -995,7 +997,8 @@ class AuditLogger:
                 seguimiento_id=near_miss["seguimiento_id"],
                 timestamp_fin=timestamp_utc.timestamp(),
                 precio_fin=precio_salida,
-                movimiento_pct=mejor_movimiento_pct if not acerto else -peor_movimiento_pct,
+                # F4.1: movimiento_pct SIEMPRE "a favor de direccion" (positivo = precio se movio a favor del trade)
+                movimiento_pct=mejor_movimiento_pct,
                 direccion_real=direccion_real,
                 acerto_bot=acerto,
                 hubiera_sido_rentable=rentable if rentable is not None else False,

@@ -375,6 +375,9 @@ CREATE TABLE IF NOT EXISTS predictions_log (
 CREATE INDEX IF NOT EXISTS idx_predlog_symbol_ts ON predictions_log(symbol, timestamp_15m);
 CREATE INDEX IF NOT EXISTS idx_predlog_modo ON predictions_log(modo);
 CREATE INDEX IF NOT EXISTS idx_predlog_decision ON predictions_log(decision_tomada);
+-- F4.3: snapshot_id para join directo con pattern_labels (evita ambiguedad por timestamp)
+ALTER TABLE predictions_log ADD COLUMN snapshot_id INTEGER;
+CREATE INDEX IF NOT EXISTS idx_predlog_snapshot ON predictions_log(snapshot_id);
 
 -- ----------------------------------------------------------------------------
 -- 3.10 models — registro versionado de modelos (Fase 9+)
@@ -466,3 +469,25 @@ CREATE INDEX IF NOT EXISTS idx_nml_symbol_ts ON near_miss_labels(symbol, timesta
 CREATE INDEX IF NOT EXISTS idx_nml_regime ON near_miss_labels(regime);
 CREATE INDEX IF NOT EXISTS idx_nml_tipo_rechazo ON near_miss_labels(tipo_rechazo);
 CREATE INDEX IF NOT EXISTS idx_nml_falso_negativo ON near_miss_labels(falso_negativo);
+
+-- ----------------------------------------------------------------------------
+-- Fase 2: bypass_rules — reglas de bypass aprendidas por régimen
+-- Fuente: PatternLearner.minar_bypasses() sobre near_miss_labels con falso_negativo=1
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS bypass_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT,                            -- NULL = regla global
+    direction TEXT NOT NULL,                -- LONG | SHORT
+    regime TEXT NOT NULL,                   -- BEARISH | BULLISH | NEUTRAL
+    rejected_filter TEXT NOT NULL,          -- ADX_EXTREMO | RSI_EXTREMO | MFM_BAJO | ATR_COMPRIMIDO
+    condition_json TEXT NOT NULL,           -- {"adx_min":40, "rsi_max":25, ...}
+    n_occurrences INTEGER NOT NULL DEFAULT 0,
+    win_rate REAL NOT NULL DEFAULT 0,
+    wilson_lower REAL NOT NULL DEFAULT 0,
+    is_active BOOLEAN DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(symbol, direction, regime, rejected_filter)
+);
+CREATE INDEX IF NOT EXISTS idx_br_active ON bypass_rules(is_active);
+CREATE INDEX IF NOT EXISTS idx_br_regime_filter ON bypass_rules(regime, rejected_filter);

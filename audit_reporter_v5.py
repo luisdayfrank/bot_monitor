@@ -800,8 +800,11 @@ class AuditReporter:
         PLAN 3.1: Metricas de exito claras.
 
         win_rate_disparos: % de FIRE donde el precio siguio la direccion
-        win_rate_rechazos: % de rechazos donde el bot acerto al NO disparar
+        precision_bloqueo: % de rechazos donde el bot acerto al NO disparar
+                          (REPLACES win_rate_rechazos - DEPRECATED, mantener 1 release)
+        win_rate_rechazos: DEPRECATED - usar precision_bloqueo. Mismo valor, nombre distinto.
         precision_near_miss: % de near-misses donde el bot acerto al rechazar
+        tasa_oportunidad_perdida: % de near-misses rentables que el bot rechazo (falso negativo)
         sharpe_approx: ratio aproximado de aciertos / (aciertos + errores)
 
         FIX F (Bloque 4): resumen_financiero alimentado desde
@@ -813,8 +816,11 @@ class AuditReporter:
         """
         metricas = {
             'win_rate_disparos': None,
-            'win_rate_rechazos': None,
+            # F4.5: precision_bloqueo reemplaza a win_rate_rechazos (deprecated)
+            'precision_bloqueo': None,
+            'win_rate_rechazos': None,  # DEPRECATED: mantener 1 release, luego eliminar
             'precision_near_miss': None,
+            'tasa_oportunidad_perdida': None,  # F4.5: nueva métrica complementaria
             'total_fire': len(eventos_fire),
             'total_rechazados': len(eventos_rechazados),
             'total_nm_finalizados': len([nm for nm in nm_seguimientos if nm.get('timestamp_fin')]),
@@ -846,17 +852,30 @@ class AuditReporter:
                 metricas['win_rate_disparos'] = round(wins / total * 100, 1)
                 metricas['fire_evaluados'] = total
 
-        # Near-miss precision = win_rate_rechazos (misma métrica: ¿el bot acertó al rechazar?)
+        # Near-miss precision = precision_bloqueo (replaces win_rate_rechazos)
         nm_finalizados = [nm for nm in nm_seguimientos if nm.get('timestamp_fin')]
         if nm_finalizados:
             acertados = sum(1 for nm in nm_finalizados if nm.get('acerto_bot'))
             precision = round(acertados / len(nm_finalizados) * 100, 1)
             metricas['precision_near_miss'] = precision
-            metricas['win_rate_rechazos'] = precision  # ← AÑADIR: misma métrica con nombre diferente
+            # precision_bloqueo = mismo valor que win_rate_rechazos (nuevo nombre)
+            metricas['precision_bloqueo'] = precision
+            # win_rate_rechazos DEPRECATED - mismo valor para backward compat
+            metricas['win_rate_rechazos'] = precision
             metricas['bot_acerto'] = acertados
             metricas['bot_fallo'] = len(nm_finalizados) - acertados
+
+            # F4.5: tasa_oportunidad_perdida = % de near-misses rentables rechazados
+            falsos_negativos = sum(1 for nm in nm_finalizados if nm.get('falso_negativo'))
+            total_nm = len(nm_finalizados)
+            if total_nm > 0:
+                metricas['tasa_oportunidad_perdida'] = round(falsos_negativos / total_nm * 100, 1)
+            else:
+                metricas['tasa_oportunidad_perdida'] = None
         else:
-            metricas['win_rate_rechazos'] = None  # PR-A Nota 1: sin datos ≠ 0% win rate
+            metricas['precision_bloqueo'] = None
+            metricas['win_rate_rechazos'] = None  # DEPRECATED
+            metricas['tasa_oportunidad_perdida'] = None
 
         return metricas
 

@@ -704,18 +704,45 @@ class SignalGenerator:
         umbral_mantenimiento = self.SCORE_MANTENIMIENTO_ARMED
         umbral_bloqueado = False
 
+        # F2.4: Contexto para bypass learning
+        _regime_4h = self._determinar_regimen_4h(symbol)
+        _ema200_15m = i15.get('ema200_15m') if 'i15' in dir() else None
+        _price_ctx = price
+        _ema200_dist_pct = ((_price_ctx - _ema200_15m) / _ema200_15m) * 100.0 if _ema200_15m and _price_ctx else 0.0
+        _bypass_ctx = {
+            'adx': adx, 'rsi': rsi, 'ema200_dist_pct': _ema200_dist_pct,
+            'atr_pct': (atr / price * 100) if price > 0 else 0,
+            'mfm': mfm, 'mfm_sma5': mfm_sma5,
+        }
+
+        # Helper: agregar rechazo solo si bypass no lo aprueba
+        def _tal_vez_rechazar(codigo: str, mensaje: str, condicion: bool):
+            if not condicion:
+                return
+            # F2.4: Consultar bypass_engine SINCRONO antes de rechazar
+            if (self.learning_engine is not None and
+                    getattr(CONFIG, 'learning_bypass_mode', 'OFF') != 'OFF'):
+                bypass_ok = self.learning_engine.evaluar_bypass(
+                    symbol=symbol, direction=direction, regime=_regime_4h,
+                    rejected_filter=codigo, context=_bypass_ctx)
+                if bypass_ok:
+                    print(f"  🧠 [BYPASS-{getattr(CONFIG, 'learning_bypass_mode', 'OFF')}] "
+                          f"{symbol} {direction} | Ignorando {codigo} por regla {_regime_4h}")
+                    return
+            rechazos.append(mensaje)
+
         adx_techo = coin_cfg['adx_reject']
         mfm_umb = coin_cfg['mfm_umbral']
         adx_min = self._calcular_adx_min(symbol)
 
         # ADX scoring (FASE 1.1 adaptativo)
         if adx is None or np.isnan(adx) or adx > adx_techo:
-            rechazos.append(f"ADX extremo (>{adx_techo}): {adx:.1f}")
+            _tal_vez_rechazar("ADX_EXTREMO", f"ADX extremo (>{adx_techo}): {adx:.1f}", True)
             umbral_entrada = self.UMBRAL_BLOQUEADO_ADX_EXTREMO
             umbral_mantenimiento = self.UMBRAL_BLOQUEADO_ADX_EXTREMO
             umbral_bloqueado = True
         elif adx < adx_min - 2:
-            rechazos.append(f"ADX sin tendencia (<{adx_min - 2:.0f}): {adx:.1f}")
+            _tal_vez_rechazar("ADX_EXTREMO", f"ADX sin tendencia (<{adx_min - 2:.0f}): {adx:.1f}", True)
             umbral_entrada = self.UMBRAL_BLOQUEADO_ADX_BAJO
             umbral_mantenimiento = self.UMBRAL_BLOQUEADO_ADX_BAJO
             umbral_bloqueado = True
@@ -738,22 +765,22 @@ class SignalGenerator:
             if decision == "PERMITIR":
                 score_macro += 20
             else:
-                rechazos.append(razon)
+                _tal_vez_rechazar("RSI_EXTREMO", razon, True)
         elif direction == 'LONG':
             decision, razon = self.evaluar_rsi_oxigeno(rsi, direction, adx, trend_strength)
             if decision == "PERMITIR":
                 score_macro += 20
             else:
-                rechazos.append(razon)
+                _tal_vez_rechazar("RSI_EXTREMO", razon, True)
         else:
             rechazos.append("Direccion NEUTRAL")
 
         # ATR scoring
         atr_pct = (atr / price) * 100 if price > 0 else 0
         if atr_pct < CONFIG.atr_min_pct:
-            rechazos.append(f"ATR bajo: {atr_pct:.3f}%")
+            _tal_vez_rechazar("ATR_COMPRIMIDO", f"ATR bajo: {atr_pct:.3f}%", True)
         elif atr_pct > CONFIG.atr_max_pct:
-            rechazos.append(f"ATR alto: {atr_pct:.3f}%")
+            _tal_vez_rechazar("ATR_COMPRIMIDO", f"ATR alto: {atr_pct:.3f}%", True)
         else:
             score_macro += 15
 
@@ -761,7 +788,7 @@ class SignalGenerator:
         hist_magnitude_pct = abs(macd_hist) / price * 100 if price > 0 else 0
         atr_pct_safe = atr_pct if atr_pct > 0 else 0.01
         if hist_magnitude_pct > CONFIG.macd_danger_threshold * atr_pct_safe:
-            rechazos.append(f"MACD explosivo: {hist_magnitude_pct:.3f}%")
+            _tal_vez_rechazar("MACD_EXPLOSIVO", f"MACD explosivo: {hist_magnitude_pct:.3f}%", True)
         elif hist_magnitude_pct > CONFIG.macd_stable_threshold * atr_pct_safe:
             score_macro += 10
         else:
@@ -834,13 +861,13 @@ class SignalGenerator:
 
                     score_macro -= penalizacion
                     if penalizacion > 0:
-                        rechazos.append(f"MFM contradictorio: mfm={mfm_sma5:.3f} vs {direction} (-{penalizacion}pts)")
+                        _tal_vez_rechazar("MFM_BAJO", f"MFM contradictorio: mfm={mfm_sma5:.3f} vs {direction} (-{penalizacion}pts)", True)
                         print(f"  [MFM] {symbol} Volumen+MFM CONTRADICTORIO | mfm={mfm_sma5:.3f} vs {direction} | -{penalizacion}pts")
                     else:
-                        rechazos.append(f"MFM contradictorio débil: mfm={mfm_sma5:.3f} vs {direction}")
+                        _tal_vez_rechazar("MFM_BAJO", f"MFM contradictorio débil: mfm={mfm_sma5:.3f} vs {direction}", True)
                         print(f"  [MFM] {symbol} Volumen+MFM CONTRADICTORIO débil | mfm={mfm_sma5:.3f} vs {direction} | sin penalización")
             else:
-                rechazos.append(f"Volumen bajo: {vol_ratio:.1%} (umbral: {volume_threshold})")
+                _tal_vez_rechazar("VOLUMEN_BAJO", f"Volumen bajo: {vol_ratio:.1%} (umbral: {volume_threshold})", True)
         else:
             score_macro += CONFIG.mfm_bonus_alineado
             print(f"  [VOLUMEN] {symbol} Volumen BYPASS (+{CONFIG.mfm_bonus_alineado}pts) | {bypass_razon}")
@@ -1107,6 +1134,28 @@ class SignalGenerator:
             return 'SHORT', 'BAJA'
 
         return 'NEUTRAL', 'NINGUNA'
+
+    def _determinar_regimen_4h(self, symbol: str) -> str:
+        """
+        F2.4: Determina régimen 4H para bypass learning.
+        Usa self.indicadores_4h que ya tiene ema50_4h y ema200_4h (P0.6).
+        """
+        i4h = self.indicadores_4h.get(symbol, {})
+        if not i4h:
+            return 'NEUTRAL'
+
+        ema50 = i4h.get('ema50_4h')
+        ema200 = i4h.get('ema200_4h')
+        price = i4h.get('close')
+
+        if ema50 is None or ema200 is None or price is None:
+            return 'NEUTRAL'
+
+        if price > ema50 > ema200:
+            return 'BULLISH'
+        elif price < ema50 < ema200:
+            return 'BEARISH'
+        return 'NEUTRAL'
 
     def _trend_strength_from_adx(self, adx: float, direction: str) -> str:
         """CR1: Determina fuerza de tendencia solo con ADX (sin depender de 4h)."""

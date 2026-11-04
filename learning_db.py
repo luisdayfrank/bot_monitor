@@ -21,6 +21,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from typing import Iterable, Optional
 
 _SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "learning_schema.sql")
@@ -57,6 +58,15 @@ async def init_learning_db(db_path: str = "crypto_learning.db"):
     _conn = conn
     _db_path = db_path
     await inicializar_schema_versions()
+    # F4.3: Añadir snapshot_id a predictions_log (idempotente para DBs existentes)
+    def _add_snapshot_id_col():
+        try:
+            _conn.execute("ALTER TABLE predictions_log ADD COLUMN snapshot_id INTEGER")
+            _conn.execute("CREATE INDEX IF NOT EXISTS idx_predlog_snapshot ON predictions_log(snapshot_id)")
+            _conn.commit()
+        except Exception:
+            pass  # columna ya existe
+    await _run(_add_snapshot_id_col)
     print(f"  🧠 [LEARN-DB] crypto_learning.db abierta ({db_path}) | journal_mode={modo}")
     return modo
 
@@ -418,6 +428,208 @@ async def contar_near_miss_labels():
     return await _run(_op)
 
 
+async def cargar_near_miss_labels_falsos_negativos():
+    """Carga near_miss_labels con falso_negativo=1 para minar reglas de bypass."""
+    def _op():
+        conn = _get_conn()
+        cursor = conn.execute("""
+            SELECT * FROM near_miss_labels
+            WHERE falso_negativo = 1
+            ORDER BY timestamp_inicio DESC
+        """)
+        rows = cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    return await _run(_op)
+
+
+async def guardar_bypass_rules_batch(rows: list):
+    """Upsert reglas de bypass en SQLite (UNIQUE: symbol, direction, regime, rejected_filter)."""
+    if not rows:
+        return 0
+    cols = ['symbol', 'direction', 'regime', 'rejected_filter', 'condition_json',
+            'n_occurrences', 'win_rate', 'wilson_lower', 'is_active']
+    ph = ", ".join(["?"] * len(cols))
+    sql = f"""INSERT INTO bypass_rules ({', '.join(cols)}) VALUES ({ph})
+              ON CONFLICT(symbol, direction, regime, rejected_filter) DO UPDATE SET
+                condition_json=excluded.condition_json,
+                n_occurrences=excluded.n_occurrences,
+                win_rate=excluded.win_rate,
+                wilson_lower=excluded.wilson_lower,
+                is_active=excluded.is_active,
+                updated_at=CURRENT_TIMESTAMP"""
+
+    def _op():
+        conn = _get_conn()
+        conn.executemany(sql, [tuple(r.get(c) for c in cols) for r in rows])
+        conn.commit()
+        return len(rows)
+
+    return await _run(_op)
+
+
+async def cargar_bypass_rules_activas():
+    """Carga reglas de bypass activas (is_active=1) para cache RAM."""
+    def _op():
+        conn = _get_conn()
+        cursor = conn.execute("""
+            SELECT * FROM bypass_rules WHERE is_active = 1
+        """)
+        rows = cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    return await _run(_op)
+
+
+async def cargar_bypass_rules_todas():
+    """Carga todas las reglas de bypass (activas e inactivas) para evaluar promotor/demotor."""
+    def _op():
+        conn = _get_conn()
+        cursor = conn.execute("SELECT * FROM bypass_rules")
+        rows = cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    return await _run(_op)
+
+
+async def guardar_bypass_rule_estado(symbol, direction, regime, rejected_filter, is_active, wilson_lower, n_occurrences):
+    """Actualiza is_active de una regla de bypass individual."""
+    def _op():
+        conn = _get_conn()
+        if symbol is None:
+            conn.execute("""
+                UPDATE bypass_rules
+                SET is_active = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE symbol IS NULL AND direction = ? AND regime = ? AND rejected_filter = ?
+            """, (1 if is_active else 0, direction, regime, rejected_filter))
+        else:
+            conn.execute("""
+                UPDATE bypass_rules
+                SET is_active = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE symbol = ? AND direction = ? AND regime = ? AND rejected_filter = ?
+            """, (1 if is_active else 0, symbol, direction, regime, rejected_filter))
+        conn.commit()
+
+    return await _run(_op)
+
+
+async def cargar_bypass_rule_stats(rejected_filter: str, regime: str):
+    """Estadísticas de una regla de bypass para compute_confidence_v2."""
+    def _op():
+        conn = _get_conn()
+        cursor = conn.execute("""
+            SELECT
+                COUNT(*) as n,
+                AVG(CASE WHEN rentable_neto_2h = 1 THEN 1.0 ELSE 0.0 END) as win_rate,
+                AVG(wilson_lower) as wilson_lower
+            FROM near_miss_labels
+            WHERE tipo_rechazo = ? AND regime = ? AND falso_negativo = 1
+        """, (rejected_filter, regime))
+        row = cursor.fetchone()
+        if not row or row[0] == 0:
+            return None
+        return {'n': row[0], 'win_rate': row[1] or 0.5, 'wilson_lower': row[2] or 0}
+
+    return await _run(_op)
+
+
+async def calcular_base_rates_reales(symbol: str = None, horas: int = 24 * 30):
+    """
+    F3.7: base_rates reales desde feature_snapshots JOIN pattern_labels.
+    Distribución real de labels por régimen (no promedio de p_baseline).
+    """
+    def _op():
+        conn = _get_conn()
+        ts_corte = int(time.time() * 1000) - horas * 3600_000
+        where_symbol = "AND fs.symbol = ?" if symbol else ""
+        params = [ts_corte]
+        if symbol:
+            params.append(symbol)
+        cursor = conn.execute(f"""
+            SELECT
+                fs.regime as regime,
+                pl.label_class as label,
+                COUNT(*) as n
+            FROM feature_snapshots fs
+            JOIN pattern_labels pl ON pl.snapshot_id = fs.id
+            WHERE fs.timestamp_15m >= ?
+            {where_symbol}
+            GROUP BY fs.regime, pl.label_class
+        """, params)
+        rows = cursor.fetchall()
+        result = {}
+        for r in rows:
+            regime = r[0] or 'UNKNOWN'
+            label = r[1] or 'UNKNOWN'
+            n = r[2] or 0
+            result.setdefault(regime, {})[label] = n
+        # Convertir a probabilidades
+        base_rates = {}
+        for regime, labels in result.items():
+            total = sum(labels.values())
+            if total > 0:
+                for label, n in labels.items():
+                    base_rates[f"{regime}|{label}"] = round(n / total, 4)
+        return base_rates
+
+    return await _run(_op)
+
+
+async def contar_snapshots_ventana(symbol: str, horas: int = 24 * 7):
+    """Cuenta feature_snapshots para un símbolo en ventana de horas."""
+    def _op():
+        conn = _get_conn()
+        ts_corte = int(time.time() * 1000) - horas * 3600_000
+        cursor = conn.execute(
+            "SELECT COUNT(*) FROM feature_snapshots WHERE symbol = ? AND timestamp_15m >= ?",
+            (symbol, ts_corte))
+        return cursor.fetchone()[0] or 0
+
+    return await _run(_op)
+
+
+async def calcular_fnr_ventana(horas: int = 24 * 7):
+    """
+    Calcula False Negative Ratio en ventana de horas.
+    FNR = FN / (FN + TP) donde:
+      FN = falso_negativo = 1 en near_miss_labels
+      TP = bloqueo_correcto = 1 en near_miss_labels
+    """
+    def _op():
+        conn = _get_conn()
+        cursor = conn.execute("""
+            SELECT
+                SUM(CASE WHEN falso_negativo = 1 THEN 1 ELSE 0 END) as fn,
+                SUM(CASE WHEN bloqueo_correcto = 1 THEN 1 ELSE 0 END) as tp
+            FROM near_miss_labels
+            WHERE timestamp_inicio >= ?
+        """, (int(time.time() * 1000) - horas * 3600_000,))
+        row = cursor.fetchone()
+        fn = row[0] or 0
+        tp = row[1] or 0
+        total = fn + tp
+        fnr = fn / total if total > 0 else 0.0
+        return fnr, fn, tp, total
+
+    return await _run(_op)
+
+
+async def contar_predicciones_fire_periodo(horas: float = 24.0):
+    """Cuenta FIREs en predictions_log en ventana de horas."""
+    def _op():
+        conn = _get_conn()
+        ts_corte = int(time.time() * 1000) - int(horas * 3600_000)
+        cursor = conn.execute("""
+            SELECT COUNT(*) as n_fire
+            FROM predictions_log
+            WHERE decision_tomada = 'FIRE' AND timestamp_15m >= ?
+        """, (ts_corte,))
+        row = cursor.fetchone()
+        return row[0] or 0
+
+    return await _run(_op)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # predictions_log
 # ═══════════════════════════════════════════════════════════════════════════
@@ -438,23 +650,35 @@ async def log_prediccion(row: dict):
 
 
 async def completar_outcomes_predicciones(antes_de_ms: int, limit: int = 2000):
-    """Rellena outcome_* en predictions_log desde pattern_labels (job horario)."""
+    """Rellena outcome_* en predictions_log desde pattern_labels (job horario).
+    F4.3: Join por snapshot_id (no por symbol+timestamp) para evitar ambiguedad."""
     def _op():
         conn = _get_conn()
+        # Primero: poblar snapshot_id en predictions_log pendientes (match por symbol+timestamp)
+        conn.execute("""
+            UPDATE predictions_log
+            SET snapshot_id = (
+                SELECT fs.id FROM feature_snapshots fs
+                WHERE fs.symbol = predictions_log.symbol
+                  AND fs.timestamp_15m = predictions_log.timestamp_15m
+                  AND predictions_log.snapshot_id IS NULL
+            )
+            WHERE snapshot_id IS NULL
+        """)
+        # Luego: completar outcomes via join directo en snapshot_id
         rows = conn.execute(
-            """SELECT pl.id AS pid, pl.symbol, pl.timestamp_15m, pl.label_class, pl.ret_4h_neto_pct
+            """SELECT pl.id AS pid, p.id AS lid, pl.label_class, pl.ret_4h_neto_pct
                FROM pattern_labels pl
-               JOIN predictions_log p
-                 ON p.symbol = pl.symbol AND p.timestamp_15m = pl.timestamp_15m
+               JOIN predictions_log p ON p.snapshot_id = pl.snapshot_id
                WHERE p.outcome_label IS NULL AND pl.timestamp_15m <= ?
                LIMIT ?""", (int(antes_de_ms), int(limit))).fetchall()
         for r in rows:
             conn.execute(
                 """UPDATE predictions_log
                    SET outcome_label = ?, outcome_retorno_pct = ?, outcome_timestamp = ?
-                   WHERE symbol = ? AND timestamp_15m = ?""",
-                (r["label_class"], r["ret_4h_neto_pct"], int(r["timestamp_15m"]),
-                 r["symbol"], int(r["timestamp_15m"])))
+                   WHERE id = ?""",
+                (r["label_class"], r["ret_4h_neto_pct"], int(r["pid"]),
+                 r["lid"]))
         conn.commit()
         return len(rows)
 

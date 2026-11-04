@@ -850,10 +850,150 @@ class PatternLearner:
             await ldb.guardar_pattern_history_batch(historial)
         return len(filas)
 
+    # ── F2.2: Minería de reglas de bypass por régimen (Wilson CI) ──
+    async def minar_bypasses(self, min_samples: int = 30,
+                             min_wilson_lower: float = 0.55) -> list:
+        """
+        Para cada (direction, regime, rejected_filter) en near_miss_labels con falso_negativo=1:
+        1. Discretizar features clave en bins (ADX, RSI, EMA200_dist, ATR_pct)
+        2. Para cada combinacion de bins: calcular n, win_rate, Wilson CI
+        3. Si n >= min_samples AND wilson_lower >= min_wilson_lower -> candidato
+        4. Seleccionar mejor condicion por (direction, regime, rejected_filter)
+        5. Guardar en tabla bypass_rules de SQLite
+        """
+        import json as _json
 
-# ═══════════════════════════════════════════════════════════════════════════
+        rows = await ldb.cargar_near_miss_labels_falsos_negativos()
+        if not rows:
+            print("  🧠 [BYPASS] Sin near_miss_labels con falso_negativo=1 para minar")
+            return []
+
+        # Agrupar por (direction, regime, rejected_filter)
+        from collections import defaultdict as _dd
+        grupos = _dd(list)
+        for r in rows:
+            key = (r.get('direction') or 'UNKNOWN',
+                   r.get('regime') or 'NEUTRAL',
+                   r.get('tipo_rechazo') or 'DESCONOCIDO')
+            grupos[key].append(r)
+
+        candidatos = []
+        for (direction, regime, rf), filas_grupo in grupos.items():
+            n_total = len(filas_grupo)
+            if n_total < min_samples:
+                continue
+
+            # Discretizar features clave en bins simples
+            bins_candidates = self._generar_bins_bypass(filas_grupo)
+
+            mejor_win_rate = 0.0
+            mejor_condition = None
+
+            for condition_json, filas_bin in bins_candidates:
+                n_bin = len(filas_bin)
+                if n_bin < min_samples:
+                    continue
+
+                # Win rate = P(rentable_neto_2h == 1 | condicion)
+                wins = sum(1 for f in filas_bin if f.get('rentable_neto_2h'))
+                win_rate = wins / n_bin if n_bin > 0 else 0.0
+
+                # Wilson lower bound
+                lo, _ = _wilson(wins, n_bin)
+
+                if lo >= min_wilson_lower and win_rate > mejor_win_rate:
+                    mejor_win_rate = win_rate
+                    mejor_condition = condition_json
+
+            if mejor_condition:
+                candidatos.append({
+                    'symbol': None,          # Regla global por defecto
+                    'direction': direction,
+                    'regime': regime,
+                    'rejected_filter': rf,
+                    'condition_json': _json.dumps(mejor_condition),
+                    'n_occurrences': n_total,
+                    'win_rate': round(mejor_win_rate, 4),
+                    'wilson_lower': round(_wilson(
+                        int(mejor_win_rate * n_total), n_total)[0], 4),
+                    'is_active': 0,          # Se activa en SHADOW, luego valida para ACTIVE
+                })
+
+        # Guardar en bypass_rules (upsert por UNIQUE constraint)
+        if candidatos:
+            await ldb.guardar_bypass_rules_batch(candidatos)
+            print(f"  🧠 [BYPASS] {len(candidatos)} reglas candidatas minadas (Wilson>={min_wilson_lower})")
+
+        return candidatos
+
+    def _generar_bins_bypass(self, filas: list) -> list:
+        """
+        Genera combinaciones de bins de features para buscar reglas de bypass.
+        Retorna lista de (condition_json, filas_que_coinciden).
+        """
+        import json as _json
+
+        # Features a discretizar por régimen
+        feature_keys = ['adx_15m', 'rsi_15m', 'ema200_dist_pct', 'atr_pct_15m']
+
+        # Definir bins por feature (umbrales típicos)
+        bins_def = {
+            'adx_15m': [25, 40, 50, 60],
+            'rsi_15m': [25, 30, 70, 75],
+            'ema200_dist_pct': [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0],
+            'atr_pct_15m': [0.1, 0.2, 0.3, 0.5],
+        }
+
+        # Generar condiciones combinando umbrales min/max por feature
+        resultados = []
+
+        # Estrategia simple: probar condiciones individuales y pares
+        for fk in feature_keys:
+            valores = sorted(set(
+                f.get(fk) for f in filas if f.get(fk) is not None
+            ))
+            if not valores:
+                continue
+            umbrales = bins_def.get(fk, [])
+            for umb in umbrales:
+                # Condicion: fk >= umb
+                cond_min = {fk: {'_min': umb}}
+                filas_min = [f for f in filas
+                             if f.get(fk) is not None and f[fk] >= umb]
+                if len(filas_min) >= 10:
+                    resultados.append((_json.dumps(cond_min), filas_min))
+
+                # Condicion: fk <= umb
+                cond_max = {fk: {'_max': umb}}
+                filas_max = [f for f in filas
+                             if f.get(fk) is not None and f[fk] <= umb]
+                if len(filas_max) >= 10:
+                    resultados.append((_json.dumps(cond_max), filas_max))
+
+        # Combinaciones de pares (para reglas mas específicas)
+        for i, fk1 in enumerate(feature_keys):
+            for fk2 in feature_keys[i+1:]:
+                vals1 = [f.get(fk1) for f in filas if f.get(fk1) is not None]
+                vals2 = [f.get(fk2) for f in filas if f.get(fk2) is not None]
+                if not vals1 or not vals2:
+                    continue
+                umb1_list = bins_def.get(fk1, []) or [sorted(vals1)[len(vals1)//2]]
+                umb2_list = bins_def.get(fk2, []) or [sorted(vals2)[len(vals2)//2]]
+                for u1 in umb1_list:
+                    for u2 in umb2_list:
+                        cond = {fk1: {'_min': u1}, fk2: {'_min': u2}}
+                        filas_c = [f for f in filas
+                                   if f.get(fk1) is not None and f[fk1] >= u1
+                                   and f.get(fk2) is not None and f[fk2] >= u2]
+                        if len(filas_c) >= 10:
+                            resultados.append((_json.dumps(cond), filas_c))
+
+        return resultados
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # P2 · ProfilePublisher — perfiles por moneda, cache TTL
-# ═══════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 class ProfilePublisher:
     def __init__(self, ttl_seg: int = 600):
         self.ttl = ttl_seg
@@ -880,7 +1020,8 @@ class ProfilePublisher:
             self._cache.clear()
 
     @staticmethod
-    def construir_perfil(symbol: str, patterns: list) -> dict:
+    def construir_perfil(symbol: str, patterns: list,
+                         base_rates_reales: dict = None) -> dict:
         """Consolida patrones ACTIVE/STABLE por régimen en estructura runtime."""
         por_regimen = defaultdict(lambda: {'patrones': [], 'sugerencias': []})
         base_rates = defaultdict(float)
@@ -908,6 +1049,11 @@ class ProfilePublisher:
                       if p['label_objetivo'] == lab]
                 if ps:
                     base_rates[f"{reg}|{lab}"] = round(sum(ps) / len(ps), 4)
+
+        # F3.7: Sobrescribir con base_rates reales si se proporcionan
+        if base_rates_reales:
+            for key, val in base_rates_reales.items():
+                base_rates[key] = val
 
         return {
             'symbol': symbol,
@@ -1390,6 +1536,7 @@ class LearningEngine:
         self._last_drift_run = 0.0
         self._last_nmi_import = 0.0     # F1.6: último run del importador
         self._drift_notificado: dict = {}   # symbol -> ts (anti-spam 24h)
+        self._bypass_cache: dict = {}       # (symbol, direction, regime, rejected_filter) -> rule dict
 
     # ── loader por defecto: database_v5 (MySQL del trading) ───────────────
     @staticmethod
@@ -1478,6 +1625,55 @@ class LearningEngine:
             return 0.5
         prob = 1.0 / (1.0 + math.exp(-logit))
         return round(_clamp(prob, 0.02, 0.98), 4)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # F3.6: compute_confidence v2 — log-odds combinadas con near_miss_labels
+    # ══════════════════════════════════════════════════════════════════════════
+    async def compute_confidence_v2(self, perfil_data: dict, direction: str,
+                                    features: dict = None,
+                                    near_miss_context: dict = None) -> float:
+        """
+        P(rentable | ctx) + P(rentable_neto | NM, rejected_filter, regime).
+
+        Combina:
+          1. log-odds de patrones ACTIVE/STABLE del régimen (compute_confidence)
+          2. log-odds de near_miss_labels con falso_negativo=1 para el (regime, rejected_filter)
+        """
+        prob_base = self.compute_confidence(perfil_data, direction, features)
+
+        # Si no hay contexto de near-miss, devolver el base
+        if not near_miss_context:
+            return prob_base
+
+        # Obtener P(rentable_neto | NM, tipo_rechazo, regime) de near_miss_labels
+        tipo_rechazo = near_miss_context.get('rejected_filter')
+        regime = near_miss_context.get('regime') or (features or {}).get('regime') or 'NEUTRAL'
+
+        if not tipo_rechazo:
+            return prob_base
+
+        try:
+            stats = await ldb.cargar_bypass_rule_stats(tipo_rechazo, regime)
+        except Exception:
+            # Si la función aún no existe, usar 0.5 neutral
+            return prob_base
+
+        if not stats or stats.get('n', 0) < 10:
+            return prob_base
+
+        p_nm = stats.get('win_rate', 0.5)
+        p_nm = _clamp(p_nm, 0.05, 0.95)
+
+        # Log-odds aditivas: logit_total = logit_base + w_nm * logit_nm
+        logit_base = math.log(prob_base / (1 - prob_base))
+        logit_nm = math.log(p_nm / (1 - p_nm))
+
+        # Peso del near-miss según n muestras (más n = más confianza)
+        w_nm = min(1.0, stats.get('n', 0) / 100.0) * 0.5  # máximo 50% de peso
+
+        logit_total = logit_base + w_nm * logit_nm
+        prob_total = 1.0 / (1.0 + math.exp(-logit_total))
+        return round(_clamp(prob_total, 0.02, 0.98), 4)
 
     def log_prediccion(self, symbol: str, timestamp_15m: int, prob: float,
                        decision_sugerida: str, decision_tomada: str,
@@ -1620,6 +1816,43 @@ class LearningEngine:
             except Exception as e:
                 print(f"  ⚠️ [NMI-HEALTH] Error: {e}")
 
+        # F3.4: False Negative Ratio guardrail (FNR>25% → demote all + alert)
+        if ahora - getattr(self, '_last_fnr_check', 0) > 3600:
+            self._last_fnr_check = ahora
+            try:
+                fnr, fn, tp, total = await ldb.calcular_fnr_ventana(horas=24 * 7)
+                if total > 50 and fnr > 0.25:
+                    modo_antes = getattr(self.cfg, 'learning_bypass_mode', 'OFF')
+                    if modo_antes == 'ACTIVE':
+                        self.cfg.learning_bypass_mode = 'SHADOW'
+                        print(f"  🛑 [FNR-GUARDRAIL] FNR={fnr:.1%} > 25% en 7d → demote ALL bypass_rules to SHADOW")
+                        if self.notifier:
+                            await self.notifier.enviar_telegram(
+                                f"🛑 <b>FNR GUARDRAIL</b>\n"
+                                f"FNR={fnr:.1%} > 25% en 7 días (FN={fn}, TP={tp}, total={total})\n"
+                                f"Modo bypass: ACTIVE → SHADOW")
+            except Exception as e:
+                print(f"  ⚠️ [FNR-GUARDRAIL] Error: {e}")
+
+        # F3.5: Fire rate guardrail (>5 FIREs/día → SHADOW global)
+        if ahora - getattr(self, '_last_fire_check', 0) > 3600:
+            self._last_fire_check = ahora
+            try:
+                n_fire = await ldb.contar_predicciones_fire_periodo(horas=24.0)
+                umbral_fire = getattr(self.cfg, 'learning_bypass_max_fire_dia', 5)
+                if n_fire > umbral_fire:
+                    modo_antes = getattr(self.cfg, 'learning_bypass_mode', 'OFF')
+                    if modo_antes == 'ACTIVE':
+                        self.cfg.learning_bypass_mode = 'SHADOW'
+                        print(f"  🛑 [FIRE-GUARDRAIL] {n_fire} FIREs/24h > {umbral_fire} → demote bypass to SHADOW")
+                        if self.notifier:
+                            await self.notifier.enviar_telegram(
+                                f"🛑 <b>FIRE RATE GUARDRAIL</b>\n"
+                                f"{n_fire} FIREs en 24h > {umbral_fire} límite\n"
+                                f"Modo bypass: ACTIVE → SHADOW")
+            except Exception as e:
+                print(f"  ⚠️ [FIRE-GUARDRAIL] Error: {e}")
+
         # 7) Learner diario a la hora configurada
         if self._es_hora_learner() and (ahora - self._last_learner_run > 20 * 3600):
             self._last_learner_run = ahora
@@ -1656,7 +1889,9 @@ class LearningEngine:
                 symbol, por_ventana, generado)
 
             patterns = await ldb.cargar_learned_patterns(symbol)
-            perfil = self.publisher.construir_perfil(symbol, patterns)
+            # F3.7: base_rates reales desde feature_snapshots JOIN pattern_labels
+            base_rates_reales = await ldb.calcular_base_rates_reales(symbol, horas=24 * 30)
+            perfil = self.publisher.construir_perfil(symbol, patterns, base_rates_reales)
             await self.publisher.publicar(symbol, perfil)
 
             # TrendEndModel (P4)
@@ -1665,6 +1900,92 @@ class LearningEngine:
             self.trend_model.entrenar(symbol, te_rows)
 
         print(f"  🧠 [LEARN] learner diario completado: {total_patrones} patrones consolidados")
+
+        # F4.4: Verificar learning_min_snapshots_perfil + alerta
+        try:
+            min_snaps = getattr(self.cfg, 'learning_min_snapshots_perfil', 300)
+            for symbol in self.cfg.symbols:
+                n_snaps = await ldb.contar_snapshots_ventana(symbol, horas=24*7)
+                if n_snaps < min_snaps:
+                    print(f"  ⚠️ [SNAPSHOTS] {symbol}: solo {n_snaps} snapshots en 7d "
+                          f"(min {min_snaps} requeridos para perfil confiable)")
+                    if self.notifier:
+                        await self.notifier.enviar_telegram(
+                            f"⚠️ <b>SNAPSHOTS INSUFICIENTES — {symbol}</b>\n"
+                            f"Solo {n_snaps} snapshots en 7 días (mínimo {min_snaps} requeridos).\n"
+                            f"Los perfiles de aprendizaje pueden no ser estadísticamente válidos.")
+        except Exception as e:
+            print(f"  ⚠️ [F4.4] Error verificando snapshots: {e}")
+
+        # Cargar reglas de bypass activas al cache RAM (F2.3)
+        try:
+            bypass_rows = await ldb.cargar_bypass_rules_activas()
+            self._bypass_cache = {}
+            for r in bypass_rows:
+                key = (r.get('symbol'), r.get('direction'), r.get('regime'), r.get('rejected_filter'))
+                self._bypass_cache[key] = {
+                    'condition_json': r.get('condition_json'),
+                    'win_rate': r.get('win_rate'),
+                    'wilson_lower': r.get('wilson_lower'),
+                    'is_active': r.get('is_active'),
+                    'n_occurrences': r.get('n_occurrences'),
+                }
+            print(f"  🧠 [BYPASS] {len(self._bypass_cache)} reglas cargadas en cache RAM")
+        except Exception as e:
+            print(f"  ⚠️ [BYPASS] Error cargando reglas al cache: {e}")
+
+        # F3.1: Calibración inicial - minar reglas de bypass con históricos
+        try:
+            candidatos = await self.minar_bypasses(
+                min_samples=getattr(self.cfg, 'learning_bypass_min_samples', 30),
+                min_wilson_lower=getattr(self.cfg, 'learning_bypass_min_wilson', 0.55))
+            print(f"  🧠 [BYPASS-CALIB] {len(candidatos)} reglas candidatas minadas")
+        except Exception as e:
+            print(f"  ⚠️ [BYPASS-CALIB] Error: {e}")
+
+        # F3.2/F3.3: Auto-promote SHADOW→ACTIVE / ACTIVE→SHADOW para reglas de bypass
+        try:
+            await self._auto_promote_demote_bypass_rules()
+        except Exception as e:
+            print(f"  ⚠️ [BYPASS-PROMOTE] Error: {e}")
+
+    async def _auto_promote_demote_bypass_rules(self):
+        """
+        F3.2: SHADOW→ACTIVE si n≥50 y wilson_lower≥0.65 durante 7 días estable.
+        F3.3: ACTIVE→SHADOW si wilson_lower<0.50 en ventana rodante de 30 labels.
+        """
+        todas = await ldb.cargar_bypass_rules_todas()
+        ahora = _now_ms()
+        siete_dias_ms = 7 * 86400_000
+
+        for r in todas:
+            symbol = r.get('symbol')
+            direction = r.get('direction')
+            regime = r.get('regime')
+            rejected_filter = r.get('rejected_filter')
+            is_active = r.get('is_active', 0)
+            wilson_lower = r.get('wilson_lower', 0) or 0
+            n_occ = r.get('n_occurrences', 0) or 0
+            created_at = r.get('created_at')
+
+            # F3.2: Promover SHADOW→ACTIVE
+            if not is_active:
+                if (n_occ >= getattr(self.cfg, 'learning_bypass_min_samples', 30) and
+                        wilson_lower >= getattr(self.cfg, 'learning_bypass_min_wilson', 0.65) and
+                        created_at and (ahora - created_at) >= siete_dias_ms):
+                    await ldb.guardar_bypass_rule_estado(symbol, direction, regime,
+                                                         rejected_filter, True,
+                                                         wilson_lower, n_occ)
+                    print(f"  🚀 [BYPASS-PROMOTE] {symbol}/{direction}/{regime}/{rejected_filter} "
+                          f"SHADOW→ACTIVE (wilson={wilson_lower:.3f}, n={n_occ})")
+
+            # F3.3: Demotear ACTIVE→SHADOW si wilson_lower < 0.50
+            elif is_active and wilson_lower < 0.50:
+                await ldb.guardar_bypass_rule_estado(symbol, direction, regime,
+                                                     rejected_filter, False,
+                                                     wilson_lower, n_occ)
+                print(f"  ⚠️ [BYPASS-DEMOTE] {symbol}/{direction}/{regime}/{rejected_filter} "
+                      f"ACTIVE→SHADOW (wilson={wilson_lower:.3f} < 0.50)")
 
     # ── trend-end labels batch (P4) ───────────────────────────────────────
     async def etiquetar_trend_ends(self, symbols: list, max_lote: int = 500):
@@ -1682,6 +2003,62 @@ class LearningEngine:
         if filas:
             await ldb.guardar_trend_end_labels_batch(filas)
         return len(filas)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # F2.3: evaluar_bypass — SINCRONO (consulta cache en RAM, sin await)
+    # ══════════════════════════════════════════════════════════════════════════
+    def evaluar_bypass(self, symbol: str, direction: str, regime: str,
+                       rejected_filter: str, context: dict) -> bool:
+        """
+        Consulta bypass_rules en cache RAM. Retorna True si debe ignorar el rechazo estatico.
+        SIN async: solo lee diccionario en RAM, no bloquea el event loop.
+        """
+        import json as _json
+
+        if getattr(self.cfg, 'learning_bypass_mode', 'OFF') == 'OFF':
+            return False
+
+        # Buscar regla especifica (symbol) -> global (None)
+        for sym in (symbol, None):
+            key = (sym, direction, regime, rejected_filter)
+            rule = self._bypass_cache.get(key)
+            if rule and rule.get('is_active'):
+                if self._match_bypass_condition(rule.get('condition_json', '{}'), context):
+                    if getattr(self.cfg, 'learning_bypass_mode', 'OFF') == 'SHADOW':
+                        self._log_bypass_shadow(symbol, direction, regime, rejected_filter, rule)
+                    return getattr(self.cfg, 'learning_bypass_mode', 'OFF') == 'ACTIVE'
+        return False
+
+    def _match_bypass_condition(self, condition_json: str, context: dict) -> bool:
+        """Evalua condicion JSON contra contexto de features."""
+        import json as _json
+        try:
+            cond = _json.loads(condition_json)
+        except Exception:
+            return False
+        for key, threshold in cond.items():
+            feature = key.replace('_min', '').replace('_max', '')
+            value = context.get(feature)
+            if value is None:
+                return False
+            if '_min' in key and value < threshold:
+                return False
+            if '_max' in key and value > threshold:
+                return False
+        return True
+
+    def _log_bypass_shadow(self, symbol: str, direction: str, regime: str,
+                           rejected_filter: str, rule: dict):
+        """Loggea bypass en modo SHADOW (solo informativo, no ejecuta)."""
+        print(f"  🧠 [BYPASS-SHADOW] {symbol} {direction} | regla={rejected_filter} "
+              f"regimen={regime} | condicion={rule.get('condition_json')} "
+              f"win_rate={rule.get('win_rate'):.3f} n={rule.get('n_occurrences')}")
+
+    def _cargar_bypass_cache(self):
+        """Carga reglas activas de bypass_rules a _bypass_cache (llamado en entreno diario)."""
+        import asyncio
+        # Se carga de forma async desde SQLite en entreno_todo()
+        pass
 
     # ══════════════════════════════════════════════════════════════════════════
     # F1.6: NearMissOutcomeImporter — MySQL → SQLite (idempotente)

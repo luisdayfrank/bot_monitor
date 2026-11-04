@@ -48,13 +48,26 @@ class Config(BaseModel):
     use_per_coin_params: bool = True   # False = usa globals, ignora registry por moneda
 
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # LEARNING ENGINE â€” todos los flags arrancan OFF / SHADOW (Fase 0)
+    # LEARNING ENGINE â€” MODO ACUMULACIÓN DE DATOS (Sin operar en mercado)
     # Ver: informe_revision_learning_engine.md (correcciones C-1..C-6, Â§3A-Â§3I)
-    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    learning_enabled: bool = True              # master switch (Fase 0)
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    #
+    # CONFIGURACIÓN PARA SOLO RECOLECTAR DATOS (sin tomar decisiones de trading):
+    #   - learning_enabled   = True  -> Captura snapshots y near-misses
+    #   - learning_apply_mode= OFF   -> No bloquea/rechaza entradas (modo pasivo)
+    #   - learning_exit_mode = OFF   -> No ajusta salidas dinámicamente
+    #   - learning_bypass_mode = OFF -> No ignora filtros estáticos
+    #   - modo_auditoria     = True  -> Seguimiento virtual de near-misses activo
+    #
+    # Cuando termines de probar en el VPS y quiera activar el learning:
+    #   1. learning_apply_mode = "SHADOW"  (observa qué rechazaría, sin bloquear)
+    #   2. learning_apply_mode = "ACTIVE"  (bloquea entradas malas)
+    #   3. learning_bypass_mode = "SHADOW" -> "ACTIVE" (ignora filtros cuando la regla lo valide)
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    learning_enabled: bool = True              # master switch (Fase 0) - ON para recolectar datos
     learning_db_path: str = "crypto_learning.db"
-    learning_apply_mode: str = "OFF"            # OFF | SHADOW | ACTIVE (refusal-first)
-    learning_exit_mode: str = "OFF"             # OFF | SHADOW | ACTIVE (Fase 8)
+    learning_apply_mode: str = "OFF"            # OFF | SHADOW | ACTIVE (refusal-first) - OFF = no bloquea
+    learning_exit_mode: str = "OFF"             # OFF | SHADOW | ACTIVE (Fase 8) - OFF = no ajusta salidas
     learning_regime_tracking: bool = True       # Fase 6
 
     # ParÃ¡metros del learner
@@ -75,6 +88,15 @@ class Config(BaseModel):
     learning_min_n: int = 40
     learning_fdr_q: float = 0.10                # Benjamini-Hochberg
     learning_regime_min_velas: int = 4          # histÃ©resis del clasificador Â§3F
+
+    # F2.5: ConfiguraciÃ³n de Bypass Learning (rÃ©gimen adaptativo)
+    learning_bypass_mode: str = "OFF"           # OFF | SHADOW | ACTIVE
+    learning_bypass_min_samples: int = 30       # n mÃ­nimo para regla
+    learning_bypass_min_wilson: float = 0.55    # Wilson lower bound mÃ­nimo
+    learning_bypass_max_rules_per_filter: int = 1  # una regla por (dir, regimen, filtro)
+    learning_bypass_shadow_log_every: int = 10  # log cada N bypass SHADOW
+    learning_bypass_auto_promote: bool = True   # SHADOW->ACTIVE automÃ¡tico
+    learning_bypass_auto_demote: bool = True    # ACTIVE->SHADOW si degrada
 
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # LEARNING ENGINE â€” GUARDRAILS FINANCIEROS (Anexo A Â§4: auto-rollback)
