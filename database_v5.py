@@ -875,27 +875,35 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_nm_symbol ON near_miss_seguimientos(symbol)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_nm_timestamp ON near_miss_seguimientos(timestamp_inicio)")
 
-        # F1.4: ALTER TABLE para columnas de régimen y contexto (backward compatible: DEFAULT NULL)
-        for alter_stmt in [
-            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS regime_4h VARCHAR(16)",
-            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS adx_15m DOUBLE",
-            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS rsi_15m DOUBLE",
-            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS ema200_dist_pct DOUBLE",
-            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS tipo_rechazo VARCHAR(32)",
-            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS ret_neto_pct DOUBLE",
-            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS significativo_katr INT DEFAULT 0",
-            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS falso_negativo INT DEFAULT 0",
-            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS costo_oportunidad_usdt DOUBLE",
-            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS breakeven_pct DOUBLE",
-            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS katr_umbral DOUBLE",
-            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS ret_neto_2h_pct DOUBLE",
-            "ALTER TABLE near_miss_seguimientos ADD COLUMN IF NOT EXISTS ret_neto_8h_pct DOUBLE",
-        ]:
+        # F1.4: ALTER TABLE para columnas de régimen y contexto
+        # NOTA: No usar ADD COLUMN IF NOT EXISTS (solo MySQL 8.0+).
+        # Usar ADD COLUMN simple + capturar error de columna duplicada.
+        columnas_nuevas = [
+            ("regime_4h", "VARCHAR(16)"),
+            ("adx_15m", "DOUBLE"),
+            ("rsi_15m", "DOUBLE"),
+            ("ema200_dist_pct", "DOUBLE"),
+            ("tipo_rechazo", "VARCHAR(32)"),
+            ("ret_neto_pct", "DOUBLE"),
+            ("significativo_katr", "INT DEFAULT 0"),
+            ("falso_negativo", "INT DEFAULT 0"),
+            ("costo_oportunidad_usdt", "DOUBLE"),
+            ("breakeven_pct", "DOUBLE"),
+            ("katr_umbral", "DOUBLE"),
+            ("ret_neto_2h_pct", "DOUBLE"),
+            ("ret_neto_8h_pct", "DOUBLE"),
+        ]
+        for col_name, col_type in columnas_nuevas:
             try:
-                await db.execute(alter_stmt)
-            except Exception:
-                # MySQL no soporta ADD COLUMN IF NOT EXISTS en algunas versiones; ignorar si ya existe
-                pass
+                await db.execute(f"ALTER TABLE near_miss_seguimientos ADD COLUMN {col_name} {col_type}")
+                await db.commit()
+                print(f"  [DB] Columna '{col_name}' añadida a near_miss_seguimientos")
+            except Exception as e:
+                err_str = str(e).lower()
+                if 'duplicate' in err_str or 'duplicate column' in err_str:
+                    pass  # Columna ya existe, OK
+                else:
+                    print(f"  [DB] Error añadiendo columna '{col_name}': {e}")
 
         # ═══════════════════════════════════════════════════════════════════════════════
         # V5.9.2: TABLAS DE GRID NEUTRAL (simulación virtual)
