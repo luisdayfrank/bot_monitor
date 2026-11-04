@@ -1277,7 +1277,7 @@
                 const stale = d.labels_stale_h;
                 const statusEl = document.getElementById('learning-pipeline-status');
                 const staleEl = document.getElementById('learning-stale-h');
-                if (stale !== null && stale !== undefined) {
+                if (stale !== null && stale !== undefined && isFinite(stale)) {
                     staleEl.textContent = stale.toFixed(1);
                     if (d.alerta) {
                         statusEl.textContent = 'ALERTA - Datos obsoletos';
@@ -1304,22 +1304,26 @@
                 document.getElementById('learning-rules-candidates').textContent = d.inactivas || 0;
                 const tbody = document.getElementById('bypass-rules-tbody');
                 if (!d.data || !d.data.length) {
-                    tbody.innerHTML = '<tr><td colspan="9" class="text-center text-gray-500 py-8">Sin reglas de bypass</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="9" class="text-center text-gray-500 py-8">Sin reglas de bypass (el learning esta acumulando datos)</td></tr>';
                     return;
                 }
-                tbody.innerHTML = d.data.map(r => `
-                    <tr>
-                        <td class="font-mono text-[11px]">${r.symbol}</td>
-                        <td class="font-bold">${r.direction}</td>
-                        <td>${r.regime}</td>
-                        <td>${r.rejected_filter}</td>
-                        <td class="font-mono text-[10px]">${r.condition_json}</td>
-                        <td class="font-mono text-[11px]">${r.n_occurrences}</td>
-                        <td class="${r.win_rate >= 0.65 ? 'text-green-400' : 'text-yellow-400'}">${(r.win_rate * 100).toFixed(1)}%</td>
-                        <td class="font-mono text-[11px]">${(r.wilson_lower || 0).toFixed(3)}</td>
-                        <td class="${r.is_active ? 'text-green-400' : 'text-gray-500'}">${r.estado}</td>
-                    </tr>
-                `).join('');
+                tbody.innerHTML = d.data.map(r => {
+                    const wr = (r.win_rate != null) ? (r.win_rate * 100).toFixed(1) : '0.0';
+                    const wl = (r.wilson_lower != null) ? r.wilson_lower.toFixed(3) : '0.000';
+                    return `
+                        <tr>
+                            <td class="font-mono text-[11px]">${r.symbol || 'GLOBAL'}</td>
+                            <td class="font-bold">${r.direction || '-'}</td>
+                            <td>${r.regime || '-'}</td>
+                            <td>${r.rejected_filter || '-'}</td>
+                            <td class="font-mono text-[10px]">${r.condition_json || '-'}</td>
+                            <td class="font-mono text-[11px]">${r.n_occurrences || 0}</td>
+                            <td class="${(r.win_rate || 0) >= 0.65 ? 'text-green-400' : 'text-yellow-400'}">${wr}%</td>
+                            <td class="font-mono text-[11px]">${wl}</td>
+                            <td class="${r.is_active ? 'text-green-400' : 'text-gray-500'}">${r.estado || 'INACTIVA'}</td>
+                        </tr>
+                    `;
+                }).join('');
             } catch (e) { console.error('[LEARNING] Error bypass-rules:', e); }
         }
 
@@ -1332,19 +1336,21 @@
                 document.getElementById('learning-costo-total').textContent = (d.costo_oportunidad_total_usdt || 0).toFixed(2);
                 const tbody = document.getElementById('fn-tbody');
                 if (!d.data || !d.data.length) {
-                    tbody.innerHTML = '<tr><td colspan="8" class="text-center text-gray-500 py-8">Sin oportunidades perdidas</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="8" class="text-center text-gray-500 py-8">Sin oportunidades perdidas (aun sin datos acumulados)</td></tr>';
                     return;
                 }
                 tbody.innerHTML = d.data.map(r => {
                     const fecha = r.timestamp_inicio ? new Date(r.timestamp_inicio * 1000).toLocaleDateString() : '-';
+                    const costo = (r.costo_oportunidad_usdt != null) ? Number(r.costo_oportunidad_usdt).toFixed(4) : '0.0000';
+                    const mov = (r.ret_neto_2h_pct != null) ? Number(r.ret_neto_2h_pct).toFixed(2) : '0.00';
                     return `
                         <tr>
-                            <td class="font-mono text-[11px]">${r.symbol}</td>
+                            <td class="font-mono text-[11px]">${r.symbol || '-'}</td>
                             <td class="font-bold">${r.direction || '-'}</td>
                             <td>${r.regime || '-'}</td>
                             <td>${r.rejected_filter || '-'}</td>
-                            <td class="font-mono text-[11px]">${(r.ret_neto_2h_pct || 0).toFixed(2)}%</td>
-                            <td class="font-mono text-[11px] text-red-400">${r.costo_oportunidad_usdt.toFixed(4)}</td>
+                            <td class="font-mono text-[11px]">${mov}%</td>
+                            <td class="font-mono text-[11px] text-red-400">${costo}</td>
                             <td>${r.bloqueo_correcto_bool ? '✅' : '❌'}</td>
                             <td class="font-mono text-[11px]">${fecha}</td>
                         </tr>
@@ -1359,10 +1365,27 @@
                 const d = await res.json();
                 if (d.estado !== 'success') return;
 
+                // Si no hay datos, mostrar mensaje en los charts
+                if (!d.data || !d.data.length) {
+                    Plotly.newPlot('learning-regime-chart', [{
+                        x: ['Sin datos'], y: [0], type: 'bar', marker: { color: '#6b7280' }
+                    }], {
+                        margin: { t: 20, b: 40 }, paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
+                        font: { color: '#9ca3af', size: 11 }, xaxis: { showgrid: false }, yaxis: { showgrid: true, gridcolor: '#374151' }
+                    }, { responsive: true });
+                    Plotly.newPlot('learning-filter-chart', [{
+                        x: ['Sin datos'], y: [0], type: 'bar', marker: { color: '#6b7280' }
+                    }], {
+                        margin: { t: 20, b: 80 }, paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
+                        font: { color: '#9ca3af', size: 11 }, xaxis: { showgrid: false }, yaxis: { showgrid: true, gridcolor: '#374151', range: [0, 100] }
+                    }, { responsive: true });
+                    return;
+                }
+
                 // Regímenes chart
                 const regimeCounts = {};
                 d.data.forEach(r => {
-                    const key = r.regime + (r.is_active ? ' (Activa)' : ' (Inactiva)');
+                    const key = (r.regime || 'UNKNOWN') + (r.is_active ? ' (Activa)' : ' (Inactiva)');
                     regimeCounts[key] = (regimeCounts[key] || 0) + 1;
                 });
                 Plotly.newPlot('learning-regime-chart', [{
@@ -1371,36 +1394,25 @@
                     type: 'bar',
                     marker: { color: Object.keys(regimeCounts).map(k => k.includes('Activa') ? '#22c55e' : '#6b7280') }
                 }], {
-                    margin: { t: 20, b: 40 },
-                    paper_bgcolor: 'transparent',
-                    plot_bgcolor: 'transparent',
-                    font: { color: '#9ca3af', size: 11 },
-                    xaxis: { tickangle: -45, showgrid: false },
-                    yaxis: { showgrid: true, gridcolor: '#374151' }
+                    margin: { t: 20, b: 40 }, paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
+                    font: { color: '#9ca3af', size: 11 }, xaxis: { tickangle: -45, showgrid: false }, yaxis: { showgrid: true, gridcolor: '#374151' }
                 }, { responsive: true });
 
                 // Win rate by filter chart
                 const filterStats = {};
                 d.data.forEach(r => {
-                    const f = r.rejected_filter;
+                    const f = r.rejected_filter || 'UNKNOWN';
                     if (!filterStats[f]) filterStats[f] = { wins: 0, total: 0 };
-                    filterStats[f].total += r.n_occurrences;
-                    filterStats[f].wins += r.n_occurrences * (r.win_rate || 0);
+                    filterStats[f].total += (r.n_occurrences || 0);
+                    filterStats[f].wins += (r.n_occurrences || 0) * (r.win_rate || 0);
                 });
                 const filters = Object.keys(filterStats);
                 const wrs = filters.map(f => (filterStats[f].wins / filterStats[f].total * 100) || 0);
                 Plotly.newPlot('learning-filter-chart', [{
-                    x: filters,
-                    y: wrs,
-                    type: 'bar',
-                    marker: { color: '#3b82f6' }
+                    x: filters, y: wrs, type: 'bar', marker: { color: '#3b82f6' }
                 }], {
-                    margin: { t: 20, b: 80 },
-                    paper_bgcolor: 'transparent',
-                    plot_bgcolor: 'transparent',
-                    font: { color: '#9ca3af', size: 11 },
-                    xaxis: { tickangle: -45, showgrid: false },
-                    yaxis: { showgrid: true, gridcolor: '#374151', range: [0, 100], ticksuffix: '%' }
+                    margin: { t: 20, b: 80 }, paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
+                    font: { color: '#9ca3af', size: 11 }, xaxis: { tickangle: -45, showgrid: false }, yaxis: { showgrid: true, gridcolor: '#374151', range: [0, 100], ticksuffix: '%' }
                 }, { responsive: true });
             } catch (e) { console.error('[LEARNING] Error charts:', e); }
         }
