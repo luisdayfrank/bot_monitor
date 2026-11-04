@@ -1047,11 +1047,6 @@
             document.getElementById('analysis-' + subTab).classList.remove('hidden');
             document.getElementById('analysis-tab-' + subTab).classList.add('active');
             if (subTab === 'learning') refreshLearning();
-            localStorage.setItem('cm_v62_prefs', JSON.stringify({
-                ...JSON.parse(localStorage.getItem('cm_v62_prefs') || '{}'),
-                analysisTab: subTab
-            }));
-        }.add('active');
 
             if (subTab === 'resumen') loadResumenGlobal();
             if (subTab === 'auditoria') loadAuditoria();
