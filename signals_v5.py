@@ -656,21 +656,12 @@ class SignalGenerator:
             )
 
             if tipo_near_miss == "SCORE_PASA_OTRO_FILTRO_NO" and self.audit_logger:
-                # F1.4: Contexto de régimen para near_miss_seguimientos
-                _ema200_15m = i15.get('ema200_15m')
-                _price = i15.get('close', 0)
-                _ema200_dist_pct = ((_price - _ema200_15m) / _ema200_15m) * 100.0 if _ema200_15m and _price else 0.0
-                _regime_4h = 'NEUTRAL'
-                if self.learning_engine:
-                    _regime_4h = self.learning_engine.regime_cls.regimen_actual.get(symbol, 'NEUTRAL')
-                _tipo_rechazo = rechazos[0] if rechazos else 'SCORE_PASA_OTRO_FILTRO_NO'
-                
                 await self.audit_logger.iniciar_seguimiento_near_miss(
                     symbol=symbol,
                     score=score_macro,
                     umbral=umbral_efectivo,
                     direccion=direction,
-                    precio=_price,
+                    precio=i15.get('close', 0),
                     contexto={
                         'tipo_near_miss': tipo_near_miss,
                         'rechazos': rechazos,
@@ -680,13 +671,7 @@ class SignalGenerator:
                         'rsi': i15.get('rsi'),
                         'volumen_ratio': i15.get('volume') / i15.get('volume_sma20', 1) if i15.get('volume_sma20') else 0,
                         'mfm_sma5': i15.get('mfm_sma5'),
-                        'timestamp_15m': i15.get('timestamp', 0),
-                    },
-                    regime_4h=_regime_4h,
-                    adx_15m=i15.get('adx'),
-                    rsi_15m=i15.get('rsi'),
-                    ema200_dist_pct=_ema200_dist_pct,
-                    tipo_rechazo=_tipo_rechazo,
+                    }
                 )
 
     def _evaluar_condiciones_macro(self, symbol: str, coin_cfg: dict, direction: str,
@@ -706,7 +691,8 @@ class SignalGenerator:
 
         # F2.4: Contexto para bypass learning
         _regime_4h = self._determinar_regimen_4h(symbol)
-        _ema200_15m = i15.get('ema200_15m') if 'i15' in dir() else None
+        i15_ctx = self.indicadores_15m.get(symbol, {})
+        _ema200_15m = i15_ctx.get('ema200_15m')
         _price_ctx = price
         _ema200_dist_pct = ((_price_ctx - _ema200_15m) / _ema200_15m) * 100.0 if _ema200_15m and _price_ctx else 0.0
         _bypass_ctx = {
@@ -726,7 +712,7 @@ class SignalGenerator:
                     symbol=symbol, direction=direction, regime=_regime_4h,
                     rejected_filter=codigo, context=_bypass_ctx)
                 if bypass_ok:
-                    print(f"  🧠 [BYPASS-{getattr(CONFIG, 'learning_bypass_mode', 'OFF')}] "
+                    print(f"  [BYPASS-{getattr(CONFIG, 'learning_bypass_mode', 'OFF')}] "
                           f"{symbol} {direction} | Ignorando {codigo} por regla {_regime_4h}")
                     return
             rechazos.append(mensaje)
@@ -1385,7 +1371,6 @@ class SignalGenerator:
         # ── LEARNING ENGINE Fase 4 — SHADOW serving (no toca decisiones) ──────
         # Solo log + predictions_log. En ACTIVE el refusal vive en _procesar_disparo
         # (corrección C-3: antes de mutar state).
-        # P0.4: log_prediccion SIEMPRE (perfil None -> prob=0.5, decision=IGNORADA)
         if (self.learning_engine is not None and
                 getattr(CONFIG, 'learning_apply_mode', 'OFF') in ('SHADOW', 'ACTIVE') and
                 direction != 'NEUTRAL'):
@@ -1404,23 +1389,12 @@ class SignalGenerator:
                           f"patrón top: {_top.get('feature', '—')} {_top.get('bucket', '')} "
                           f"→ {_top.get('label_objetivo', '—')} "
                           f"(lift {_top.get('lift', '—')}, n={_top.get('n', '—')})")
-                else:
-                    # Sin perfil: log con prob base 0.5
-                    _feats = {'regime': self.learning_engine.regime_cls.regimen_actual.get(symbol, 'RANGE'),
-                              'rsi_15m': i15.get('rsi'), 'adx_15m': i15.get('adx'),
-                              'mfm_15m': i15.get('mfm_15m'), 'mfm_sma5': i15.get('mfm_sma5'),
-                              'macd_hist': i15.get('macd_hist')}
-                    _prob = 0.5
-                    print(f"  🧠 [LEARN-{getattr(CONFIG, 'learning_apply_mode', 'OFF')}] "
-                          f"{symbol} {direction} | prob=0.500 (sin perfil) | regime={_feats['regime']}")
-
-                # P0.4: Loggear siempre
-                self.learning_engine.log_prediccion(
-                    symbol=symbol, timestamp_15m=i15.get('timestamp', 0),
-                    prob=_prob, decision_sugerida='RECHAZAR' if _prob < 0.35 else 'FIRE',
-                    decision_tomada='IGNORADA',
-                    modo=getattr(CONFIG, 'learning_apply_mode', 'SHADOW'),
-                    direction=direction, score_macro=score_ajustado, regime=_feats['regime'])
+                    self.learning_engine.log_prediccion(
+                        symbol=symbol, timestamp_15m=i15.get('timestamp', 0),
+                        prob=_prob, decision_sugerida='RECHAZAR' if _prob < 0.35 else 'FIRE',
+                        decision_tomada='IGNORADA',
+                        modo=getattr(CONFIG, 'learning_apply_mode', 'SHADOW'),
+                        direction=direction, score_macro=score_ajustado, regime=_feats['regime'])
             except Exception as e_learn:
                 print(f"  ⚠️ [LEARN] shadow {symbol}: {e_learn}")
         # ── fin LEARNING ENGINE Fase 4 ────────────────────────────────────
@@ -1438,24 +1412,11 @@ class SignalGenerator:
 
         # FASE 1.5: Seguimiento virtual NEUTRAL con convicción alta
         if direction == 'NEUTRAL' and score_macro >= 55 and adx >= 20 and adx <= 35 and self.audit_logger:
-            # F1.4: Contexto de régimen para near_miss_seguimientos
-            _ema200_15m = i15.get('ema200_15m')
-            _ema200_dist_pct = ((price - _ema200_15m) / _ema200_15m) * 100.0 if _ema200_15m and price else 0.0
-            _regime_4h = 'NEUTRAL'
-            if self.learning_engine:
-                _regime_4h = self.learning_engine.regime_cls.regimen_actual.get(symbol, 'NEUTRAL')
-            
             await self.audit_logger.iniciar_seguimiento_near_miss(
                 symbol=symbol, score=score_macro,
                 umbral=umbral_entrada if umbral_entrada > 0 else 70,
                 direccion='NEUTRAL', precio=price,
-                contexto={'tipo': 'NEUTRAL_CONVICCION', 'adx': adx, 'rsi': rsi, 'score_macro': score_macro,
-                         'timestamp_15m': i15.get('timestamp', 0)},
-                regime_4h=_regime_4h,
-                adx_15m=adx,
-                rsi_15m=rsi,
-                ema200_dist_pct=_ema200_dist_pct,
-                tipo_rechazo='NEUTRAL_CONVICCION',
+                contexto={'tipo': 'NEUTRAL_CONVICCION', 'adx': adx, 'rsi': rsi, 'score_macro': score_macro}
             )
 
         state.score_macro_actual = score_macro
