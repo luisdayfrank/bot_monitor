@@ -1342,7 +1342,7 @@
                     return;
                 }
                 tbody.innerHTML = d.data.map(r => {
-                    const fecha = r.timestamp_inicio ? new Date(r.timestamp_inicio * 1000).toLocaleDateString() : '-';
+                    const fecha = r.timestamp_inicio ? new Date(r.timestamp_inicio).toLocaleDateString() : '-';
                     const costo = (r.costo_oportunidad_usdt != null) ? Number(r.costo_oportunidad_usdt).toFixed(4) : '0.0000';
                     const mov = (r.ret_neto_2h_pct != null) ? Number(r.ret_neto_2h_pct).toFixed(2) : '0.00';
                     return `
