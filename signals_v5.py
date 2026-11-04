@@ -656,12 +656,22 @@ class SignalGenerator:
             )
 
             if tipo_near_miss == "SCORE_PASA_OTRO_FILTRO_NO" and self.audit_logger:
+                _regime_nm = self._determinar_regimen_4h(symbol)
+                _ema200_nm = i15.get('ema200_15m')
+                _price_nm = i15.get('close', 0)
+                _ema200_dist_nm = ((_price_nm - _ema200_nm) / _ema200_nm) * 100.0 if _ema200_nm and _price_nm else 0.0
+                _tipo_rechazo_nm = rechazos[0] if rechazos else 'SCORE_PASA_OTRO_FILTRO_NO'
                 await self.audit_logger.iniciar_seguimiento_near_miss(
                     symbol=symbol,
                     score=score_macro,
                     umbral=umbral_efectivo,
                     direccion=direction,
                     precio=i15.get('close', 0),
+                    regime_4h=_regime_nm,
+                    adx_15m=i15.get('adx'),
+                    rsi_15m=i15.get('rsi'),
+                    ema200_dist_pct=_ema200_dist_nm,
+                    tipo_rechazo=_tipo_rechazo_nm,
                     contexto={
                         'tipo_near_miss': tipo_near_miss,
                         'rechazos': rechazos,
@@ -1412,10 +1422,18 @@ class SignalGenerator:
 
         # FASE 1.5: Seguimiento virtual NEUTRAL con convicción alta
         if direction == 'NEUTRAL' and score_macro >= 55 and adx >= 20 and adx <= 35 and self.audit_logger:
+            _regime_nm2 = self._determinar_regimen_4h(symbol)
+            _ema200_nm2 = i15.get('ema200_15m')
+            _ema200_dist_nm2 = ((price - _ema200_nm2) / _ema200_nm2) * 100.0 if _ema200_nm2 and price else 0.0
             await self.audit_logger.iniciar_seguimiento_near_miss(
                 symbol=symbol, score=score_macro,
                 umbral=umbral_entrada if umbral_entrada > 0 else 70,
                 direccion='NEUTRAL', precio=price,
+                regime_4h=_regime_nm2,
+                adx_15m=adx,
+                rsi_15m=rsi,
+                ema200_dist_pct=_ema200_dist_nm2,
+                tipo_rechazo='NEUTRAL_CONVICCION',
                 contexto={'tipo': 'NEUTRAL_CONVICCION', 'adx': adx, 'rsi': rsi, 'score_macro': score_macro}
             )
 
