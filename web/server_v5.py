@@ -16,6 +16,7 @@ from database_v5 import (
 )
 from notifier_v5 import Notifier
 from config import CONFIG
+import learning_db as ldb
 
 REGISTRY_PATH = "coins_registry.json"
 
@@ -526,6 +527,27 @@ async def get_stats_summary(request: Request, dias: int = 1):
             win_rate_val = None
             win_rate_estado = "PENDIENTE"
 
+        # ─── NUEVO: Tasa de oportunidad perdida y costo oportunidad (F1.1-F1.3) ───
+        # falso_negativo = near-miss que era rentable pero el bot rechazó
+        # costo_oportunidad_usdt = valor estimado perdido en USDT
+        cursor = await db.execute(
+            """
+            SELECT 
+                COUNT(*) as total_finalizados,
+                SUM(CASE WHEN falso_negativo = 1 THEN 1 ELSE 0 END) as falsos_negativos,
+                COALESCE(SUM(costo_oportunidad_usdt), 0) as costo_total_usdt
+            FROM near_miss_seguimientos 
+            WHERE timestamp_inicio >= ? AND timestamp_inicio < ? AND timestamp_fin IS NOT NULL
+            """,
+            (ts_desde, ts_hasta)
+        )
+        row_nm = await cursor.fetchone()
+        total_finalizados_nm = row_nm[0] if row_nm and row_nm[0] else 0
+        falsos_negativos = row_nm[1] if row_nm and row_nm[1] else 0
+        costo_oportunidad_total = float(row_nm[2]) if row_nm and row_nm[2] is not None else 0.0
+
+        tasa_oportunidad_perdida = round((falsos_negativos / total_finalizados_nm * 100), 2) if total_finalizados_nm > 0 else None
+
         # ─── 3. Grids REALES (executor) ───
         cursor = await db.execute(
             "SELECT count(*) FROM grid_ejecuciones WHERE timestamp_inicio >= ? AND timestamp_inicio < ?",
@@ -602,7 +624,12 @@ async def get_stats_summary(request: Request, dias: int = 1):
             "pnl_real_activo": round(pnl_real_activo, 4),
             "cb_hoy": cb_hoy,
             "ultimo_evento": ultimo_evento_info,
-            "mensaje": f"{periodo_txt}: {seguimientos_activos} seguimiento(s) en curso (2h). Win Rate calculable sobre {finalizados_hoy} finalizados.",
+            # NUEVO: Métricas de oportunidad perdida (F1.1-F1.3)
+            "total_finalizados_nm": total_finalizados_nm,
+            "falsos_negativos": falsos_negativos,
+            "tasa_oportunidad_perdida": tasa_oportunidad_perdida,
+            "costo_oportunidad_total_usdt": round(costo_oportunidad_total, 4),
+            "mensaje": f"{periodo_txt}: {seguimientos_activos} seguimiento(s) en curso (2h). Win Rate calculable sobre {finalizados_hoy} finalizados. Tasa oportunidad perdida: {tasa_oportunidad_perdida if tasa_oportunidad_perdida is not None else 'N/A'}%. Costo oportunidad: ${costo_oportunidad_total:.2f}",
         }
 
     except Exception as e:
@@ -1277,6 +1304,166 @@ async def get_stats_missed_opportunities(request: Request, dias: int = 1):
         return {"estado": "failed", "error": str(e)}
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+# V7: ENDPOINTS DE LEARNING ENGINE (NMI v2 - Bypass Learning)
+# ════════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/stats/learning-health")
+async def get_stats_learning_health(request: Request):
+    """Salud del pipeline NMI: labels acumulados, stale, estado del importer."""
+    try:
+        total, ultimo_ts = await ldb.contar_near_miss_labels()
+        ahora_ms = int(time.time() * 1000)
+        stale_h = (ahora_ms - ultimo_ts) / 3600_000 if ultimo_ts else float('inf')
+        estado = "OK" if stale_h <= 48 else "ALERTA"
+        return {
+            "estado": "success",
+            "labels_total": total,
+            "labels_stale_h": round(stale_h, 1) if ultimo_ts else None,
+            "pipeline_status": estado,
+            "alerta": stale_h > 48,
+            "mensaje": f"{total} near_miss_labels acumulados | Último hace {stale_h:.1f}h" if ultimo_ts else "Sin labels aún",
+        }
+    except Exception as e:
+        logger.error(f"Error learning-health: {e}")
+        return {"estado": "failed", "error": str(e)}
+
+
+@app.get("/api/stats/bypass-rules")
+async def get_stats_bypass_rules(request: Request):
+    """Reglas de bypass aprendidas: símbolo, dirección, régimen, filtro, condición, stats."""
+    try:
+        reglas = await ldb.cargar_bypass_rules_todas()
+        result = []
+        for r in reglas:
+            result.append({
+                "symbol": r.get("symbol") or "GLOBAL",
+                "direction": r.get("direction"),
+                "regime": r.get("regime"),
+                "rejected_filter": r.get("rejected_filter"),
+                "condition_json": r.get("condition_json"),
+                "n_occurrences": r.get("n_occurrences"),
+                "win_rate": round(r.get("win_rate", 0), 4),
+                "wilson_lower": round(r.get("wilson_lower", 0), 4),
+                "is_active": bool(r.get("is_active")),
+                "estado": "ACTIVA" if r.get("is_active") else "INACTIVA",
+                "created_at": r.get("created_at"),
+                "updated_at": r.get("updated_at"),
+            })
+        result.sort(key=lambda x: x["n_occurrences"], reverse=True)
+        return {
+            "estado": "success",
+            "total": len(result),
+            "activas": sum(1 for r in result if r["is_active"]),
+            "inactivas": sum(1 for r in result if not r["is_active"]),
+            "data": result,
+        }
+    except Exception as e:
+        logger.error(f"Error bypass-rules: {e}")
+        return {"estado": "failed", "error": str(e)}
+
+
+@app.get("/api/stats/learning-summary")
+async def get_stats_learning_summary(request: Request, dias: int = 7):
+    """Resumen agregado del Learning Engine: snapshots, NM importados, reglas."""
+    try:
+        # Contar snapshots en ventana
+        ts_corte = int(time.time() * 1000) - dias * 86400_000
+        total_snaps = 0
+        try:
+            for symbol in CONFIG.symbols:
+                n = await ldb.contar_snapshots_ventana(symbol, horas=dias * 24)
+                total_snaps += n
+        except Exception:
+            total_snaps = -1
+
+        # Contar near_miss_labels en ventana
+        nm_total, nm_ultimo_ts = await ldb.contar_near_miss_labels()
+        ahora_ms = int(time.time() * 1000)
+        nm_stale_h = (ahora_ms - nm_ultimo_ts) / 3600_000 if nm_ultimo_ts else float('inf')
+
+        # Contar reglas de bypass
+        reglas = await ldb.cargar_bypass_rules_todas()
+        reglas_activas = sum(1 for r in reglas if r.get("is_active"))
+        reglas_inactivas = len(reglas) - reglas_activas
+
+        return {
+            "estado": "success",
+            "dias": dias,
+            "snapshots_ventana": total_snaps,
+            "near_miss_labels_total": nm_total,
+            "near_miss_labels_stale_h": round(nm_stale_h, 1) if nm_ultimo_ts else None,
+            "bypass_rules_total": len(reglas),
+            "bypass_rules_activas": reglas_activas,
+            "bypass_rules_inactivas": reglas_inactivas,
+            "pipeline_ok": nm_stale_h <= 48 if nm_ultimo_ts else False,
+        }
+    except Exception as e:
+        logger.error(f"Error learning-summary: {e}")
+        return {"estado": "failed", "error": str(e)}
+
+
+@app.get("/api/stats/near-miss-detail")
+async def get_stats_near_miss_detail(request: Request, dias: int = 7, symbol: str = None):
+    """Detalle de near_miss_labels con falso_negativo, costo oportunidad, régimen."""
+    try:
+        ts_corte = int(time.time() * 1000) - dias * 86400_000
+        params = [ts_corte]
+        where_symbol = ""
+        if symbol:
+            symbol = _sanitize_symbol(symbol)
+            where_symbol = "AND symbol = ?"
+            params.append(symbol)
+
+        cursor = await ldb._get_db()
+        # Usar la conexión directa de learning_db (sqlite)
+        def _op():
+            conn = ldb._get_conn()
+            query = f"""
+                SELECT seguimiento_id, symbol, timestamp_inicio, timestamp_fin,
+                       regime, tipo_rechazo, adx_15m, rsi_15m, ema200_dist_pct,
+                       ret_neto_2h_pct, ret_neto_8h_pct, rentable_neto_2h,
+                       rentable_neto_8h, bloqueo_correcto, falso_negativo,
+                       significativo_katr, costo_oportunidad_usdt, created_at
+                FROM near_miss_labels
+                WHERE timestamp_inicio >= ? {where_symbol}
+                ORDER BY timestamp_inicio DESC
+                LIMIT 200
+            """
+            rows = conn.execute(query, tuple(params)).fetchall()
+            columns = [d[0] for d in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+        import asyncio
+        result = await asyncio.get_event_loop().run_in_executor(None, _op)
+
+        # Enriquecer con formato legible
+        for r in result:
+            r["falso_negativo_bool"] = bool(r.get("falso_negativo"))
+            r["rentable_2h_bool"] = bool(r.get("rentable_neto_2h"))
+            r["bloqueo_correcto_bool"] = bool(r.get("bloqueo_correcto"))
+            r["costo_oportunidad_usdt"] = round(float(r.get("costo_oportunidad_usdt") or 0), 4)
+            r["ret_neto_2h_pct"] = round(float(r.get("ret_neto_2h_pct") or 0), 4)
+
+        total_nm = len(result)
+        falsos_neg = sum(1 for r in result if r.get("falso_negativo_bool"))
+        costo_total = sum(float(r.get("costo_oportunidad_usdt") or 0) for r in result)
+
+        return {
+            "estado": "success",
+            "dias": dias,
+            "symbol": symbol,
+            "total": total_nm,
+            "falsos_negativos": falsos_neg,
+            "tasa_oportunidad_perdida": round((falsos_neg / total_nm * 100), 2) if total_nm > 0 else 0,
+            "costo_oportunidad_total_usdt": round(costo_total, 4),
+            "data": result,
+        }
+    except Exception as e:
+        logger.error(f"Error near-miss-detail: {e}")
+        return {"estado": "failed", "error": str(e)}
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # V6.2: ENDPOINT SALUD DEL SISTEMA
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1724,8 +1911,8 @@ async def force_fire(symbol: str, request: Request):
         notional_por_orden = poder_total / grid_count
         qty_por_orden = notional_por_orden / price if price > 0 else 0
 
-        fee_rate = 0.0005
-        breakeven = (2 * fee_rate + 2 * 0.0005) * 100
+        fee_rate = CONFIG.grid_fee_taker
+        breakeven = CONFIG.breakeven_taker_pct  # PR-C: fuente única (worst-case taker+slippage)
 
         params = {
             'direction': direction,
