@@ -424,6 +424,42 @@
                     </div>
                 </div>
 
+                <!-- FILA 3: Nuevas métricas de Learning Engine (NMI v2) -->
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
+                    <div class="bg-gray-800/40 p-4 rounded-xl border border-gray-700/50 hover:border-orange-500/30 transition">
+                        <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
+                            <span class="w-2 h-2 rounded-full bg-orange-500"></span>
+                            ❌ Falsos Negativos (NM)
+                        </div>
+                        <div class="text-3xl font-mono text-orange-400" id="stat-falsos-negativos">--</div>
+                        <div class="text-xs text-gray-600 mt-1">Near-misses rentables rechazados</div>
+                    </div>
+                    <div class="bg-gray-800/40 p-4 rounded-xl border border-gray-700/50 hover:border-red-500/30 transition">
+                        <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
+                            <span class="w-2 h-2 rounded-full bg-red-500"></span>
+                            📉 Tasa Oportunidad Perdida
+                        </div>
+                        <div class="text-3xl font-mono text-red-400" id="stat-tasa-oportunidad-perdida">--</div>
+                        <div class="text-xs text-gray-600 mt-1">% de NM rentables no capturados</div>
+                    </div>
+                    <div class="bg-gray-800/40 p-4 rounded-xl border border-gray-700/50 hover:border-yellow-500/30 transition">
+                        <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
+                            <span class="w-2 h-2 rounded-full bg-yellow-500"></span>
+                            💸 Costo Oportunidad Total
+                        </div>
+                        <div class="text-3xl font-mono text-yellow-400" id="stat-costo-oportunidad-total">--</div>
+                        <div class="text-xs text-gray-600 mt-1">USDT estimado perdido en el período</div>
+                    </div>
+                    <div class="bg-gray-800/40 p-4 rounded-xl border border-gray-700/50 hover:border-blue-500/30 transition">
+                        <div class="text-sm text-gray-400 mb-2 flex items-center gap-2">
+                            <span class="w-2 h-2 rounded-full bg-blue-500"></span>
+                            🎯 Precisión Bloqueo
+                        </div>
+                        <div class="text-3xl font-mono text-blue-400" id="stat-precision-bloqueo">--</div>
+                        <div class="text-xs text-gray-600 mt-1">Aciertos al rechazar (NM)</div>
+                    </div>
+                </div>
+
                 <!-- Alerta último evento -->
                 <div id="stats-ultimo-evento" class="bg-gray-800/30 p-3 rounded-xl border border-gray-700/50 mb-6 hidden">
                     <div class="text-xs text-gray-400"></div>
@@ -556,6 +592,7 @@
                     <button onclick="switchAnalysisTab('filters')" id="analysis-tab-filters" class="sub-tab-btn">🧪 Filtros</button>
                     <button onclick="switchAnalysisTab('health')" id="analysis-tab-health" class="sub-tab-btn">🩺 Salud</button>
                     <button onclick="switchAnalysisTab('compare')" id="analysis-tab-compare" class="sub-tab-btn">⚖️ Comparar</button>
+                    <button onclick="switchAnalysisTab('learning')" id="analysis-tab-learning" class="sub-tab-btn">🧠 Learning NMI</button>
                     <div class="flex-1"></div>
                     <button onclick="refreshAnalysis()" class="text-xs px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg font-semibold transition">🔄 Actualizar</button>
                 </div>
@@ -754,8 +791,101 @@
                                 <tbody><tr><td colspan="9" class="text-center text-gray-500 py-8">Selecciona monedas para comparar</td></tr></tbody>
                             </table>
                         </div>
-                    </div>
+                    <!-- LEARNING NMI -->
+                    <div id="analysis-learning" class="analysis-panel hidden">
+                        <h2 class="text-xl font-bold text-white mb-4">🧠 Learning Engine — NMI v2 (Bypass por Régimen)</h2>
+                        <p class="text-xs text-gray-500 mb-4">Datos del Learning Engine: reglas de bypass aprendidas, salud del pipeline NMI y análisis de oportunidades perdidas.</p>
 
+                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-6 gap-3 mb-6">
+                            <div class="kpi-card">
+                                <div class="text-xs text-gray-400">Labels Totales</div>
+                                <div class="text-2xl font-mono text-blue-400" id="learning-labels-total">--</div>
+                                <div class="text-xs text-gray-600 mt-1">near_miss_labels en SQLite</div>
+                            </div>
+                            <div class="kpi-card">
+                                <div class="text-xs text-gray-400">Pipeline Status</div>
+                                <div class="text-2xl font-mono" id="learning-pipeline-status">--</div>
+                                <div class="text-xs text-gray-600 mt-1">Stale: <span id="learning-stale-h" class="font-mono">--</span>h</div>
+                            </div>
+                            <div class="kpi-card">
+                                <div class="text-xs text-gray-400">Reglas Bypass Activas</div>
+                                <div class="text-2xl font-mono text-green-400" id="learning-rules-active">--</div>
+                                <div class="text-xs text-gray-600 mt-1">De <span id="learning-rules-total" class="text-gray-400">--</span> totales</div>
+                            </div>
+                            <div class="kpi-card">
+                                <div class="text-xs text-gray-400">Reglas Candidatas</div>
+                                <div class="text-2xl font-mono text-yellow-400" id="learning-rules-candidates">--</div>
+                                <div class="text-xs text-gray-600 mt-1">Pendientes de activación</div>
+                            </div>
+                            <div class="kpi-card">
+                                <div class="text-xs text-gray-400">Falsos Negativos</div>
+                                <div class="text-2xl font-mono text-orange-400" id="learning-fn-count">--</div>
+                                <div class="text-xs text-gray-600 mt-1">Oportunidades perdidas</div>
+                            </div>
+                            <div class="kpi-card">
+                                <div class="text-xs text-gray-400">Costo Oportunidad</div>
+                                <div class="text-2xl font-mono text-red-400" id="learning-costo-total">--</div>
+                                <div class="text-xs text-gray-600 mt-1">USDT estimado perdido</div>
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+                            <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                                <div class="flex items-center justify-between mb-3">
+                                    <h3 class="text-sm font-bold text-gray-300 flex items-center gap-2">
+                                        <span>📋</span> Reglas de Bypass Aprendidas
+                                    </h3>
+                                    <button onclick="refreshLearning()" class="text-xs px-2 py-1 bg-blue-600 hover:bg-blue-500 text-white rounded transition">🔄</button>
+                                </div>
+                                <div class="overflow-x-auto">
+                                    <table class="analysis-table" id="bypass-rules-table">
+                                        <thead><tr>
+                                            <th>Símbolo</th><th>Dir</th><th>Régimen</th><th>Filtro Rechazado</th><th>Condición</th><th>N</th><th>Win Rate</th><th>Wilson</th><th>Estado</th>
+                                        </tr></thead>
+                                        <tbody id="bypass-rules-tbody"><tr><td colspan="9" class="text-center text-gray-500 py-8">Cargando...</td></tr></tbody>
+                                    </table>
+                                </div>
+                            </div>
+
+                            <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                                <div class="flex items-center justify-between mb-3">
+                                    <h3 class="text-sm font-bold text-gray-300 flex items-center gap-2">
+                                        <span>💸</span> Oportunidades Perdidas (Falsos Negativos)
+                                    </h3>
+                                </div>
+                                <div class="overflow-x-auto">
+                                    <table class="analysis-table" id="fn-table">
+                                        <thead><tr>
+                                            <th>Símbolo</th><th>Dir</th><th>Régimen</th><th>Filtro</th><th>Mov %</th><th>Costo USDT</th><th>Bloqueo</th><th>Fecha</th>
+                                        </tr></thead>
+                                        <tbody id="fn-tbody"><tr><td colspan="8" class="text-center text-gray-500 py-8">Cargando...</td></tr></tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+                            <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                                <h3 class="text-sm font-bold text-gray-300 mb-3">Reglas por Régimen</h3>
+                                <div id="learning-regime-chart" class="h-64"></div>
+                            </div>
+                            <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                                <h3 class="text-sm font-bold text-gray-300 mb-3">Win Rate por Filtro Rechazado</h3>
+                                <div id="learning-filter-chart" class="h-64"></div>
+                            </div>
+                        </div>
+
+                        <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50 mb-6">
+                            <h3 class="text-sm font-bold text-gray-300 mb-2">ℹ️ Sobre el Learning Engine NMI v2</h3>
+                            <ul class="text-xs text-gray-500 space-y-1 list-disc list-inside">
+                                <li><b>🎯 Objetivo:</b> El bot aprende cuándo ignorar sus propios filtros estáticos (ADX extremo, RSI sobreventa/compra, etc.) cuando detecta un patrón de tendencia fuerte.</li>
+                                <li><b>📊 Datos:</b> Se acumulan <code>near_miss_labels</code> con medición honesta (retorno neto de fees, no precio extremo).</li>
+                                <li><b>⚙️ Reglas:</b> Se minan patrones con Wilson CI (n≥30, wilson_lower≥0.55) y se guardan en <code>bypass_rules</code>.</li>
+                                <li><b>🔄 Ciclo:</b> SHADOW (observar) → ACTIVE (ejecutar bypass) → auto-demote si wilson_lower &lt; 0.50.</li>
+                                <li><b>🚨 Guardrails:</b> FNR > 25% o Fire rate > 5/día → demote automático a SHADOW.</li>
+                            </ul>
+                        </div>
+                    </div>
                 </div>
             </div>
 
@@ -910,12 +1040,18 @@
         // V6.2: SUB-TABS DE ANÁLISIS
         // ============================================
         function switchAnalysisTab(subTab) {
-            ['resumen', 'auditoria', 'nearmiss', 'grids', 'equity', 'filters', 'health', 'compare'].forEach(t => {
+            ['resumen', 'auditoria', 'nearmiss', 'grids', 'equity', 'filters', 'health', 'compare', 'learning'].forEach(t => {
                 document.getElementById('analysis-' + t).classList.add('hidden');
                 document.getElementById('analysis-tab-' + t).classList.remove('active');
             });
             document.getElementById('analysis-' + subTab).classList.remove('hidden');
             document.getElementById('analysis-tab-' + subTab).classList.add('active');
+            if (subTab === 'learning') refreshLearning();
+            localStorage.setItem('cm_v62_prefs', JSON.stringify({
+                ...JSON.parse(localStorage.getItem('cm_v62_prefs') || '{}'),
+                analysisTab: subTab
+            }));
+        }.add('active');
 
             if (subTab === 'resumen') loadResumenGlobal();
             if (subTab === 'auditoria') loadAuditoria();
@@ -1125,6 +1261,153 @@
                     </tr>`;
                 }).join('');
             } catch (e) { console.error('[ANALYSIS] Error near-misses:', e); }
+        }
+
+        // ============================================
+        // LEARNING ENGINE NMI v2 FUNCTIONS
+        // ============================================
+        async function refreshLearning() {
+            await loadLearningHealth();
+            await loadBypassRules();
+            await loadNearMissDetail();
+            await drawLearningCharts();
+        }
+
+        async function loadLearningHealth() {
+            try {
+                const res = await fetch('/api/stats/learning-health');
+                const d = await res.json();
+                if (d.estado !== 'success') return;
+                document.getElementById('learning-labels-total').textContent = d.labels_total || 0;
+                const stale = d.labels_stale_h;
+                const statusEl = document.getElementById('learning-pipeline-status');
+                const staleEl = document.getElementById('learning-stale-h');
+                if (stale !== null && stale !== undefined) {
+                    staleEl.textContent = stale.toFixed(1);
+                    if (d.alerta) {
+                        statusEl.textContent = 'ALERTA - Datos obsoletos';
+                        statusEl.className = 'text-2xl font-mono text-red-400';
+                    } else {
+                        statusEl.textContent = 'OK - Pipeline activo';
+                        statusEl.className = 'text-2xl font-mono text-green-400';
+                    }
+                } else {
+                    statusEl.textContent = 'Sin datos';
+                    statusEl.className = 'text-2xl font-mono text-gray-500';
+                    staleEl.textContent = '--';
+                }
+            } catch (e) { console.error('[LEARNING] Error health:', e); }
+        }
+
+        async function loadBypassRules() {
+            try {
+                const res = await fetch('/api/stats/bypass-rules');
+                const d = await res.json();
+                if (d.estado !== 'success') return;
+                document.getElementById('learning-rules-active').textContent = d.activas || 0;
+                document.getElementById('learning-rules-total').textContent = d.total || 0;
+                document.getElementById('learning-rules-candidates').textContent = d.inactivas || 0;
+                const tbody = document.getElementById('bypass-rules-tbody');
+                if (!d.data || !d.data.length) {
+                    tbody.innerHTML = '<tr><td colspan="9" class="text-center text-gray-500 py-8">Sin reglas de bypass</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = d.data.map(r => `
+                    <tr>
+                        <td class="font-mono text-[11px]">${r.symbol}</td>
+                        <td class="font-bold">${r.direction}</td>
+                        <td>${r.regime}</td>
+                        <td>${r.rejected_filter}</td>
+                        <td class="font-mono text-[10px]">${r.condition_json}</td>
+                        <td class="font-mono text-[11px]">${r.n_occurrences}</td>
+                        <td class="${r.win_rate >= 0.65 ? 'text-green-400' : 'text-yellow-400'}">${(r.win_rate * 100).toFixed(1)}%</td>
+                        <td class="font-mono text-[11px]">${(r.wilson_lower || 0).toFixed(3)}</td>
+                        <td class="${r.is_active ? 'text-green-400' : 'text-gray-500'}">${r.estado}</td>
+                    </tr>
+                `).join('');
+            } catch (e) { console.error('[LEARNING] Error bypass-rules:', e); }
+        }
+
+        async function loadNearMissDetail() {
+            try {
+                const res = await fetch('/api/stats/near-miss-detail?dias=7');
+                const d = await res.json();
+                if (d.estado !== 'success') return;
+                document.getElementById('learning-fn-count').textContent = d.falsos_negativos || 0;
+                document.getElementById('learning-costo-total').textContent = (d.costo_oportunidad_total_usdt || 0).toFixed(2);
+                const tbody = document.getElementById('fn-tbody');
+                if (!d.data || !d.data.length) {
+                    tbody.innerHTML = '<tr><td colspan="8" class="text-center text-gray-500 py-8">Sin oportunidades perdidas</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = d.data.map(r => {
+                    const fecha = r.timestamp_inicio ? new Date(r.timestamp_inicio * 1000).toLocaleDateString() : '-';
+                    return `
+                        <tr>
+                            <td class="font-mono text-[11px]">${r.symbol}</td>
+                            <td class="font-bold">${r.direction || '-'}</td>
+                            <td>${r.regime || '-'}</td>
+                            <td>${r.rejected_filter || '-'}</td>
+                            <td class="font-mono text-[11px]">${(r.ret_neto_2h_pct || 0).toFixed(2)}%</td>
+                            <td class="font-mono text-[11px] text-red-400">${r.costo_oportunidad_usdt.toFixed(4)}</td>
+                            <td>${r.bloqueo_correcto_bool ? '✅' : '❌'}</td>
+                            <td class="font-mono text-[11px]">${fecha}</td>
+                        </tr>
+                    `;
+                }).join('');
+            } catch (e) { console.error('[LEARNING] Error near-miss-detail:', e); }
+        }
+
+        async function drawLearningCharts() {
+            try {
+                const res = await fetch('/api/stats/bypass-rules');
+                const d = await res.json();
+                if (d.estado !== 'success') return;
+
+                // Regímenes chart
+                const regimeCounts = {};
+                d.data.forEach(r => {
+                    const key = r.regime + (r.is_active ? ' (Activa)' : ' (Inactiva)');
+                    regimeCounts[key] = (regimeCounts[key] || 0) + 1;
+                });
+                Plotly.newPlot('learning-regime-chart', [{
+                    x: Object.keys(regimeCounts),
+                    y: Object.values(regimeCounts),
+                    type: 'bar',
+                    marker: { color: Object.keys(regimeCounts).map(k => k.includes('Activa') ? '#22c55e' : '#6b7280') }
+                }], {
+                    margin: { t: 20, b: 40 },
+                    paper_bgcolor: 'transparent',
+                    plot_bgcolor: 'transparent',
+                    font: { color: '#9ca3af', size: 11 },
+                    xaxis: { tickangle: -45, showgrid: false },
+                    yaxis: { showgrid: true, gridcolor: '#374151' }
+                }, { responsive: true });
+
+                // Win rate by filter chart
+                const filterStats = {};
+                d.data.forEach(r => {
+                    const f = r.rejected_filter;
+                    if (!filterStats[f]) filterStats[f] = { wins: 0, total: 0 };
+                    filterStats[f].total += r.n_occurrences;
+                    filterStats[f].wins += r.n_occurrences * (r.win_rate || 0);
+                });
+                const filters = Object.keys(filterStats);
+                const wrs = filters.map(f => (filterStats[f].wins / filterStats[f].total * 100) || 0);
+                Plotly.newPlot('learning-filter-chart', [{
+                    x: filters,
+                    y: wrs,
+                    type: 'bar',
+                    marker: { color: '#3b82f6' }
+                }], {
+                    margin: { t: 20, b: 80 },
+                    paper_bgcolor: 'transparent',
+                    plot_bgcolor: 'transparent',
+                    font: { color: '#9ca3af', size: 11 },
+                    xaxis: { tickangle: -45, showgrid: false },
+                    yaxis: { showgrid: true, gridcolor: '#374151', range: [0, 100], ticksuffix: '%' }
+                }, { responsive: true });
+            } catch (e) { console.error('[LEARNING] Error charts:', e); }
         }
 
         async function selectNearMiss(idx) {
@@ -1652,6 +1935,26 @@
                     document.getElementById('stat-fees-real').innerText = (data.fees_real_hoy || 0).toFixed(2) + ' USDT';
                     document.getElementById('stat-cb').innerText = data.cb_hoy !== undefined ? data.cb_hoy : '--';
 
+                    // NUEVO: Métricas de Learning Engine (NMI v2)
+                    document.getElementById('stat-falsos-negativos').innerText = data.falsos_negativos !== undefined ? data.falsos_negativos : '--';
+                    const fpr = data.tasa_oportunidad_perdida;
+                    const fprEl = document.getElementById('stat-tasa-oportunidad-perdida');
+                    if (fpr !== null && fpr !== undefined) {
+                        fprEl.innerText = fpr + '%';
+                        fprEl.className = 'text-3xl font-mono ' + (fpr > 25 ? 'text-red-400' : fpr > 10 ? 'text-yellow-400' : 'text-green-400');
+                    } else {
+                        fprEl.innerText = '--';
+                    }
+                    document.getElementById('stat-costo-oportunidad-total').innerText = (data.costo_oportunidad_total_usdt || 0).toFixed(2) + ' USDT';
+                    const pb = data.precision_bloqueo !== undefined ? data.precision_bloqueo : data.win_rate_rechazos;
+                    const pbEl = document.getElementById('stat-precision-bloqueo');
+                    if (pb !== null && pb !== undefined) {
+                        pbEl.innerText = pb + '%';
+                        pbEl.className = 'text-3xl font-mono ' + (pb >= 60 ? 'text-green-400' : pb >= 40 ? 'text-yellow-400' : 'text-red-400');
+                    } else {
+                        pbEl.innerText = '--';
+                    }
+
                     const ultEvEl = document.getElementById('stats-ultimo-evento');
                     if (data.ultimo_evento) {
                         ultEvEl.classList.remove('hidden');
@@ -1688,6 +1991,10 @@
                     document.getElementById('stat-pnl-real').innerText = 'ERR';
                     document.getElementById('stat-fees-real').innerText = 'ERR';
                     document.getElementById('stat-cb').innerText = 'ERR';
+                    document.getElementById('stat-falsos-negativos').innerText = 'ERR';
+                    document.getElementById('stat-tasa-oportunidad-perdida').innerText = 'ERR';
+                    document.getElementById('stat-costo-oportunidad-total').innerText = 'ERR';
+                    document.getElementById('stat-precision-bloqueo').innerText = 'ERR';
                 }
             } catch (e) { console.error("[STATS] Error cargando summary:", e); }
 
