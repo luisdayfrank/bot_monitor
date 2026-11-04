@@ -699,31 +699,25 @@ class SignalGenerator:
         umbral_mantenimiento = self.SCORE_MANTENIMIENTO_ARMED
         umbral_bloqueado = False
 
-        # F2.4: Contexto para bypass learning
         _regime_4h = self._determinar_regimen_4h(symbol)
-        i15_ctx = self.indicadores_15m.get(symbol, {})
-        _ema200_15m = i15_ctx.get('ema200_15m')
-        _price_ctx = price
-        _ema200_dist_pct = ((_price_ctx - _ema200_15m) / _ema200_15m) * 100.0 if _ema200_15m and _price_ctx else 0.0
+        _i15_ctx = self.indicadores_15m.get(symbol, {})
+        _ema200_15m = _i15_ctx.get('ema200_15m')
+        _ema200_dist_pct = ((price - _ema200_15m) / _ema200_15m) * 100.0 if _ema200_15m and price else 0.0
         _bypass_ctx = {
             'adx': adx, 'rsi': rsi, 'ema200_dist_pct': _ema200_dist_pct,
             'atr_pct': (atr / price * 100) if price > 0 else 0,
             'mfm': mfm, 'mfm_sma5': mfm_sma5,
         }
 
-        # Helper: agregar rechazo solo si bypass no lo aprueba
-        def _tal_vez_rechazar(codigo: str, mensaje: str, condicion: bool):
+        def _tal_vez_rechazar(codigo, mensaje, condicion):
             if not condicion:
                 return
-            # F2.4: Consultar bypass_engine SINCRONO antes de rechazar
             if (self.learning_engine is not None and
                     getattr(CONFIG, 'learning_bypass_mode', 'OFF') != 'OFF'):
                 bypass_ok = self.learning_engine.evaluar_bypass(
                     symbol=symbol, direction=direction, regime=_regime_4h,
                     rejected_filter=codigo, context=_bypass_ctx)
                 if bypass_ok:
-                    print(f"  [BYPASS-{getattr(CONFIG, 'learning_bypass_mode', 'OFF')}] "
-                          f"{symbol} {direction} | Ignorando {codigo} por regla {_regime_4h}")
                     return
             rechazos.append(mensaje)
 
@@ -767,7 +761,7 @@ class SignalGenerator:
             if decision == "PERMITIR":
                 score_macro += 20
             else:
-                _tal_vez_rechazar("RSI_EXTREMO", razon, True)
+                rechazos.append(razon)
         else:
             rechazos.append("Direccion NEUTRAL")
 
@@ -1132,21 +1126,14 @@ class SignalGenerator:
         return 'NEUTRAL', 'NINGUNA'
 
     def _determinar_regimen_4h(self, symbol: str) -> str:
-        """
-        F2.4: Determina régimen 4H para bypass learning.
-        Usa self.indicadores_4h que ya tiene ema50_4h y ema200_4h (P0.6).
-        """
         i4h = self.indicadores_4h.get(symbol, {})
         if not i4h:
             return 'NEUTRAL'
-
         ema50 = i4h.get('ema50_4h')
         ema200 = i4h.get('ema200_4h')
         price = i4h.get('close')
-
         if ema50 is None or ema200 is None or price is None:
             return 'NEUTRAL'
-
         if price > ema50 > ema200:
             return 'BULLISH'
         elif price < ema50 < ema200:
