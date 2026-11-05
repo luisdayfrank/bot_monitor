@@ -1,1 +1,370 @@
-Galaxy FDS Error: Request Expired [This presigned url has expired] [alsgp0], requestId:7de86436-b0c6-5689-0000-01a1ac866f7a
+import asyncio
+import uvicorn
+from contextlib import asynccontextmanager
+from datetime import datetime
+import pytz
+
+from config import CONFIG
+from database_v5 import init_db, close_db
+from collector import DataCollector
+from indicators_v3 import IndicatorEngineV3 as IndicatorEngine
+from signals_v5 import SignalGenerator
+from web.server_v5 import app, orquestador_eventos
+from notifier_v5 import Notifier
+
+from audit_logger import AuditLogger
+from audit_reporter_v5 import AuditReporter
+# FASE 4 PLAN 6.3: El executor es autónomo. No hay servicio externo de grid.
+# La lógica operativa vive en los métodos internos del executor.
+
+background_tasks = set()
+
+
+@asynccontextmanager
+async def lifespan(fastapi_app):
+    await init_db()
+    print("🗄️ Base de datos MySQL/MariaDB inicializada.")
+
+    # ── LEARNING ENGINE Fase 0: DB separada (crypto_learning.db, SQLite) ──
+    # Aislado total del trading; cero impacto si learning_enabled=False.
+    learning_engine = None
+    if getattr(CONFIG, 'learning_enabled', False):
+        from learning_db import init_learning_db
+        modo_db = await init_learning_db(getattr(CONFIG, 'learning_db_path', 'crypto_learning.db'))
+        print(f"  🧠 [LEARN] base de learning lista (journal={modo_db})")
+
+    queue_velas = asyncio.Queue()
+    queue_indicadores = asyncio.Queue()
+    queue_eventos = asyncio.Queue()
+    precios_vivo = {}
+
+    collector = DataCollector(queue_velas, precios_vivo)
+    engine = IndicatorEngine(queue_velas, queue_indicadores)
+    signals = SignalGenerator(queue_indicadores, queue_eventos)
+    notifier = Notifier()
+
+    # V4.2: Guardar referencia para comandos Telegram
+    notifier.signal_generator = signals
+
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # FASE 1: Crear executor de trading real/testnet
+    # ═══════════════════════════════════════════════════════════════════════════════
+    executor = None
+    if CONFIG.trading_mode in ('TESTNET', 'REAL'):
+        from executor import GridExecutor
+        executor = GridExecutor(precios_vivo, signals.states)
+        signals.executor = executor
+        print(f"  🚀 [FASE 1] Executor {CONFIG.trading_mode} creado | Capital: ${CONFIG.trading_capital_max_usdt}")
+    else:
+        print("  ℹ️ [FASE 1] Modo SIMULACIÓN (executor no activado)")
+
+    # PR-A Nota 3: aviso de cambio de contabilidad (el usuario verá el PnL "bajar" a neto)
+    print("  💰 [CONTABILIDAD] PnL mostrado es NETO (realizedPnl - commission). Antes se mostraba gross.")
+
+    # F2.8: Crear todas las instancias PRIMERO (antes de inyectar dependencias)
+    audit_logger = None
+    audit_reporter = None
+    if CONFIG.modo_auditoria:
+        audit_logger = AuditLogger()
+        audit_reporter = AuditReporter(notifier)
+        print(f"📋 Modo auditoría ACTIVADO ({CONFIG.timezone})")
+        print(f"   Reporte diario: {CONFIG.auditoria_hora_reporte} {CONFIG.timezone}")
+        # FASE 5.2: Notificar que MFM está activo
+        print(f"   📊 MFM (Money Flow Multiplier) ACTIVADO en filtro macro")
+        print(f"   Umbral alineación: ±{CONFIG.mfm_umbral_alineacion}")
+    else:
+        print("📋 Modo auditoría DESACTIVADO")
+
+    # FASE 4 PLAN 6.3: El executor maneja todo internamente.
+    # No hay instancia de GridSimulator en el pipeline.
+
+    # F2.8: BLOQUE SECUENCIAL de inyección de dependencias (TODAS juntas, antes de lanzar tareas)
+    signals.audit_logger = audit_logger
+    # FASE 4 PLAN 6.3: Executor autónomo. Grid neutral gestionado internamente.
+    signals.executor = executor  # ← FASE 1: Inyectar executor
+    if executor:
+        executor.notifier = notifier  # ← FASE 1: Executor puede notificar
+    signals.notifier = notifier  # FASE 3.2: Para alertas pre-disparo Telegram
+
+    # ── LEARNING ENGINE Fases 1-8: crear e inyectar en signals + executor ──
+    if getattr(CONFIG, 'learning_enabled', False):
+        from learning_engine import LearningEngine
+        learning_engine = LearningEngine(signals)
+        learning_engine.notifier = notifier   # ANEXO A §4/§5: alertas de guardrail/drift
+        signals.learning_engine = learning_engine
+        if executor:
+            executor.learning_engine = learning_engine
+        print(f"  🧠 [LEARN] engine inyectado | apply={CONFIG.learning_apply_mode} "
+              f"exit={CONFIG.learning_exit_mode}")
+
+    # P0.1: Inyectar learning_engine en audit_logger (después de crear el engine)
+    if learning_engine and audit_logger:
+        audit_logger.learning_engine = learning_engine
+        print("  🧠 [LEARN] LearningEngine inyectado en AuditLogger")
+
+
+    print("⏳ Cold start en progreso...")
+    await collector.cold_start()
+    print("✅ Cold start OK.")
+
+    engine.buffers_1m = collector.buffers_1m
+    engine.buffers_15m = collector.buffers_15m
+    engine.buffers_4h = collector.buffers_4h
+    await engine.precalcular()
+
+    app.state.buffers_1m = engine.buffers_1m
+    app.state.buffers_15m = engine.buffers_15m
+    app.state.buffers_4h = engine.buffers_4h
+    app.state.signal_states = signals.states
+    app.state.precios_vivo = precios_vivo
+    app.state.indicadores_1m = signals.indicadores_1m
+    app.state.indicadores_15m = signals.indicadores_15m
+    app.state.indicadores_4h = signals.indicadores_4h
+    # V4.2: Exponer signal_generator para endpoints REST
+    app.state.signal_generator = signals
+    # FASE 4 PLAN 6.3: El endpoint /api/grid-neutral/{symbol} lee del executor directamente.
+    # FASE 5 FIX: Exponer notifier real para endpoints REST
+    app.state.notifier = notifier
+    # FASE 1: Exponer executor para endpoints REST de fuerza manual
+    app.state.executor = executor
+
+    # FASE 4 PLAN 6.3: Recuperación post-crash gestionada internamente por el executor.
+
+    print("✅ Precálculo completado. Arrancando pipeline V5.9.2...")
+
+    t1 = asyncio.create_task(collector.run())
+    t2 = asyncio.create_task(engine.run())
+    t3 = asyncio.create_task(signals.run())
+    t4 = asyncio.create_task(orquestador_eventos(
+        queue_eventos=queue_eventos,
+        precios_vivo=precios_vivo,
+        indicadores_1m=signals.indicadores_1m,
+        indicadores_15m=signals.indicadores_15m,
+        indicadores_4h=signals.indicadores_4h,
+        signal_states=signals.states,
+        notifier=notifier  # FASE 1 FIX: Pasar la instancia real con signal_generator configurado
+    ))
+
+    # FASE 4: Eliminadas tareas async de grid_simulator.
+    # El executor maneja grid neutral sincronicamente dentro de su loop de polling.
+    # No hay colas, tickers ni heartbeats separados.
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # F1.3 FIX: Definir callback ANTES de usarlo en las tareas del grid
+    # ═══════════════════════════════════════════════════════════════════════════════
+    def task_done_callback(t):
+        try:
+            t.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"❌ ERROR CRÍTICO EN TAREA: {e}")
+
+    # FASE 4 PLAN 6.3: No hay tareas externas de grid que monitorear.
+
+    background_tasks.update([t1, t2, t3, t4])
+
+
+    # FASE 1: Tarea del executor de trading real
+    if executor:
+        t_executor = asyncio.create_task(executor.run())
+        background_tasks.add(t_executor)
+        t_executor.add_done_callback(task_done_callback)
+        print(f"  ✅ [FASE 1] Tarea executor añadida al pipeline")
+
+    # ── LEARNING ENGINE: loop de background (flush, labeler, learner diario) ──
+    if learning_engine:
+        t_learn = asyncio.create_task(learning_engine.run())
+        background_tasks.add(t_learn)
+        t_learn.add_done_callback(task_done_callback)
+        print(f"  ✅ [LEARN] Tarea del LearningEngine añadida al pipeline")
+
+    # Aplicar callback a tareas principales
+    for t in [t1, t2, t3, t4]:
+        t.add_done_callback(task_done_callback)
+
+    if CONFIG.modo_auditoria and audit_logger and audit_reporter:
+        t5 = asyncio.create_task(audit_logger.run())
+        background_tasks.add(t5)
+        t5.add_done_callback(task_done_callback)
+
+        t6 = asyncio.create_task(audit_reporter.run())
+        background_tasks.add(t6)
+        t6.add_done_callback(task_done_callback)
+
+        async def trackear_precios_post():
+            while True:
+                await asyncio.sleep(5)
+                if not CONFIG.modo_auditoria:
+                    break
+                for symbol, precio in list(precios_vivo.items()):
+                    try:
+                        ts = datetime.now(pytz.UTC)
+                        await audit_logger.trackear_precio_post_disparo(symbol, precio, ts)
+                        await audit_logger.trackear_precio_near_miss(symbol, precio, ts)
+                    except Exception as e:
+                        print(f"  ⚠️ Error trackeando {symbol}: {e}")
+                    await asyncio.sleep(0)
+
+        t7 = asyncio.create_task(trackear_precios_post())
+        background_tasks.add(t7)
+        t7.add_done_callback(task_done_callback)
+
+    await asyncio.sleep(2)
+    await notifier.notificar_online(
+        symbols=CONFIG.symbols,
+        uptime_start=datetime.now(pytz.UTC).timestamp()
+    )
+    await notifier.notificar_resumen(
+        estados=signals.states,
+        precios=precios_vivo,
+        indicadores_15m=signals.indicadores_15m
+    )
+
+    # V4.2: Pasar signal_generator al polling
+    t8 = asyncio.create_task(notifier.polling_comandos(
+        estados=signals.states,
+        precios=precios_vivo,
+        indicadores_15m=signals.indicadores_15m,
+        indicadores_1m=signals.indicadores_1m,
+        indicadores_4h=signals.indicadores_4h,
+        signal_generator=signals
+    ))
+    background_tasks.add(t8)
+    t8.add_done_callback(task_done_callback)
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # V4.2: HEARTBEAT MEJORADO CON DOCUMENTACIÓN DE ESTADOS
+    # ═══════════════════════════════════════════════════════════════════════════════
+    if CONFIG.heartbeat_debug:
+        async def heartbeat_validacion():
+            """Log periódico del estado interno de todas las monedas. Solo lectura."""
+            from datetime import datetime
+            while True:
+                await asyncio.sleep(CONFIG.heartbeat_intervalo_min * 60)
+                lineas = []
+                ahora = datetime.now(pytz.UTC).strftime('%H:%M:%S')
+
+                # Contadores para resumen
+                total_monedas = len(CONFIG.symbols)
+                monedas_pausadas_manual = 0
+                monedas_pausadas_auto = 0
+                monedas_armed = 0
+                monedas_fire = 0
+                monedas_neutral_grid = 0  # FIX #7: Contador NEUTRAL_GRID
+
+                for symbol in CONFIG.symbols:
+                    st = signals.states[symbol]
+                    i15 = signals.indicadores_15m.get(symbol, {})
+                    i1m = signals.indicadores_1m.get(symbol, {})
+                    adx = i15.get('adx', 'N/A')
+                    rsi = i15.get('rsi', 'N/A')
+                    score = st.score_macro_actual
+                    dir_valida = st.direccion_ultima_valida or 'None'
+
+                    # V4.2: Información de pausa mejorada
+                    pausa_info = ''
+                    if st.moneda_pausada_manual:
+                        pausa_info = ' [PAUSADA-MANUAL]'
+                        monedas_pausadas_manual += 1
+                    elif st.moneda_pausada:
+                        pausa_info = ' [PAUSADA-AUTO]'
+                        monedas_pausadas_auto += 1
+                    elif st.score_bajo_desde:
+                        mins_bajo = (int(datetime.now(pytz.UTC).timestamp()) - st.score_bajo_desde) // 60
+                        pausa_info = f' [bajo:{mins_bajo}min→pausa en {max(0, int(CONFIG.pausa_inactividad_horas*60)-mins_bajo)}min]'
+
+                    armed_age = ''
+                    if st.estado == 'ARMED' and st.armed_timestamp > 0:
+                        mins = (int(datetime.now(pytz.UTC).timestamp() * 1000) - st.armed_timestamp) // 60000
+                        armed_age = f' armed:{mins}min'
+                        monedas_armed += 1
+
+                    if st.estado == 'FIRE':
+                        monedas_fire += 1
+
+                    if st.estado == 'NEUTRAL_GRID':
+                        monedas_neutral_grid += 1
+
+                    # V4.2: Score con indicador visual
+                    score_visual = score
+                    if score >= 70:
+                        score_str = f"{score}✅"
+                    elif score >= 50:
+                        score_str = f"{score}🟡"
+                    elif score > 0:
+                        score_str = f"{score}🔴"
+                    else:
+                        score_str = f"{score}⚪"
+
+                    lineas.append(
+                        f"{symbol}:{st.estado} score={score_str} adx={adx} rsi={rsi} "
+                        f"dir={dir_valida}{armed_age}{pausa_info}"
+                    )
+
+                # V4.2: Resumen al inicio del heartbeat
+                resumen = (
+                    f"💓 [{ahora}] HEARTBEAT | "
+                    f"Total:{total_monedas} | "
+                    f"🔥FIRE:{monedas_fire} | "
+                    f"🎯ARMED:{monedas_armed} | "
+                    f"💠N-GRID:{monedas_neutral_grid} | "  # FIX #7: Mostrar NEUTRAL_GRID
+                    f"⏸️Manual:{monedas_pausadas_manual} | "
+                    f"⏸️Auto:{monedas_pausadas_auto}"
+                )
+                print(resumen)
+                print(f"  💓 [{ahora}] DETALLE | {' | '.join(lineas)}")
+
+                # V4.2: Leyenda cada 4 ciclos (1 hora)
+                ciclo_actual = int(datetime.now(pytz.UTC).timestamp()) // (CONFIG.heartbeat_intervalo_min * 60)
+                if ciclo_actual % 4 == 0:
+                    print("  📖 LEYENDA: [PAUSADA-MANUAL]=solo /resume la reactiva | "
+                          "[PAUSADA-AUTO]=se reactiva sola cuando score>=50 | "
+                          "[bajo:Xmin→pausa en Ymin]=cuenta regresiva a pausa auto | "
+                          "armed:Xmin=tiempo en ARMED | score✅>=70 🟡>=50 🔴>0 ⚪=0")
+
+        t9 = asyncio.create_task(heartbeat_validacion())
+        background_tasks.add(t9)
+        t9.add_done_callback(task_done_callback)
+        print(f"  💓 Heartbeat de validación activado (cada {CONFIG.heartbeat_intervalo_min}min)")
+        print(f"  📖 Comandos Telegram: /pause, /resume, /pause_all, /resume_all, /list_paused")
+
+    yield
+
+    print("⏹️ Apagando procesos de forma segura...")
+
+    # LEARNING ENGINE: parar antes que nada (flush final en curso)
+    if learning_engine:
+        print("  🧠 [SHUTDOWN] Deteniendo LearningEngine...")
+        learning_engine.stop()
+        await asyncio.sleep(0.5)
+
+    # FASE 1.4: Apagar executor antes de cerrar DB
+    if executor:
+        print("  🛑 [SHUTDOWN] Solicitando parada del executor...")
+        executor.stop()
+        # Dar tiempo al executor para abortar grids activos en Binance
+        await asyncio.sleep(1)
+        print("  ✅ [SHUTDOWN] Executor detenido")
+
+    if CONFIG.modo_auditoria and audit_logger:
+        await audit_logger.cerrar_seguimiento_todos()
+        await audit_logger.stop()
+
+    collector.stop()
+
+    # LEARNING ENGINE: cerrar DB de learning
+    if getattr(CONFIG, 'learning_enabled', False):
+        from learning_db import close_learning_db
+        await close_learning_db()
+
+
+app.router.lifespan_context = lifespan
+
+if __name__ == "__main__":
+    print("🚀 Iniciando Crypto Monitor V6.0 — Multi-Timeframe Sniper Dashboard + MFM...")
+    if CONFIG.modo_auditoria:
+        print(f"📋 MODO AUDITORÍA: Reportes a las {CONFIG.auditoria_hora_reporte} {CONFIG.timezone}")
+        print(f"📊 MODO MFM: Volumen inteligente con Money Flow Multiplier")
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
