@@ -84,6 +84,9 @@ class Config(BaseModel):
 
     # Rigor estadÃ­stico de la minerÃ­a (correcciÃ³n Â§3A)
     learning_min_lift: float = 1.5
+    # P2-3: significancia de ATR (desacoplado de learning_min_lift, que es un lift estadístico)
+    learning_atr_significance_mult: float = 1.5        # k × ATR% para "significativo"
+    learning_atr_significance_fallback_pct: float = 0.5  # fallback si no hay ATR
     learning_min_lift_lower: float = 1.2        # lÃ­mite inferior Wilson 95%
     learning_min_n: int = 40
     learning_fdr_q: float = 0.10                # Benjamini-Hochberg

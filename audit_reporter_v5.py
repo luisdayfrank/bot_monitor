@@ -269,7 +269,18 @@ class AuditReporter:
                 "direccion_real": nm.get('direccion_real'),
                 "acerto_bot": bool(nm.get('acerto_bot')),
                 "hubiera_sido_rentable": bool(nm.get('hubiera_sido_rentable')),
-                "notas": nm.get('notas')
+                "notas": nm.get('notas'),
+                # P1-2: contexto/economía que faltaban para el análisis NMI
+                "regime_4h": nm.get('regime_4h'),
+                "tipo_rechazo": nm.get('tipo_rechazo'),
+                "falso_negativo": bool(nm.get('falso_negativo')),
+                "ret_neto_pct": nm.get('ret_neto_pct'),
+                "costo_oportunidad_usdt": nm.get('costo_oportunidad_usdt'),
+                "breakeven_pct": nm.get('breakeven_pct'),
+                "katr_umbral": nm.get('katr_umbral'),
+                "significativo_katr": bool(nm.get('significativo_katr')),
+                "ret_neto_2h_pct": nm.get('ret_neto_2h_pct'),
+                "ret_neto_8h_pct": nm.get('ret_neto_8h_pct'),
             }
             # Parsear filtros de rechazo si existen
             if nm.get('filtros_rechazo'):
@@ -411,6 +422,7 @@ class AuditReporter:
                 "nota2": "acerto_bot=False -> El bot rechazo pero el precio SI siguio la direccion (falso negativo)",
                 "objetivo": "Maximizar precision_near_miss (minimizar falsos negativos)",
                 "como_medir": "Si precision_near_miss sube despues de Plan 3.1, los parametros adaptativos funcionan",
+                "nota3": "P2-4: precision_near_miss y tasa_oportunidad_perdida solo sobre near-misses direccionales (LONG/SHORT). Los NEUTRAL se reportan aparte (nm_neutrales_*). acerto_bot=None = no determinable.",
                 "metricas": metricas_exito
             },
             # FASE 2.1 FIX: Resumen agregado de grid neutral
@@ -853,21 +865,41 @@ class AuditReporter:
                 metricas['fire_evaluados'] = total
 
         # Near-miss precision = precision_bloqueo (replaces win_rate_rechazos)
+        # P2-4: separar direccionales (LONG/SHORT) de NEUTRAL — semánticas distintas:
+        #   LONG/SHORT acerto = el rechazo fue correcto (precio no siguió la dirección)
+        #   NEUTRAL    acerto = el precio se movió < 2% (mercado en rango)
         nm_finalizados = [nm for nm in nm_seguimientos if nm.get('timestamp_fin')]
         if nm_finalizados:
-            acertados = sum(1 for nm in nm_finalizados if nm.get('acerto_bot'))
-            precision = round(acertados / len(nm_finalizados) * 100, 1)
-            metricas['precision_near_miss'] = precision
-            # precision_bloqueo = mismo valor que win_rate_rechazos (nuevo nombre)
-            metricas['precision_bloqueo'] = precision
-            # win_rate_rechazos DEPRECATED - mismo valor para backward compat
-            metricas['win_rate_rechazos'] = precision
-            metricas['bot_acerto'] = acertados
-            metricas['bot_fallo'] = len(nm_finalizados) - acertados
+            direccionales = [nm for nm in nm_finalizados
+                             if nm.get('direccion_nm') in ('LONG', 'SHORT')
+                             and nm.get('acerto_bot') is not None]
+            neutrales = [nm for nm in nm_finalizados
+                         if nm.get('direccion_nm') == 'NEUTRAL'
+                         and nm.get('acerto_bot') is not None]
+
+            if direccionales:
+                acertados = sum(1 for nm in direccionales if nm.get('acerto_bot'))
+                precision = round(acertados / len(direccionales) * 100, 1)
+                metricas['precision_near_miss'] = precision
+                # precision_bloqueo = mismo valor que win_rate_rechazos (nuevo nombre)
+                metricas['precision_bloqueo'] = precision
+                # win_rate_rechazos DEPRECATED - mismo valor para backward compat
+                metricas['win_rate_rechazos'] = precision
+                metricas['bot_acerto'] = acertados
+                metricas['bot_fallo'] = len(direccionales) - acertados
+                metricas['nm_direccionales_evaluados'] = len(direccionales)
+            else:
+                metricas['precision_near_miss'] = None
+                metricas['precision_bloqueo'] = None
+                metricas['win_rate_rechazos'] = None
+
+            metricas['nm_neutrales_evaluados'] = len(neutrales)
+            metricas['nm_neutrales_acertados'] = sum(1 for nm in neutrales if nm.get('acerto_bot'))
 
             # F4.5: tasa_oportunidad_perdida = % de near-misses rentables rechazados
-            falsos_negativos = sum(1 for nm in nm_finalizados if nm.get('falso_negativo'))
-            total_nm = len(nm_finalizados)
+            # (solo sobre direccionales: para NEUTRAL no hay dirección de trade)
+            falsos_negativos = sum(1 for nm in direccionales if nm.get('falso_negativo'))
+            total_nm = len(direccionales)
             if total_nm > 0:
                 metricas['tasa_oportunidad_perdida'] = round(falsos_negativos / total_nm * 100, 1)
             else:

@@ -1526,6 +1526,43 @@ async def guardar_near_miss_seguimiento(symbol, timestamp_inicio, precio_inicio,
                 return None
     return None
 
+# ─── P0-1: Enriquecimiento de contexto y guard de dedupe a nivel DB ─────────
+
+async def actualizar_seguimiento_contexto(seguimiento_id, regime_4h=None, adx_15m=None,
+                                          rsi_15m=None, ema200_dist_pct=None,
+                                          tipo_rechazo=None, filtros_rechazo=None):
+    """Enriquece el contexto de un seguimiento sin sobrescribir valores ya guardados
+    (COALESCE). Usado por el dedupe de iniciar_seguimiento_near_miss y por el guard
+    MySQL cuando se detecta un seguimiento activo duplicado (P0-1)."""
+    await _execute_with_retry("""
+        UPDATE near_miss_seguimientos SET
+            regime_4h = COALESCE(?, regime_4h),
+            adx_15m = COALESCE(?, adx_15m),
+            rsi_15m = COALESCE(?, rsi_15m),
+            ema200_dist_pct = COALESCE(?, ema200_dist_pct),
+            tipo_rechazo = COALESCE(?, tipo_rechazo),
+            filtros_rechazo = COALESCE(?, filtros_rechazo)
+        WHERE id = ?
+    """, (regime_4h, adx_15m, rsi_15m, ema200_dist_pct, tipo_rechazo,
+          json.dumps(filtros_rechazo) if filtros_rechazo else None, seguimiento_id))
+
+
+async def cargar_near_miss_seguimiento_activo(symbol: str):
+    """P0-1 GUARD: devuelve el seguimiento activo (timestamp_fin IS NULL) más reciente
+    de un symbol, o None. Dedupe a nivel de DB para cerrar la ventana de arranque
+    entre start() y _recuperar_near_miss_activos()."""
+    async with _conexion() as db:
+        db.row_factory = Row
+        cursor = await db.execute("""
+            SELECT * FROM near_miss_seguimientos
+            WHERE symbol = ? AND timestamp_fin IS NULL
+            ORDER BY timestamp_inicio DESC
+            LIMIT 1
+        """, (symbol,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
 async def actualizar_near_miss_muestras(seguimiento_id, muestras_json, precio_max=None,
                                          precio_min=None, precio_fin=None):
     """Actualiza las muestras y precios extremos de un seguimiento activo."""
@@ -1562,7 +1599,7 @@ async def finalizar_near_miss_seguimiento(seguimiento_id, timestamp_fin, precio_
             ret_neto_2h_pct = ?, ret_neto_8h_pct = ?
         WHERE id = ?
     """, (timestamp_fin, precio_fin, movimiento_pct, direccion_real,
-          1 if acerto_bot else 0, 1 if hubiera_sido_rentable else 0, notas,
+          (None if acerto_bot is None else (1 if acerto_bot else 0)), 1 if hubiera_sido_rentable else 0, notas,
           ret_neto_pct, 1 if significativo_katr else 0, 1 if falso_negativo else 0,
           costo_oportunidad_usdt, breakeven_pct, katr_umbral,
           ret_neto_2h_pct, ret_neto_8h_pct, seguimiento_id))

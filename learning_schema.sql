@@ -440,6 +440,7 @@ CREATE TABLE IF NOT EXISTS near_miss_labels (
     
     -- Contexto de régimen y filtro (F1.4)
     regime TEXT NOT NULL,                        -- BEARISH|BULLISH|NEUTRAL
+    direction TEXT,                              -- P0-2: LONG | SHORT | NEUTRAL (desde MySQL direccion_nm)
     tipo_rechazo TEXT NOT NULL,                  -- ADX_EXTREMO|RSI_EXTREMO|MFM_BAJO|ATR_COMPRIMIDO|...
     adx_15m REAL,
     rsi_15m REAL,

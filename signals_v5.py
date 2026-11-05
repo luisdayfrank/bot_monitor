@@ -667,6 +667,7 @@ class SignalGenerator:
                     umbral=umbral_efectivo,
                     direccion=direction,
                     precio=i15.get('close', 0),
+                    filtros_rechazo=list(rechazos or []),
                     regime_4h=_regime_nm,
                     adx_15m=i15.get('adx'),
                     rsi_15m=i15.get('rsi'),
@@ -703,10 +704,14 @@ class SignalGenerator:
         _i15_ctx = self.indicadores_15m.get(symbol, {})
         _ema200_15m = _i15_ctx.get('ema200_15m')
         _ema200_dist_pct = ((price - _ema200_15m) / _ema200_15m) * 100.0 if _ema200_15m and price else 0.0
+        _atr_pct_15m = (atr / price * 100) if price > 0 else 0
         _bypass_ctx = {
-            'adx': adx, 'rsi': rsi, 'ema200_dist_pct': _ema200_dist_pct,
-            'atr_pct': (atr / price * 100) if price > 0 else 0,
+            # P2-1a: claves canónicas alineadas con near_miss_labels / _generar_bins_bypass
+            'adx_15m': adx, 'rsi_15m': rsi, 'ema200_dist_pct': _ema200_dist_pct,
+            'atr_pct_15m': _atr_pct_15m,
             'mfm': mfm, 'mfm_sma5': mfm_sma5,
+            # alias heredados (compatibilidad con reglas pre-fix con claves sin sufijo)
+            'adx': adx, 'rsi': rsi, 'atr_pct': _atr_pct_15m,
         }
 
         def _tal_vez_rechazar(codigo, mensaje, condicion):

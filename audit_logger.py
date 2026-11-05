@@ -2,26 +2,12 @@ import asyncio
 import json
 import numpy as np
 
-# FIX: Monkey-patch json.dumps para manejar tipos numpy en este módulo
-_original_json_dumps = json.dumps
-
-def _json_dumps_with_numpy(obj, **kwargs):
-    def default(o):
-        if isinstance(o, (np.bool_, bool)):
-            return bool(o)
-        if isinstance(o, (np.integer, np.int64, np.int32, np.int16, np.int8)):
-            return int(o)
-        if isinstance(o, (np.floating, np.float64, np.float32, np.float16)):
-            if np.isnan(o) or np.isinf(o):
-                return None
-            return float(o)
-        if isinstance(o, np.ndarray):
-            return o.tolist()
-        raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
-    kwargs.setdefault('default', default)
-    return _original_json_dumps(obj, **kwargs)
-
-json.dumps = _json_dumps_with_numpy
+# P3-2: centralizado en json_utils (antes: monkey-patch accidental de json.dumps aquí).
+# install_global_patch() es idempotente y conserva el comportamiento heredado para los
+# módulos no auditados (main.py, notifier_v5.py). Deuda de 1 línea: eliminar esta
+# llamada cuando esos módulos usen json_utils.dumps() explícito.
+import json_utils
+json_utils.install_global_patch()
 
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
@@ -35,6 +21,7 @@ from database_v5 import (
     # V5.7: Nuevas funciones para near-miss seguimiento
     guardar_near_miss_seguimiento, actualizar_near_miss_muestras,
     finalizar_near_miss_seguimiento, cargar_near_miss_seguimientos_activos,
+    actualizar_seguimiento_contexto, cargar_near_miss_seguimiento_activo,
     utc_to_local, now_utc, now_local
 )
 
@@ -295,19 +282,13 @@ class AuditLogger:
         async with self._buffer_lock:
             self._buffer_eventos.append(evento)
 
-        # V5.7: Iniciar seguimiento virtual persistente para near-misses de alto score
-        # F4.2: Cuando tipo == "SCORE_PASA_OTRO_FILTRO_NO", score_macro >= umbral es siempre
-        # True (el tier se asigna precisamente porque score >= umbral). Se simplifica.
-        if tipo == "SCORE_PASA_OTRO_FILTRO_NO":
-            await self.iniciar_seguimiento_near_miss(
-                symbol=symbol,
-                score=score_macro,
-                umbral=umbral,
-                direccion=direccion,
-                precio=contexto.get("precio", 0) if contexto else 0,
-                filtros_rechazo=detalle.get("rechazos", []) if detalle else [],
-                contexto=contexto
-            )
+        # P0-1a: ELIMINADA la creación interna del seguimiento virtual.
+        # La creación es responsabilidad ÚNICA del caller enriquecido
+        # (signals_v5._evaluar_near_misses), que sí dispone de regime_4h,
+        # adx_15m, rsi_15m, ema200_dist_pct y tipo_rechazo.
+        # La llamada interna anterior insertaba la fila SIN contexto y el dedupe
+        # de iniciar_seguimiento_near_miss descartaba la segunda llamada
+        # enriquecida (todas las filas quedaban con NULLs de contexto).
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # V5.7: METRICAS DIARIAS — Agregadas al cierre del dia
@@ -717,6 +698,52 @@ class AuditLogger:
                 minutos_desde_inicio = (ts_actual - existente["timestamp_utc"]).total_seconds() / 60
                 horas_seguimiento = CONFIG.auditoria_near_miss_horas
                 if minutos_desde_inicio < horas_seguimiento * 60:
+                    # P0-1c: enriquecer el seguimiento existente en vez de descartar
+                    # los datos de contexto (antes: return seco perdía regime_4h,
+                    # tipo_rechazo, adx/rsi/ema200_dist y filtros_rechazo).
+                    await actualizar_seguimiento_contexto(
+                        seguimiento_id=existente["seguimiento_id"],
+                        regime_4h=regime_4h, adx_15m=adx_15m, rsi_15m=rsi_15m,
+                        ema200_dist_pct=ema200_dist_pct, tipo_rechazo=tipo_rechazo,
+                        filtros_rechazo=filtros_rechazo)
+                    return
+
+            # P0-1 GUARD MySQL: dedupe a nivel de DB (1 query). Cierra la ventana de
+            # arranque (start → _recuperar_near_miss_activos) y el caso de crash con
+            # _near_miss_activos vacío: si ya existe un seguimiento SIN finalizar para
+            # este symbol dentro de la ventana, se enriquece en vez de insertar duplicado.
+            try:
+                activo_db = await cargar_near_miss_seguimiento_activo(symbol)
+            except Exception as e_guard:
+                print(f"  ⚠️ Guard MySQL near-miss ({symbol}): {e_guard}")
+                activo_db = None
+            if activo_db:
+                ts_activo = float(activo_db.get("timestamp_inicio") or 0)
+                if ts_actual.timestamp() - ts_activo < CONFIG.auditoria_near_miss_horas * 3600:
+                    await actualizar_seguimiento_contexto(
+                        seguimiento_id=activo_db["id"],
+                        regime_4h=regime_4h, adx_15m=adx_15m, rsi_15m=rsi_15m,
+                        ema200_dist_pct=ema200_dist_pct, tipo_rechazo=tipo_rechazo,
+                        filtros_rechazo=filtros_rechazo)
+                    # 3.1: adoptar el seguimiento en RAM — evita repetir la query del guard
+                    # en cada llamada y permite trackear/finalizar este seguimiento ahora.
+                    _muestras_db = json.loads(activo_db.get("muestras_json") or "[]")
+                    self._near_miss_activos[symbol] = {
+                        "seguimiento_id": activo_db["id"],
+                        "timestamp_utc": datetime.fromtimestamp(ts_activo, tz=pytz.UTC),
+                        "symbol": symbol,
+                        "score": activo_db.get("score"),
+                        "umbral": activo_db.get("umbral"),
+                        "direccion": activo_db.get("direccion_nm"),
+                        "precio_inicial": activo_db.get("precio_inicio"),
+                        "precio_maximo": activo_db.get("precio_max") or activo_db.get("precio_inicio"),
+                        "precio_minimo": activo_db.get("precio_min") or activo_db.get("precio_inicio"),
+                        "muestras": _muestras_db,
+                        "muestras_guardadas": len(_muestras_db),
+                        "filtros_rechazo": json.loads(activo_db.get("filtros_rechazo") or "[]"),
+                        "contexto_json": activo_db.get("contexto_json"),
+                    }
+                    print(f"  🛡 {symbol} Guard MySQL: seguimiento activo #{activo_db['id']} enriquecido y adoptado en RAM (sin duplicar)")
                     return
 
             # Guardar en MySQL/MariaDB con datos de régimen (F1.4)
@@ -908,7 +935,7 @@ class AuditLogger:
             ret_neto_trade_pct = 0.0
 
         # ── F1.2: significativo_katr = abs(ret_neto_pct) > k * ATR_15m_pct (k=1.5 default)
-        katr_umbral = getattr(CONFIG, 'learning_min_lift', 1.0)
+        katr_umbral = getattr(CONFIG, 'learning_atr_significance_mult', 1.5)
         atr_15m_pct = 0.0
         contexto_json = near_miss.get("contexto_json")
         if contexto_json:
@@ -919,7 +946,10 @@ class AuditLogger:
                     atr_15m_pct = atr_15m / precio_inicial * 100.0
             except Exception:
                 pass
-        significativo_katr = abs(ret_neto_trade_pct) > katr_umbral * atr_15m_pct if atr_15m_pct > 0 else abs(ret_neto_trade_pct) > 0.5
+        _fallback_sig = getattr(CONFIG, 'learning_atr_significance_fallback_pct', 0.5)
+        significativo_katr = (abs(ret_neto_trade_pct) > katr_umbral * atr_15m_pct
+                              if atr_15m_pct > 0
+                              else abs(ret_neto_trade_pct) > _fallback_sig)
 
         # ── F1.3: falso_negativo = el movimiento fue a favor de la dirección (neto de fees)
         falso_negativo = (ret_neto_trade_pct > 0) if direccion in ("LONG", "SHORT") else False
@@ -957,7 +987,7 @@ class AuditLogger:
         elif direccion == "SHORT":
             acerto = (ret_neto_trade_pct <= 0)
         else:
-            acerto = False
+            acerto = None  # P3-1: no determinable (dirección desconocida) → se guarda NULL
 
         # ── Costo de oportunidad (F1.1: fórmula explícita)
         notional_ref = getattr(CONFIG, 'trading_capital_max_usdt', 1000) * getattr(CONFIG, 'grid_default_leverage', 10) / getattr(CONFIG, 'grid_count', 10)
@@ -1022,8 +1052,8 @@ class AuditLogger:
                 costo_oportunidad_usdt=round(costo_oportunidad_usdt, 4),
                 breakeven_pct=round(fees_pct, 4),
                 katr_umbral=round(katr_umbral, 4),
-                ret_neto_2h_pct=round(ret_neto_trade_pct, 4),   # Proxy: mismo valor para 2h
-                ret_neto_8h_pct=round(ret_neto_trade_pct, 4),   # Proxy: mismo valor para 8h
+                ret_neto_2h_pct=round(ret_neto_trade_pct, 4),   # P2-2: ventana real (tracking = 2h)
+                ret_neto_8h_pct=None,   # P2-2: no calculable con tracking de 2h (sin proxy)
             )
         except Exception as e:
             print(f"  ⚠️ Error finalizando near-miss en DB {symbol}: {e}")
@@ -1046,7 +1076,7 @@ class AuditLogger:
             self._buffer_eventos.append(evento_final)
 
         rentable_icon = "✅" if rentable else "❌" if rentable is not None else "⚪"
-        acerto_icon = "✅" if acerto else "❌"
+        acerto_icon = "⚪" if acerto is None else ("✅" if acerto else "❌")
         print(f"  📊 {symbol} Seguimiento virtual NEAR-MISS finalizado | {rentable_icon} {resultados['conclusion']} | Mejor mov: {mejor_movimiento_pct:+.4f}% | Peor mov: {peor_movimiento_pct:+.4f}% | Bot acerto: {acerto_icon}")
 
     async def cerrar_seguimiento_near_miss_todos(self):

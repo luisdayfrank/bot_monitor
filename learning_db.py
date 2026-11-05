@@ -71,6 +71,48 @@ async def init_learning_db(db_path: str = "crypto_learning.db"):
         except Exception:
             pass  # indice ya existe
     await _run(_add_snapshot_id_col)
+    # P0-2: Añadir direction a near_miss_labels (idempotente para DBs existentes)
+    def _add_direction_col():
+        try:
+            _conn.execute("ALTER TABLE near_miss_labels ADD COLUMN direction TEXT")
+            _conn.commit()
+        except Exception:
+            pass  # columna ya existe
+    await _run(_add_direction_col)
+    # 3.2 (convención schema_versions §2.1): registrar el cambio de esquema
+    def _register_direction_version():
+        try:
+            _conn.execute(
+                "INSERT OR IGNORE INTO schema_versions "
+                "(componente, version, aplicado_utc, changelog, activo) "
+                "VALUES ('LABELER', 'v1.1_direction', ?, 'P0-2: columna direction en near_miss_labels', 1)",
+                (int(__import__('time').time() * 1000),))
+            _conn.commit()
+        except Exception:
+            pass  # ya registrado / tabla no disponible
+    await _run(_register_direction_version)
+    # P3-5: purga one-shot de bypass_rules pre-fix (reglas minadas con el bucket
+    # colapsado (UNKNOWN, NEUTRAL, DESCONOCIDO) — estadísticamente inválidas).
+    # Se ejecuta UNA vez (marcado en schema_versions); el bypass aprende limpio desde cero.
+    def _purgar_bypass_rules_legacy():
+        try:
+            ya = _conn.execute(
+                "SELECT 1 FROM schema_versions WHERE componente = 'PATTERNS' AND version = 'v1.1_bypass_purge'"
+            ).fetchone()
+            if ya:
+                return
+            n = _conn.execute("SELECT COUNT(*) FROM bypass_rules").fetchone()[0]
+            _conn.execute("DELETE FROM bypass_rules")
+            _conn.execute(
+                "INSERT OR IGNORE INTO schema_versions "
+                "(componente, version, aplicado_utc, changelog, activo) "
+                "VALUES ('PATTERNS', 'v1.1_bypass_purge', ?, 'P3-5: purga de bypass_rules pre-fix (bucket colapsado)', 1)",
+                (int(__import__('time').time() * 1000),))
+            _conn.commit()
+            print(f"  🧠 [LEARN-DB] P3-5: purgadas {n} bypass_rules inválidas (re-aprendizaje limpio)")
+        except Exception as e:
+            print(f"  ⚠️ P3-5 purga bypass_rules: {e}")
+    await _run(_purgar_bypass_rules_legacy)
     print(f"  🧠 [LEARN-DB] crypto_learning.db abierta ({db_path}) | journal_mode={modo}")
     return modo
 
@@ -402,7 +444,7 @@ async def guardar_near_miss_labels_batch(rows: list):
     if not rows:
         return 0
     cols = ['seguimiento_id', 'symbol', 'timestamp_inicio', 'timestamp_fin',
-            'regime', 'tipo_rechazo', 'adx_15m', 'rsi_15m', 'ema200_dist_pct',
+            'regime', 'direction', 'tipo_rechazo', 'adx_15m', 'rsi_15m', 'ema200_dist_pct',
             'ret_neto_2h_pct', 'ret_neto_8h_pct', 'mfe_neto_pct', 'mae_neto_pct',
             'breakeven_pct', 'katr_umbral', 'rentable_neto_2h', 'rentable_neto_8h',
             'bloqueo_correcto', 'falso_negativo', 'significativo_katr',

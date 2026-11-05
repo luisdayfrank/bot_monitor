@@ -934,14 +934,15 @@ class PatternLearner:
         import json as _json
 
         # Features a discretizar por régimen
-        feature_keys = ['adx_15m', 'rsi_15m', 'ema200_dist_pct', 'atr_pct_15m']
+        # P2-1b: 'atr_pct_15m' ELIMINADO — no es columna de near_miss_labels y el
+        # mining la descartaba en silencio (f.get(fk) → None → valores vacío → skip).
+        feature_keys = ['adx_15m', 'rsi_15m', 'ema200_dist_pct']
 
         # Definir bins por feature (umbrales típicos)
         bins_def = {
             'adx_15m': [25, 40, 50, 60],
             'rsi_15m': [25, 30, 70, 75],
             'ema200_dist_pct': [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0],
-            'atr_pct_15m': [0.1, 0.2, 0.3, 0.5],
         }
 
         # Generar condiciones combinando umbrales min/max por feature
@@ -2030,21 +2031,39 @@ class LearningEngine:
         return False
 
     def _match_bypass_condition(self, condition_json: str, context: dict) -> bool:
-        """Evalua condicion JSON contra contexto de features."""
+        """Evalua condicion JSON contra contexto de features.
+
+        P2-1c: acepta AMBOS formatos —
+          anidado: {"adx_15m": {"_min": 40, "_max": 60}}   (producido por _generar_bins_bypass)
+          plano:   {"adx_15m_min": 40}                      (formato heredado)
+        Conservador: feature ausente en contexto → no matchea (False).
+        """
         import json as _json
         try:
             cond = _json.loads(condition_json)
         except Exception:
             return False
         for key, threshold in cond.items():
-            feature = key.replace('_min', '').replace('_max', '')
-            value = context.get(feature)
-            if value is None:
-                return False
-            if '_min' in key and value < threshold:
-                return False
-            if '_max' in key and value > threshold:
-                return False
+            if isinstance(threshold, dict):
+                # Formato anidado: {feature: {_min: X, _max: Y}}
+                value = context.get(key)
+                if value is None:
+                    return False
+                for op, val in threshold.items():
+                    if op == "_min" and value < val:
+                        return False
+                    if op == "_max" and value > val:
+                        return False
+            else:
+                # Formato plano heredado: {feature_min: X}
+                feature = key.replace('_min', '').replace('_max', '')
+                value = context.get(feature)
+                if value is None:
+                    return False
+                if '_min' in key and value < threshold:
+                    return False
+                if '_max' in key and value > threshold:
+                    return False
         return True
 
     def _log_bypass_shadow(self, symbol: str, direction: str, regime: str,
@@ -2054,11 +2073,8 @@ class LearningEngine:
               f"regimen={regime} | condicion={rule.get('condition_json')} "
               f"win_rate={rule.get('win_rate'):.3f} n={rule.get('n_occurrences')}")
 
-    def _cargar_bypass_cache(self):
-        """Carga reglas activas de bypass_rules a _bypass_cache (llamado en entreno diario)."""
-        import asyncio
-        # Se carga de forma async desde SQLite en entreno_todo()
-        pass
+    # P3-3: eliminado _cargar_bypass_cache (stub sin efecto; la carga real de
+    # _bypass_cache ocurre inline en entrenar_todo).
 
     # ══════════════════════════════════════════════════════════════════════════
     # F1.6: NearMissOutcomeImporter — MySQL → SQLite (idempotente)
@@ -2100,13 +2116,14 @@ class LearningEngine:
                         "timestamp_inicio": int(r["timestamp_inicio"] * 1000),
                         "timestamp_fin": int(r["timestamp_fin"] * 1000) if r.get("timestamp_fin") else None,
                         "regime": r.get("regime_4h") or "NEUTRAL",
+                        "direction": r.get("direccion_nm"),
                         "tipo_rechazo": r.get("tipo_rechazo") or "DESCONOCIDO",
                         "adx_15m": r.get("adx_15m"),
                         "rsi_15m": r.get("rsi_15m"),
                         "ema200_dist_pct": r.get("ema200_dist_pct"),
-                        "ret_neto_2h_pct": r.get("ret_neto_pct"),
-                        "ret_neto_8h_pct": r.get("ret_neto_pct"),   # Proxy: mismo valor
-                        "mfe_neto_pct": r.get("ret_neto_pct"),       # Proxy
+                        "ret_neto_2h_pct": r.get("ret_neto_2h_pct"),
+                        "ret_neto_8h_pct": r.get("ret_neto_8h_pct"),  # NULL con tracking de 2h (P2-2, sin proxy)
+                        "mfe_neto_pct": r.get("ret_neto_pct"),        # Proxy documentado (MySQL sin MFE propio)
                         "mae_neto_pct": None,
                         "breakeven_pct": r.get("breakeven_pct"),
                         "katr_umbral": r.get("katr_umbral"),
