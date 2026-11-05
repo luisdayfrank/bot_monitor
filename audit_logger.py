@@ -697,7 +697,12 @@ class AuditLogger:
     async def iniciar_seguimiento_near_miss(self, symbol: str, score: int, umbral: int,
                                              direccion: str, precio: float,
                                              filtros_rechazo: list = None,
-                                             contexto: dict = None):
+                                             contexto: dict = None,
+                                             regime_4h: str = None,
+                                             adx_15m: float = None,
+                                             rsi_15m: float = None,
+                                             ema200_dist_pct: float = None,
+                                             tipo_rechazo: str = None):
         """
         Inicia seguimiento virtual persistente de un near-miss de alto score.
         Se guarda en MySQL/MariaDB para sobrevivir reinicios del bot.
@@ -706,17 +711,15 @@ class AuditLogger:
             return
 
         async with self._near_miss_lock:
-            # Evitar duplicados: si ya hay seguimiento para este simbolo, reemplazar solo si es mas reciente
             ts_actual = now_utc()
             if symbol in self._near_miss_activos:
                 existente = self._near_miss_activos[symbol]
                 minutos_desde_inicio = (ts_actual - existente["timestamp_utc"]).total_seconds() / 60
                 horas_seguimiento = CONFIG.auditoria_near_miss_horas
                 if minutos_desde_inicio < horas_seguimiento * 60:
-                    # Ya hay seguimiento activo, no duplicar
                     return
 
-            # Guardar en MySQL/MariaDB primero
+            # Guardar en MySQL/MariaDB con datos de régimen (F1.4)
             seguimiento_id = await guardar_near_miss_seguimiento(
                 symbol=symbol,
                 timestamp_inicio=ts_actual.timestamp(),
@@ -724,7 +727,12 @@ class AuditLogger:
                 direccion_nm=direccion,
                 score=score,
                 umbral=umbral,
-                filtros_rechazo=filtros_rechazo
+                filtros_rechazo=filtros_rechazo,
+                regime_4h=regime_4h,
+                adx_15m=adx_15m,
+                rsi_15m=rsi_15m,
+                ema200_dist_pct=ema200_dist_pct,
+                tipo_rechazo=tipo_rechazo
             )
 
             if not seguimiento_id:
@@ -892,7 +900,12 @@ class AuditLogger:
         # ── F1.3: Retorno del trade direccional (SHORT rentable = positivo)
         fees_pct = getattr(CONFIG, 'breakeven_taker_pct', 0.08)
         raw_ret_pct = (precio_salida - precio_inicial) / precio_inicial * 100.0
-        ret_neto_trade_pct = (1.0 if direccion == "LONG" else -1.0) * raw_ret_pct - fees_pct
+        if direccion == "LONG":
+            ret_neto_trade_pct = raw_ret_pct - fees_pct
+        elif direccion == "SHORT":
+            ret_neto_trade_pct = -raw_ret_pct - fees_pct
+        else:  # NEUTRAL no tiene direccion de trade
+            ret_neto_trade_pct = 0.0
 
         # ── F1.2: significativo_katr = abs(ret_neto_pct) > k * ATR_15m_pct (k=1.5 default)
         katr_umbral = getattr(CONFIG, 'learning_min_lift', 1.0)
@@ -909,7 +922,7 @@ class AuditLogger:
         significativo_katr = abs(ret_neto_trade_pct) > katr_umbral * atr_15m_pct if atr_15m_pct > 0 else abs(ret_neto_trade_pct) > 0.5
 
         # ── F1.3: falso_negativo = el movimiento fue a favor de la dirección (neto de fees)
-        falso_negativo = ret_neto_trade_pct > 0
+        falso_negativo = (ret_neto_trade_pct > 0) if direccion in ("LONG", "SHORT") else False
 
         # ── Métricas de rendimiento virtual (mantener compatibilidad con código existente)
         if direccion == "SHORT":
@@ -940,15 +953,15 @@ class AuditLogger:
         if direccion == "NEUTRAL":
             acerto = (abs(mejor_movimiento_pct) < 2.0)
         elif direccion == "LONG":
-            acerto = (direccion_real != "ALCISTA")
+            acerto = (ret_neto_trade_pct <= 0)
         elif direccion == "SHORT":
-            acerto = (direccion_real != "BAJISTA")
+            acerto = (ret_neto_trade_pct <= 0)
         else:
             acerto = False
 
         # ── Costo de oportunidad (F1.1: fórmula explícita)
         notional_ref = getattr(CONFIG, 'trading_capital_max_usdt', 1000) * getattr(CONFIG, 'grid_default_leverage', 10) / getattr(CONFIG, 'grid_count', 10)
-        costo_oportunidad_usdt = notional_ref * (ret_neto_trade_pct / 100.0) if falso_negativo else 0.0
+        costo_oportunidad_usdt = abs(notional_ref * ret_neto_trade_pct / 100.0) if falso_negativo else 0.0
 
         resultados = {
             "seguimiento_id": near_miss["seguimiento_id"],
