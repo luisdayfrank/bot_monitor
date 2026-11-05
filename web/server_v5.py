@@ -1416,8 +1416,14 @@ async def get_stats_learning_summary(request: Request, dias: int = 7):
 
 
 @app.get("/api/stats/near-miss-detail")
-async def get_stats_near_miss_detail(request: Request, dias: int = 7, symbol: str = None):
-    """Detalle de near_miss_labels con falso_negativo, costo oportunidad, régimen."""
+async def get_stats_near_miss_detail(request: Request, dias: int = 7, symbol: str = None,
+                                     solo_fn: bool = True):
+    """Detalle de near_miss_labels con falso_negativo, costo oportunidad, régimen.
+
+    P1-1: expone `direction` y `tipo_rechazo AS rejected_filter` (los nombres que
+    espera el frontend). Con solo_fn=True (default) `data` solo trae falsos
+    negativos — la tabla se llama "Oportunidades Perdidas (Falsos Negativos)".
+    """
     try:
         ts_corte = int(time.time() * 1000) - dias * 86400_000
         params = [ts_corte]
@@ -1431,7 +1437,8 @@ async def get_stats_near_miss_detail(request: Request, dias: int = 7, symbol: st
             conn = ldb._get_conn()
             query = f"""
                 SELECT seguimiento_id, symbol, timestamp_inicio, timestamp_fin,
-                       regime, tipo_rechazo, adx_15m, rsi_15m, ema200_dist_pct,
+                       regime, direction, tipo_rechazo AS rejected_filter,
+                       adx_15m, rsi_15m, ema200_dist_pct,
                        ret_neto_2h_pct, ret_neto_8h_pct, rentable_neto_2h,
                        rentable_neto_8h, bloqueo_correcto, falso_negativo,
                        significativo_katr, costo_oportunidad_usdt, created_at
@@ -1463,15 +1470,21 @@ async def get_stats_near_miss_detail(request: Request, dias: int = 7, symbol: st
         falsos_neg = sum(1 for r in result if r.get("falso_negativo_bool"))
         costo_total = sum(float(r.get("costo_oportunidad_usdt") or 0) for r in result)
 
+        # P1-1: la tabla "Oportunidades Perdidas" solo muestra falsos negativos.
+        # El resumen (total/falsos_neg/tasa/costo) se mantiene sobre todas las
+        # filas de la ventana para no romper los contadores del dashboard.
+        data = [r for r in result if r.get("falso_negativo_bool")] if solo_fn else result
+
         return {
             "estado": "success",
             "dias": dias,
             "symbol": symbol,
+            "solo_fn": solo_fn,
             "total": total_nm,
             "falsos_negativos": falsos_neg,
             "tasa_oportunidad_perdida": round((falsos_neg / total_nm * 100), 2) if total_nm > 0 else 0,
             "costo_oportunidad_total_usdt": round(costo_total, 4),
-            "data": result,
+            "data": data,
         }
     except Exception as e:
         logger.error(f"Error near-miss-detail: {e}")
