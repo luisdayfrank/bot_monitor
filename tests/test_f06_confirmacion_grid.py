@@ -18,6 +18,25 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from signals_v5 import SignalGenerator  # noqa: E402
 
 
+def _ensure_symbol(sg, sym):
+    """Registra un simbolo ficticio (TESTUSDT) en todos los dicts del sg.
+
+    SignalGenerator.__init__ solo crea entradas para CONFIG.symbols; el test
+    usa TESTUSDT que no esta en el registry -> KeyError al primer acceso.
+    """
+    from signals_v5 import SignalState
+    if sym not in sg.states:
+        sg.states[sym] = SignalState()
+    if sym not in sg._atr_historico:
+        sg._atr_historico[sym] = []
+    if sym not in sg._atr15m_historico:
+        sg._atr15m_historico[sym] = []
+    if sym not in sg._rango_reciente:
+        sg._rango_reciente[sym] = {'highs': [], 'lows': []}
+    if sym not in sg._historial_1m:
+        sg._historial_1m[sym] = []
+
+
 class FakeExecutor:
     """Simula el executor (B5: usa signal_states, no signal_generator)."""
 
@@ -49,6 +68,7 @@ def nuevo_signals(executor=None):
 
 
 def preparar_disparo(sg, sym='TESTUSDT'):
+    _ensure_symbol(sg, sym)
     sg.indicadores_15m[sym] = {
         'timestamp': 1794000000000, 'close': 100.0, 'rsi': 30.0,
         'adx': 30.0, 'atr': 0.5, 'score_macro': 85,
@@ -134,6 +154,7 @@ async def test_fire_con_grid_ok():
 
 async def test_cooldown_15m_real():
     sg = nuevo_signals(None)
+    _ensure_symbol(sg, 'TESTUSDT')
     st = sg.states['TESTUSDT']
     sg.indicadores_15m['TESTUSDT'] = {'timestamp': 1794000000000}
 
@@ -170,10 +191,15 @@ async def test_cooldown_15m_real():
 
 
 async def main():
-    await test_fire_sin_grid_no_bucle()
-    await test_fire_con_grid_ok()
-    await test_cooldown_15m_real()
-    print('RESULTADO: PASS (3/3)')
+    from learning_db import init_learning_db, close_learning_db
+    await init_learning_db(':memory:')
+    try:
+        await test_fire_sin_grid_no_bucle()
+        await test_fire_con_grid_ok()
+        await test_cooldown_15m_real()
+        print('RESULTADO: PASS (3/3)')
+    finally:
+        await close_learning_db()
 
 
 if __name__ == '__main__':
