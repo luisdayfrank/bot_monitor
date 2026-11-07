@@ -60,6 +60,18 @@ class SignalState:
         # FASE 1.2: Debounce de abortos al executor
         self._aborto_enviado_ts = 0
 
+        # F0.6.A: cooldown real de 15 min (ms epoch). 0 = sin cooldown armado.
+        self.cooldown_hasta = 0
+
+        # F0.6.B: confirmacion de grid (Executor -> Signals)
+        self.esperando_grid_ok = False
+        self.grid_creado_ok = None
+        self.grid_creado_motivo = None
+        self.grid_creado_ts = 0          # time.time() (segundos)
+        self.grid_fallos_consecutivos = 0
+        self.grid_pausa_hasta = 0        # time.time() (segundos)
+        self.fire_payload = None         # I24-A: contextos/prob para emitir al confirmar
+
         # FASE 5.5: Metricas diarias acumuladas
         self.metricas_dia: dict = {
             'score_max': 0,
@@ -1562,6 +1574,125 @@ class SignalGenerator:
         i15 = self.indicadores_15m.get(symbol, {})
         timestamp_15m_actual = i15.get('timestamp', 0)
 
+        # ── F0.6.B: CONFIRMACION DE GRID (Executor -> Signals) ─────────────
+        # Mientras esperamos no se procesa la maquina normal. Timeout 30s.
+        if state.esperando_grid_ok:
+            elapsed = time.time() - state.grid_creado_ts
+            if elapsed > 30:
+                state.grid_creado_ok = False
+                state.grid_creado_motivo = 'timeout_sin_confirmacion'
+                state.esperando_grid_ok = False
+                print(f"  [F0.6] {symbol} timeout esperando grid ({elapsed:.0f}s)")
+            else:
+                return
+
+        if state.grid_creado_ok is not None:
+            _motivo_fallo = state.grid_creado_motivo or 'sin_detalle'
+            _ts_fire = state.ultimo_disparo_timestamp_15m
+            if state.estado == 'FIRE':
+                if state.grid_creado_ok:
+                    # ── OK: emitir lo diferido (I24-A) y transicionar ──
+                    payload = state.fire_payload or {}
+                    _pdir = payload.get('direction') or state.ultima_direccion
+                    _pprice = payload.get('price') or state.ultimo_disparo_precio
+                    _pscore = payload.get('score') or state.ultimo_score
+                    _pparams = payload.get('params') or state.ultimos_params or {}
+                    if self.audit_logger and payload:
+                        try:
+                            await self.audit_logger.log_fire(
+                                symbol=symbol, direccion=_pdir, precio=_pprice,
+                                contexto_1m=payload.get('contexto_1m', {}),
+                                contexto_15m=payload.get('contexto_15m', {}),
+                                contexto_4h=payload.get('contexto_4h', {}),
+                                grid_params=_pparams, score_disparo=_pscore)
+                        except Exception as e_aud:
+                            print(f"  [F0.6] log_fire {symbol}: {e_aud}")
+                    try:
+                        await self.emitir_alerta(symbol, 'FIRE', _pdir, _pscore, [], _pparams, _pprice)
+                    except Exception as e_alert:
+                        print(f"  [F0.6] alerta FIRE {symbol}: {e_alert}")
+                    # F0.3: predictions_log SOLO FIREs reales (modo ACTIVE)
+                    if (self.learning_engine is not None and
+                            getattr(CONFIG, 'learning_apply_mode', 'OFF') == 'ACTIVE' and
+                            payload.get('prob') is not None):
+                        try:
+                            self.learning_engine.log_prediccion(
+                                symbol=symbol, timestamp_15m=_ts_fire,
+                                prob=payload.get('prob'), decision_sugerida='FIRE',
+                                decision_tomada='FIRE', modo='ACTIVE',
+                                direction=_pdir, score_macro=state.score_macro_actual,
+                                regime=payload.get('regime'))
+                        except Exception as e_pred:
+                            print(f"  [F0.6] log_prediccion {symbol}: {e_pred}")
+                    state.estado = 'COOLDOWN'
+                    state.cooldown_hasta = int(datetime.now(pytz.UTC).timestamp() * 1000) + 900_000
+                    state.grid_fallos_consecutivos = 0
+                    print(f"  [ESTADO] {symbol} -> COOLDOWN (grid confirmado OK, cooldown 15m)")
+                else:
+                    # ── FALLO: revertir, auditar, desmarcar, pausar tras 3 ──
+                    state.estado = 'MONITOREO'
+                    state.filtro_macro_aprobado = False
+                    state.direccion_filtro = None
+                    state.armed_timestamp = 0
+                    state.ultimo_disparo_timestamp_15m = 0   # permitir retry legitimo
+                    state.ultimo_disparo_evaluado = True     # I25: CB no cuenta fantasma
+                    state.grid_fallos_consecutivos += 1
+                    # B7: limpiar debounce en AMBOS dicts
+                    self._grid_pending_creation.pop(symbol, None)
+                    if hasattr(self, 'executor') and self.executor:
+                        try:
+                            self.executor._grid_pending_creation.pop(symbol, None)
+                        except Exception:
+                            pass
+                    print(f"  [F0.6] {symbol} FIRE -> MONITOREO "
+                          f"(grid rechazado: {_motivo_fallo})")
+                    if self.audit_logger:
+                        try:
+                            await self.audit_logger.log_rechazado(
+                                symbol=symbol,
+                                direccion=state.ultima_direccion or 'NEUTRAL',
+                                precio=state.ultimo_disparo_precio or 0,
+                                contexto_1m=self.indicadores_1m.get(symbol, {}),
+                                rechazos=[f"executor: {_motivo_fallo}"],
+                                score_macro=state.score_macro_actual)
+                        except Exception as e_aud:
+                            print(f"  [F0.6] log_rechazado {symbol}: {e_aud}")
+                    # B8-A: desmarcar snapshot FIRE (el grid no existio)
+                    try:
+                        import learning_db as _ldb
+                        def _desmarcar(sym=symbol, ts=_ts_fire):
+                            conn = _ldb._get_conn()
+                            conn.execute(
+                                "UPDATE feature_snapshots SET evento_asociado = NULL, "
+                                "evento_id = NULL WHERE symbol = ? AND timestamp_15m = ? "
+                                "AND evento_asociado = 'FIRE'", (sym, ts))
+                            conn.commit()
+                        await _ldb._run(_desmarcar)
+                    except Exception as e_unmark:
+                        print(f"  [F0.6] desmarcar FIRE {symbol}: {e_unmark}")
+                    # Pausa 30 min tras 3 fallos (B6: escape via notifier)
+                    if state.grid_fallos_consecutivos >= 3:
+                        state.grid_pausa_hasta = time.time() + 1800
+                        print(f"  [F0.6-PAUSA] {symbol} 3 fallos consecutivos -> 30 min")
+                        notifier = getattr(self, 'notifier', None)
+                        if notifier:
+                            try:
+                                _motivo_safe = (notifier._escape_html(str(_motivo_fallo))
+                                                if hasattr(notifier, '_escape_html')
+                                                else str(_motivo_fallo))
+                                await notifier.enviar_telegram(
+                                    f"⛔ <b>{symbol} BLOQUEADO 30 min</b>\n"
+                                    f"3 FIREs rechazados por el executor:\n"
+                                    f"<code>{_motivo_safe}</code>")
+                            except Exception:
+                                pass
+            # I22: limpiar flags en TODOS los caminos
+            state.grid_creado_ok = None
+            state.grid_creado_motivo = None
+            state.esperando_grid_ok = False
+            state.fire_payload = None
+            return
+
         if state.moneda_pausada or state.moneda_pausada_manual:
             if state.estado != 'MONITOREO':
                 estado_anterior_log = state.estado
@@ -1681,18 +1812,26 @@ class SignalGenerator:
         estado_anterior_log = state.estado
 
         if state.estado == 'COOLDOWN':
-            if timestamp_15m_actual != state.ultimo_disparo_timestamp_15m:
+            # F0.6.A (I27/I28): 15 min reales desde la confirmacion del grid.
+            # I40: si cooldown_hasta==0 (COOLDOWN forzado por circuit breaker)
+            # se conserva la condicion original por timestamp (no romper CB).
+            ahora_ms = int(datetime.now(pytz.UTC).timestamp() * 1000)
+            if state.cooldown_hasta > 0:
+                _cooldown_ok = ahora_ms >= state.cooldown_hasta
+            else:
+                _cooldown_ok = timestamp_15m_actual != state.ultimo_disparo_timestamp_15m
+            if _cooldown_ok:
                 if state.filtro_macro_aprobado:
                     state.estado = 'ARMED'
                     state.velas_confirmacion = 0
                     state.armed_timestamp = int(datetime.now(pytz.UTC).timestamp() * 1000)
-                    print(f"  [ESTADO] {symbol} -> ARMED (nueva vela 15m, filtro activo)")
+                    print(f"  [ESTADO] {symbol} -> ARMED (cooldown cumplido, filtro activo)")
                 else:
                     state.estado = 'MONITOREO'
                     state.velas_confirmacion = 0
                     state.direccion_filtro = None
                     state.armed_timestamp = 0
-                    print(f"  [ESTADO] {symbol} -> MONITOREO (nueva vela 15m, filtro perdido)")
+                    print(f"  [ESTADO] {symbol} -> MONITOREO (cooldown cumplido, filtro perdido)")
             return
 
         if state.estado == 'MONITOREO':
@@ -1811,6 +1950,9 @@ class SignalGenerator:
             return
         if state.estado != 'ARMED':
             return
+        # F0.6.6: pausa tras 3 FIREs rechazados por el executor
+        if state.grid_pausa_hasta > time.time():
+            return
         if not state.filtro_macro_aprobado or not state.direccion_filtro:
             return
 
@@ -1901,6 +2043,9 @@ class SignalGenerator:
         # Se evalúa ANTES de mutar state.estado='FIRE' y antes de log_fire:
         # un rechazo aquí deja la máquina de estados intacta y registra
         # RECHAZADO (no FIRE+RECHAZADO contradictorios).
+        _prob = None
+        _feats = {'regime': (self.learning_engine.regime_cls.regimen_actual.get(symbol, 'RANGE')
+                             if self.learning_engine is not None else 'RANGE')}
         if (self.learning_engine is not None and
                 getattr(CONFIG, 'learning_apply_mode', 'OFF') == 'ACTIVE'):
             try:
@@ -1944,6 +2089,18 @@ class SignalGenerator:
         state.ultimo_disparo_direccion = direction
         state.ultimo_disparo_evaluado = False
 
+        # F0.2: marcar snapshot con evento FIRE (decision de senal).
+        # I24-A: log_fire/alerta/log_prediccion se difieren a la confirmacion
+        # del grid (F0.6.B); esto SOLO marca el snapshot.
+        if self.learning_engine is not None:
+            try:
+                self.learning_engine.collector.marcar_evento(
+                    symbol=symbol, tipo='FIRE',
+                    evento_id=state.ultimo_disparo_timestamp_15m,
+                    timestamp_15m=i15.get('timestamp', 0))
+            except Exception as e:
+                print(f"  [LEARN] marcar FIRE {symbol}: {e}")
+
         score_min_usado = self._calcular_umbral_dinamico(symbol)
         umbral_info = f" | Umbral: {score_min_usado}" if score_min_usado != self.SCORE_DISPARO_MIN else ""
 
@@ -1952,8 +2109,20 @@ class SignalGenerator:
         else:
             print(f"  [FIRE] {symbol} -> FIRE ({direction}) | Score: {score}{umbral_info} | Grid: {params['grid_count']} lineas")
 
-        if self.audit_logger:
-            contexto_1m = {
+        # FASE 6 FIX: Doble candado para FIRE (nunca emitir params=None)
+        if params is None:
+            params = {}
+
+        # I24-A: NO emitir log_fire/alerta/log_prediccion aqui. Se difieren a
+        # la confirmacion del grid (rama OK de F0.6.B). Se guarda el payload.
+        state.fire_payload = {
+            'direction': direction,
+            'price': price,
+            'score': score,
+            'params': params,
+            'prob': _prob,
+            'regime': _feats.get('regime'),
+            'contexto_1m': {
                 'rsi_7': i1m.get('rsi_7'),
                 'ema_300': i1m.get('ema_300'),
                 'close': i1m.get('close'),
@@ -1967,10 +2136,9 @@ class SignalGenerator:
                 'atr_1m': i1m.get('atr_1m'),
                 'mecha_valida_short': i1m.get('mecha_valida_short'),
                 'mecha_valida_long': i1m.get('mecha_valida_long'),
-                'ema300_distancia_pct': i1m.get('ema300_distancia_pct')
-            }
-
-            contexto_15m = {
+                'ema300_distancia_pct': i1m.get('ema300_distancia_pct'),
+            },
+            'contexto_15m': {
                 'rsi': i15.get('rsi'),
                 'adx': i15.get('adx'),
                 'macd_hist': i15.get('macd_hist'),
@@ -1982,36 +2150,28 @@ class SignalGenerator:
                 'recent_high': i15.get('recent_high'),
                 'recent_low': i15.get('recent_low'),
                 'mfm_15m': i15.get('mfm_15m'),
-                'mfm_sma5': i15.get('mfm_sma5')
-            }
-
-            contexto_4h = {
+                'mfm_sma5': i15.get('mfm_sma5'),
+            },
+            'contexto_4h': {
                 'ema200_4h': i4h.get('ema200_4h'),
-                'close': i4h.get('close')
-            }
+                'close': i4h.get('close'),
+            },
+        }
 
-            await self.audit_logger.log_fire(
-                symbol=symbol,
-                direccion=direction,
-                precio=price,
-                contexto_1m=contexto_1m,
-                contexto_15m=contexto_15m,
-                contexto_4h=contexto_4h,
-                grid_params=params,
-                score_disparo=score
-            )
-
-        # FASE 6 FIX: Doble candado para FIRE (nunca emitir params=None)
-        if params is None:
-            params = {}
-        await self.emitir_alerta(symbol, 'FIRE', direction, score, [], params, price)
-
-        # ═══════════════════════════════════════════════════════════════════════════════
-        # FASE 1: Ejecutar en testnet/real (solo LONG por ahora)
-        # ═══════════════════════════════════════════════════════════════════════════════
+        # FASE 1: Ejecutar en testnet/real (solo LONG/SHORT)
         if (CONFIG.trading_mode in ('TESTNET', 'REAL') and
             direction in ('LONG', 'SHORT') and
             hasattr(self, 'executor') and self.executor):
+            # B7: permitir un retry legitimo (limpiar debounce del executor)
+            try:
+                self.executor._grid_pending_creation.pop(symbol, None)
+            except Exception:
+                pass
+            # F0.6.B: esperar confirmacion; NO transicionar a COOLDOWN aqui
+            state.esperando_grid_ok = True
+            state.grid_creado_ok = None
+            state.grid_creado_motivo = None
+            state.grid_creado_ts = time.time()
             try:
                 await self.executor.queue.put({
                     'tipo': 'CREAR_GRID',
@@ -2020,15 +2180,20 @@ class SignalGenerator:
                     'params': params,
                     'price': price
                 })
-                print(f"  [FASE 1] {symbol} Grid LONG enviado al executor ({CONFIG.trading_mode})")
+                print(f"  [FASE 1] {symbol} CREAR_GRID encolado, esperando confirmacion...")
             except Exception as e:
-                print(f"  ⚠️ [FASE 1] Executor error (no crítico): {e}")
+                # I19/I22: fallo de enqueue -> rechazo inmediato (sin bucle)
+                state.esperando_grid_ok = False
+                state.grid_creado_ok = False
+                state.grid_creado_motivo = f'enqueue_error: {e}'
+                print(f"  [FASE 1] {symbol} error enqueue: {e}")
+            return
 
-        await asyncio.sleep(0.1)
+        # I19: sin executor (learning-only) o direccion no LONG/SHORT:
+        # comportamiento actual + cooldown real (F0.6.A / I27)
         state.estado = 'COOLDOWN'
-        await asyncio.sleep(0.1)
-        state.estado = 'COOLDOWN'
-        print(f"  [ESTADO] {symbol} -> COOLDOWN")
+        state.cooldown_hasta = int(datetime.now(pytz.UTC).timestamp() * 1000) + 900_000
+        print(f"  [ESTADO] {symbol} -> COOLDOWN (sin executor, cooldown 15m)")
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # CALCULO DE PARAMETROS DEL GRID

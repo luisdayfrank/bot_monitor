@@ -351,6 +351,7 @@ class GridExecutor:
         self._grid_creation_locks: Dict[str, asyncio.Lock] = {}
         # V7.1 FASE 4: Debounce interno para evitar spam de CREAR_GRID
         self._grid_pending_creation: Dict[str, float] = {}
+        self._ultimo_rechazo: Dict[str, str] = {}   # F0.6.B: motivo del ultimo rechazo
         # HEDGE MODE: Detección y helpers
         self._hedge_mode: bool = False  # Se detecta al arrancar
         # P5 FIX: Órdenes que el propio bot canceló (E.2/E.3/E.5/kill switch).
@@ -2234,6 +2235,7 @@ class GridExecutor:
             # Doble verificación DENTRO del lock
             if symbol in self._grids and self._grids[symbol].activa:
                 print(f"  ⚠️ [EXECUTOR] {symbol} Ya hay grid activo, rechazando nuevo")
+                self._ultimo_rechazo[symbol] = 'grid_ya_activo'
                 return
 
             # V7.1 FASE 1: Verificación CRÍTICA de órdenes huérfanas en Binance
@@ -2249,9 +2251,11 @@ class GridExecutor:
                         limpieza_ok = await self._cancelar_ordenes_huérfanas(symbol, huerfanas)
                         if not limpieza_ok:
                             print(f"  🚨 [V7.1] {symbol} CREACIÓN ABORTADA: huérfanas persistentes tras limpieza.")
+                            self._ultimo_rechazo[symbol] = 'huerfanas_persistentes'
                             return
                 except Exception as e:
                     print(f"  ⚠️ [V7.1] {symbol} Error limpiando huérfanas: {e}")
+                    self._ultimo_rechazo[symbol] = 'huerfanas_error_limpieza'
                     return
 
             # 1. Calcular leverage adaptativo
@@ -2261,6 +2265,7 @@ class GridExecutor:
             )
             if not leverage:
                 await self._notificar_rechazo(symbol, "No alcanza notional mínimo ni con max leverage")
+                self._ultimo_rechazo[symbol] = 'leverage_no_viable'
                 return
 
             # FASE SIZING: Usar parámetros de signals para consistencia Telegram↔bot.
@@ -2289,6 +2294,7 @@ class GridExecutor:
             try:
                 await self._cambiar_leverage(symbol, leverage)
             except Exception:
+                self._ultimo_rechazo[symbol] = 'cambiar_leverage_error'
                 return
 
             # 4. Generar niveles y qty
@@ -2297,11 +2303,13 @@ class GridExecutor:
             if len(niveles) < 3:
                 print(f"  ❌ [EXECUTOR] {symbol} Grid {direction} rechazado: solo {len(niveles)} niveles únicos")
                 await self._notificar_rechazo(symbol, f"Grid inválido: {len(niveles)} niveles únicos")
+                self._ultimo_rechazo[symbol] = 'niveles_insuficientes'
                 return
 
             # V7.1 FASE 3: Validar integridad de niveles
             if not self._validar_integridad_niveles(niveles, symbol, int(params['grid_count'])):
                 await self._notificar_rechazo(symbol, "Niveles colapsados por tick_size")
+                self._ultimo_rechazo[symbol] = 'niveles_colapsados'
                 return
 
             info = self._get_symbol_info(symbol)
@@ -2326,6 +2334,7 @@ class GridExecutor:
             )
             if not grid_id:
                 print(f"  ❌ [EXECUTOR] {symbol} No se pudo guardar grid en DB")
+                self._ultimo_rechazo[symbol] = 'guardado_db_fallo'
                 return
 
             # 6. Generar órdenes LIMIT
@@ -2365,6 +2374,7 @@ class GridExecutor:
             # 8. Verificar que se guardaron órdenes
             if not order_ids_guardados:
                 print(f"  ❌ [EXECUTOR] {symbol} Grid {direction} FALLÓ: 0 órdenes guardadas")
+                self._ultimo_rechazo[symbol] = 'batch_ordenes_fallo'
                 # V7.1: Marcar DB como abortado si el batch falló
                 await actualizar_grid_ejecucion_cierre(
                     grid_id=grid_id, estado='ABORTADO', pnl_real=0, fees_real=0,
@@ -5789,23 +5799,47 @@ class GridExecutor:
                     tiempo_desde_ultimo = ahora - self._grid_pending_creation[symbol]
                     if tiempo_desde_ultimo < 60:
                         print(f"  ⚠️ [V7.1] {symbol} Debounce activo: {tiempo_desde_ultimo:.0f}s < 60s. Ignorando CREAR_GRID.")
+                        await self._notificar_resultado_grid(symbol, False, 'debounce_activo')
                         return
                 self._grid_pending_creation[symbol] = ahora   # ← REGISTRADO AQUÍ
 
-            if direction == 'LONG':
-                await self._crear_grid_long(
-                    msg['symbol'], msg['params'], msg['price']
-                )
-            elif direction == 'SHORT':
-                await self._crear_grid_short(
-                    msg['symbol'], msg['params'], msg['price']
-                )
-            elif direction == 'NEUTRAL':
-                await self._crear_grid_neutral(
-                    msg['symbol'], msg['params'], msg['price']
-                )
+            try:
+                if direction == 'LONG':
+                    await self._crear_grid_long(
+                        msg['symbol'], msg['params'], msg['price']
+                    )
+                elif direction == 'SHORT':
+                    await self._crear_grid_short(
+                        msg['symbol'], msg['params'], msg['price']
+                    )
+                elif direction == 'NEUTRAL':
+                    # F0.6.7 (NEUTRAL) en P2: sin notificacion; flujo intacto.
+                    await self._crear_grid_neutral(
+                        msg['symbol'], msg['params'], msg['price']
+                    )
+            except Exception as e:
+                print(f"  [EXECUTOR] {symbol} excepcion creando grid: {e}")
+                self._ultimo_rechazo[symbol] = f'excepcion: {type(e).__name__}'
+            finally:
+                # I39: ok=True SOLO si el grid quedo activo en RAM
+                if direction in ('LONG', 'SHORT'):
+                    st = self._grids.get(symbol)
+                    ok = bool(st and st.activa)
+                    motivo = '' if ok else self._ultimo_rechazo.pop(symbol, 'rechazo_sin_motivo')
+                    await self._notificar_resultado_grid(symbol, ok, motivo)
         elif tipo == 'ABORTAR_GRID':
             await self._abortar_grid(msg['symbol'], msg.get('razon', 'aborto_manual'))
 
     async def _notificar_rechazo(self, symbol: str, razon: str):
         print(f"  ❌ [EXECUTOR] {symbol} Grid rechazado: {razon}")
+
+    async def _notificar_resultado_grid(self, symbol: str, ok: bool, motivo: str = ''):
+        """F0.6.B (B5): notifica a signals el resultado real de crear el grid."""
+        st = self.signal_states.get(symbol) if getattr(self, 'signal_states', None) else None
+        if st is None:
+            return
+        st.grid_creado_ok = ok
+        st.grid_creado_motivo = motivo
+        st.esperando_grid_ok = False
+        print(f"  [EXECUTOR->SIGNALS] {symbol} grid "
+              f"{'OK' if ok else 'RECHAZADO: ' + motivo}")

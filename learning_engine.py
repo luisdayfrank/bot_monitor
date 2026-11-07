@@ -852,25 +852,33 @@ class PatternLearner:
 
     # ── F2.2: Minería de reglas de bypass por régimen (Wilson CI) ──
     async def minar_bypasses(self, min_samples: int = 30,
-                             min_wilson_lower: float = 0.55) -> list:
+                             min_wilson_lower: float = 0.55,
+                             min_lift: float = 1.5,
+                             max_fnr_baseline: float = 0.5) -> list:
         """
-        Para cada (direction, regime, rejected_filter) en near_miss_labels con falso_negativo=1:
-        1. Discretizar features clave en bins (ADX, RSI, EMA200_dist, ATR_pct)
-        2. Para cada combinacion de bins: calcular n, win_rate, Wilson CI
-        3. Si n >= min_samples AND wilson_lower >= min_wilson_lower -> candidato
-        4. Seleccionar mejor condicion por (direction, regime, rejected_filter)
-        5. Guardar en tabla bypass_rules de SQLite
-        """
-        import json as _json
+        F0.1: minera con baseline + lift (antes solo FN -> win_rate == 1.0).
 
-        rows = await ldb.cargar_near_miss_labels_falsos_negativos()
-        if not rows:
-            print("  🧠 [BYPASS] Sin near_miss_labels con falso_negativo=1 para minar")
+        Carga TODOS los labels (FN + OK) de los ultimos 90 dias:
+          1. Baseline global p_base = P(falso_negativo)
+          2. Por (direction, regime, tipo_rechazo) y bin de features:
+             p_fn = P(FN | bin), lift = p_fn / p_base, Wilson sobre (n_fn, n_bin)
+          3. Acepta si: lo > p_base*1.1 AND lo >= min_wilson_lower
+             AND lift >= min_lift            (I34-A)
+          4. Mejor bin por clave (I35-B); guarda en bypass_rules (is_active=0)
+
+        max_fnr_baseline se conserva en la firma (plan literal, sin uso).
+        """
+        rows = await ldb.cargar_near_miss_labels_todas()
+        if len(rows) < min_samples * 2:
+            print("  [BYPASS] F0.1: sin labels (FN+OK) suficientes para minar")
             return []
 
+        # Baseline global de FNR
+        total_fn = sum(1 for r in rows if r.get('falso_negativo'))
+        p_base = total_fn / len(rows)
+
         # Agrupar por (direction, regime, rejected_filter)
-        from collections import defaultdict as _dd
-        grupos = _dd(list)
+        grupos = defaultdict(list)
         for r in rows:
             key = (r.get('direction') or 'UNKNOWN',
                    r.get('regime') or 'NEUTRAL',
@@ -879,50 +887,42 @@ class PatternLearner:
 
         candidatos = []
         for (direction, regime, rf), filas_grupo in grupos.items():
-            n_total = len(filas_grupo)
-            if n_total < min_samples:
+            if len(filas_grupo) < min_samples:
                 continue
 
-            # Discretizar features clave en bins simples
-            bins_candidates = self._generar_bins_bypass(filas_grupo)
-
-            mejor_win_rate = 0.0
-            mejor_condition = None
-
-            for condition_json, filas_bin in bins_candidates:
+            mejor = None  # (win_rate, wilson_lower, condition_json, n_bin)
+            for condition_json, filas_bin in self._generar_bins_bypass(filas_grupo):
                 n_bin = len(filas_bin)
                 if n_bin < min_samples:
                     continue
+                n_fn = sum(1 for f in filas_bin if f.get('falso_negativo'))
+                p_fn = n_fn / n_bin
+                lo, _ = _wilson(n_fn, n_bin)
+                lift = p_fn / p_base if p_base > 0 else 0.0
+                # Condicion de aceptacion: baseline + lift + Wilson (I34-A)
+                if lo > p_base * 1.1 and lo >= min_wilson_lower and lift >= min_lift:
+                    if (mejor is None or p_fn > mejor[0]
+                            or (p_fn == mejor[0] and lo > mejor[1])):
+                        mejor = (p_fn, lo, condition_json, n_bin)
 
-                # Win rate = P(rentable_neto_2h == 1 | condicion)
-                wins = sum(1 for f in filas_bin if f.get('rentable_neto_2h'))
-                win_rate = wins / n_bin if n_bin > 0 else 0.0
-
-                # Wilson lower bound
-                lo, _ = _wilson(wins, n_bin)
-
-                if lo >= min_wilson_lower and win_rate > mejor_win_rate:
-                    mejor_win_rate = win_rate
-                    mejor_condition = condition_json
-
-            if mejor_condition:
+            if mejor:
+                p_fn, lo, condition_json, n_bin = mejor
                 candidatos.append({
                     'symbol': None,          # Regla global por defecto
                     'direction': direction,
                     'regime': regime,
                     'rejected_filter': rf,
-                    'condition_json': _json.dumps(mejor_condition),
-                    'n_occurrences': n_total,
-                    'win_rate': round(mejor_win_rate, 4),
-                    'wilson_lower': round(_wilson(
-                        int(mejor_win_rate * n_total), n_total)[0], 4),
-                    'is_active': 0,          # Se activa en SHADOW, luego valida para ACTIVE
+                    'condition_json': condition_json,
+                    'n_occurrences': n_bin,
+                    'win_rate': round(p_fn, 4),
+                    'wilson_lower': round(lo, 4),
+                    'is_active': 0,          # SHADOW; promote/demote automatico
                 })
 
-        # Guardar en bypass_rules (upsert por UNIQUE constraint)
         if candidatos:
             await ldb.guardar_bypass_rules_batch(candidatos)
-            print(f"  🧠 [BYPASS] {len(candidatos)} reglas candidatas minadas (Wilson>={min_wilson_lower})")
+            print(f"  [BYPASS] F0.1: {len(candidatos)} reglas candidatas "
+                  f"(baseline={p_base:.3f}, lift>={min_lift})")
 
         return candidatos
 
@@ -1727,6 +1727,25 @@ class LearningEngine:
         if trans:
             await ldb.guardar_regime_transitions_batch(trans)
 
+        # F0.2b (B2, ruta A): flush de marcas de evento pendientes. Si
+        # marcar_evento llego cuando el snapshot ya estaba volcado a SQLite,
+        # quedo en _pending_markings; aqui se persiste con UPDATE puntual.
+        with self.collector._lock:
+            pendientes = list(self.collector._pending_markings)
+            self.collector._pending_markings.clear()
+        for (sym, tipo, eid, ts) in pendientes:
+            def _upd(sym=sym, tipo=tipo, eid=eid, ts=ts):
+                conn = ldb._get_conn()
+                conn.execute(
+                    "UPDATE feature_snapshots SET evento_asociado = ?, evento_id = ? "
+                    "WHERE symbol = ? AND timestamp_15m = ?",
+                    (tipo, eid, sym, ts))
+                conn.commit()
+            try:
+                await ldb._run(_upd)
+            except Exception as e:
+                print(f"  [LEARN] marcar evento flush {sym}: {e}")
+
         # 2) Flush de exits y predicciones en RAM
         exits = self.exit_labeler.drenar_exits()
         for fila in exits:
@@ -1937,7 +1956,7 @@ class LearningEngine:
 
         # F3.1: Calibración inicial - minar reglas de bypass con históricos
         try:
-            candidatos = await self.minar_bypasses(
+            candidatos = await self.pattern_learner.minar_bypasses(
                 min_samples=getattr(self.cfg, 'learning_bypass_min_samples', 30),
                 min_wilson_lower=getattr(self.cfg, 'learning_bypass_min_wilson', 0.55))
             print(f"  🧠 [BYPASS-CALIB] {len(candidatos)} reglas candidatas minadas")

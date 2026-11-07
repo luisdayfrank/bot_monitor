@@ -113,6 +113,30 @@ async def init_learning_db(db_path: str = "crypto_learning.db"):
         except Exception as e:
             print(f"  ⚠️ P3-5 purga bypass_rules: {e}")
     await _run(_purgar_bypass_rules_legacy)
+    # F0.4: purga one-shot v1.2 — reglas minadas con mineria sesgada
+    # (win_rate=1.0 por solo-FN) y condition_json doble-codificado.
+    # Re-minado limpio con baseline+lift (F0.1). Una sola vez (schema_versions).
+    def _purgar_bypass_rules_v2():
+        try:
+            ya = _conn.execute(
+                "SELECT 1 FROM schema_versions WHERE componente = 'PATTERNS' "
+                "AND version = 'v1.2_bypass_purge'"
+            ).fetchone()
+            if ya:
+                return
+            n = _conn.execute("SELECT COUNT(*) FROM bypass_rules").fetchone()[0]
+            _conn.execute("DELETE FROM bypass_rules")
+            _conn.execute(
+                "INSERT OR IGNORE INTO schema_versions "
+                "(componente, version, aplicado_utc, changelog, activo) "
+                "VALUES ('PATTERNS', 'v1.2_bypass_purge', ?, "
+                "'F0: re-minado con baseline+lift; reglas previas win_rate=1.0', 1)",
+                (int(time.time() * 1000),))
+            _conn.commit()
+            print(f"  [LEARN-DB] F0.4: purgadas {n} bypass_rules (v1.2)")
+        except Exception as e:
+            print(f"  [LEARN-DB] F0.4 purga v1.2: {e}")
+    await _run(_purgar_bypass_rules_v2)
     print(f"  🧠 [LEARN-DB] crypto_learning.db abierta ({db_path}) | journal_mode={modo}")
     return modo
 
@@ -489,6 +513,22 @@ async def cargar_near_miss_labels_falsos_negativos():
     return await _run(_op)
 
 
+async def cargar_near_miss_labels_todas(horas: int = 24 * 90):
+    """F0.1: TODOS los labels (FN + OK), no solo falsos_negativos.
+
+    Sin contramuestras (OK) la mineria daba win_rate=1.0 siempre (Bug #1).
+    """
+    def _op():
+        conn = _get_conn()
+        ts_corte = int(time.time() * 1000) - horas * 3600_000
+        rows = conn.execute(
+            "SELECT * FROM near_miss_labels WHERE timestamp_inicio >= ? "
+            "ORDER BY timestamp_inicio DESC", (ts_corte,)).fetchall()
+        return [dict(r) for r in rows]
+
+    return await _run(_op)
+
+
 async def guardar_bypass_rules_batch(rows: list):
     """Upsert reglas de bypass en SQLite (UNIQUE: symbol, direction, regime, rejected_filter)."""
     if not rows:
@@ -559,22 +599,48 @@ async def guardar_bypass_rule_estado(symbol, direction, regime, rejected_filter,
     return await _run(_op)
 
 
-async def cargar_bypass_rule_stats(rejected_filter: str, regime: str):
-    """Estadísticas de una regla de bypass para compute_confidence_v2."""
+def _wilson(k: float, n: float, z: float = 1.96):
+    """F0.1 (I32-A): Wilson local. learning_db no puede importar
+    learning_engine (circular: learning_engine importa learning_db)."""
+    if n <= 0:
+        return 0.0, 1.0
+    p = k / n
+    denom = 1 + z * z / n
+    centro = (p + z * z / (2 * n)) / denom
+    margen = (z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5)) / denom
+    return max(0.0, centro - margen), min(1.0, centro + margen)
+
+
+async def cargar_bypass_rule_stats(rejected_filter: str, regime: str,
+                                   direction: str = None):
+    """F0.1 (I2): stats COMPLETAS FN vs OK (antes solo FN -> win_rate=1.0
+    y AVG(wilson_lower) sobre columna inexistente -> error tragado).
+    direction=None agrega todas las direcciones (compat con caller actual)."""
     def _op():
         conn = _get_conn()
-        cursor = conn.execute("""
-            SELECT
-                COUNT(*) as n,
-                AVG(CASE WHEN rentable_neto_2h = 1 THEN 1.0 ELSE 0.0 END) as win_rate,
-                AVG(wilson_lower) as wilson_lower
-            FROM near_miss_labels
-            WHERE tipo_rechazo = ? AND regime = ? AND falso_negativo = 1
-        """, (rejected_filter, regime))
-        row = cursor.fetchone()
-        if not row or row[0] == 0:
+        sql = (
+            "SELECT "
+            "COUNT(*) as n, "
+            "SUM(CASE WHEN falso_negativo = 1 THEN 1 ELSE 0 END) as n_fn, "
+            "SUM(CASE WHEN bloqueo_correcto = 1 THEN 1 ELSE 0 END) as n_ok "
+            "FROM near_miss_labels "
+            "WHERE tipo_rechazo = ? AND regime = ?"
+        )
+        params = [rejected_filter, regime]
+        if direction is not None:
+            sql += " AND direction = ?"
+            params.append(direction)
+        row = conn.execute(sql, params).fetchone()
+        if not row or row[0] < 10:
             return None
-        return {'n': row[0], 'win_rate': row[1] or 0.5, 'wilson_lower': row[2] or 0}
+        n = row[0]
+        n_fn = row[1] or 0
+        lo, hi = _wilson(n_fn, n)
+        return {
+            'n': n, 'n_fn': n_fn, 'n_ok': row[2] or 0,
+            'win_rate': n_fn / n,
+            'wilson_lower': lo, 'wilson_upper': hi,
+        }
 
     return await _run(_op)
 
