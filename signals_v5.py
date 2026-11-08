@@ -713,6 +713,15 @@ class SignalGenerator:
         umbral_bloqueado = False
 
         _regime_4h = self._determinar_regimen_4h(symbol)
+        # F3.1 (I61): regimen 5-estado para el bypass HARDCODEADO por regimen.
+        # El alias _regime_4h se conserva solo para el bypass aprendido.
+        _regimen_actual = 'RANGE'
+        if self.learning_engine is not None:
+            try:
+                _regimen_actual = self.learning_engine.regime_cls.regimen_actual.get(
+                    symbol, 'RANGE')
+            except Exception:
+                _regimen_actual = 'RANGE'
         _i15_ctx = self.indicadores_15m.get(symbol, {})
         _ema200_15m = _i15_ctx.get('ema200_15m')
         _ema200_dist_pct = ((price - _ema200_15m) / _ema200_15m) * 100.0 if _ema200_15m and price else 0.0
@@ -737,8 +746,20 @@ class SignalGenerator:
             'adx': adx, 'rsi': rsi, 'atr_pct': _atr_pct_15m,
         }
 
+        # F3.1: bypass hardcodeado por regimen (I58/I59/I60). Gana al aprendido.
+        _BYPASS_BY_REGIMEN = {
+            'PANIC': {'RSI_EXTREMO', 'ATR_COMPRIMIDO', 'MFM_BAJO',
+                      'VOLUMEN_BAJO', 'MACD_EXPLOSIVO'},
+            'TREND_DOWN': {'RSI_EXTREMO', 'ATR_COMPRIMIDO', 'MFM_BAJO'},
+            'TREND_UP': {'RSI_EXTREMO', 'ATR_COMPRIMIDO', 'MFM_BAJO'},
+        }
+
         def _tal_vez_rechazar(codigo, mensaje, condicion):
             if not condicion:
+                return
+            if codigo in _BYPASS_BY_REGIMEN.get(_regimen_actual, set()):
+                print(f"  [BYPASS-REGIMEN] {symbol} {codigo} ignorado "
+                      f"(regimen {_regimen_actual})")
                 return
             if (self.learning_engine is not None and
                     getattr(CONFIG, 'learning_bypass_mode', 'OFF') != 'OFF'):
@@ -789,7 +810,9 @@ class SignalGenerator:
             if decision == "PERMITIR":
                 score_macro += 20
             else:
-                rechazos.append(razon)
+                # I7 (ruta A): misma ruta de codigo que SHORT para que el
+                # bypass por regimen/aprendido tambien aplique en LONG.
+                _tal_vez_rechazar("RSI_EXTREMO", razon, True)
         else:
             rechazos.append("Direccion NEUTRAL")
 
@@ -1736,35 +1759,76 @@ class SignalGenerator:
                 print(f"  [PAUSA] {symbol} -> MONITOREO (pausa {tipo_pausa} activa)")
             return
 
-        # FASE 2.2: CIRCUIT BREAKER con PnL real del grid (Bug B)
+        # FASE 2.2: CIRCUIT BREAKER por regimen (F3.2)
         if state.ultimo_disparo_precio > 0 and not state.ultimo_disparo_evaluado:
             price_actual = self.indicadores_1m.get(symbol, {}).get('close', 0)
+            # F3.2 (I61): regimen 5-estado para el CB
+            _regimen_cb = 'RANGE'
+            if self.learning_engine is not None:
+                try:
+                    _regimen_cb = self.learning_engine.regime_cls.regimen_actual.get(
+                        symbol, 'RANGE')
+                except Exception:
+                    _regimen_cb = 'RANGE'
+            _atr15 = i15.get('atr') or 0          # I65: guard > 0 antes de multiplicar
 
-            # FASE 4: Eliminado PnL del simulador. Usamos solo estimación por precio spot.
-            pnl_grid = 0.0
+            _inval = None
+            if _regimen_cb in ('TREND_UP', 'TREND_DOWN'):
+                # F4.2 creara este atributo; hasta entonces None -> fallback
+                # a la regla RANGE (I56: orden de fases, no es bug).
+                _inval = getattr(state, 'breakout_invalidation_level', None)
 
-            if pnl_grid != 0:
-                fue_rentable = pnl_grid > 0
-                razon_pnl = f"PnL grid: {pnl_grid:+.4f}"
-            elif price_actual > 0:
-                # Fallback: estimación por precio spot si no hay grid activo
+            if _regimen_cb == 'PANIC':
+                # PANIC: solo incrementa si el movimiento ADVERSO > 1xATR15m
+                # (I62 ruta A: direccional). Menor -> NO resetea (I57).
                 if state.ultimo_disparo_direccion == 'SHORT':
-                    fue_rentable = price_actual <= state.ultimo_disparo_precio * 1.003
+                    _mov_contra = price_actual - state.ultimo_disparo_precio
                 else:
-                    fue_rentable = price_actual >= state.ultimo_disparo_precio * 0.997
-                razon_pnl = f"Precio spot: ${price_actual:.4f}"
+                    _mov_contra = state.ultimo_disparo_precio - price_actual
+                if _mov_contra < 0:
+                    _mov_contra = 0.0
+                if _atr15 > 0 and _mov_contra > _atr15 * 1.0:
+                    state.disparos_consecutivos += 1
+                    state.ultimo_disparo_fue_rentable = False
+                    print(f"  [CB-PANIC] {symbol} movimiento adverso "
+                          f"{_mov_contra:.4f} > ATR {_atr15:.4f} -> contador +1")
+                else:
+                    print(f"  [CB-PANIC] {symbol} movimiento menor "
+                          f"({_mov_contra:.4f} <= ATR {_atr15:.4f}) -> contador NO sube")
+            elif _inval is not None:
+                # TREND/BREAKOUT: invalidacion de nivel (F4.2+). I63: ambas
+                # direcciones.
+                if _regimen_cb == 'TREND_DOWN' and price_actual > _inval:
+                    state.disparos_consecutivos += 1
+                    state.ultimo_disparo_fue_rentable = False
+                    print(f"  [CB-BREAKOUT] {symbol} precio {price_actual:.4f} > "
+                          f"invalidacion {_inval:.4f} -> contador +1")
+                elif _regimen_cb == 'TREND_UP' and price_actual < _inval:
+                    state.disparos_consecutivos += 1
+                    state.ultimo_disparo_fue_rentable = False
+                    print(f"  [CB-BREAKOUT] {symbol} precio {price_actual:.4f} < "
+                          f"invalidacion {_inval:.4f} -> contador +1")
             else:
-                fue_rentable = True
-                razon_pnl = "Sin precio disponible"
-
-            if not fue_rentable:
-                state.disparos_consecutivos += 1
-                state.ultimo_disparo_fue_rentable = False
-                print(f"  [CB] {symbol} Disparo en pérdida | #{state.disparos_consecutivos} | {razon_pnl}")
-            else:
-                state.disparos_consecutivos = 0
-                state.ultimo_disparo_fue_rentable = True
-                print(f"  [CB] {symbol} Disparo rentable | Reset contador | {razon_pnl}")
+                # RANGE/VOLATILE (y TREND pre-F4.2 por I56): ±0.3% original,
+                # conservando el RESET a 0 cuando el disparo fue rentable.
+                if price_actual > 0:
+                    if state.ultimo_disparo_direccion == 'SHORT':
+                        fue_rentable = price_actual <= state.ultimo_disparo_precio * 1.003
+                    else:
+                        fue_rentable = price_actual >= state.ultimo_disparo_precio * 0.997
+                    razon_pnl = f"Precio spot: ${price_actual:.4f}"
+                else:
+                    fue_rentable = True
+                    razon_pnl = "Sin precio disponible"
+                if not fue_rentable:
+                    state.disparos_consecutivos += 1
+                    state.ultimo_disparo_fue_rentable = False
+                    print(f"  [CB] {symbol} Disparo en perdida | "
+                          f"#{state.disparos_consecutivos} | {razon_pnl}")
+                else:
+                    state.disparos_consecutivos = 0
+                    state.ultimo_disparo_fue_rentable = True
+                    print(f"  [CB] {symbol} Disparo rentable | Reset contador | {razon_pnl}")
 
             state.ultimo_disparo_evaluado = True
 
