@@ -5799,6 +5799,7 @@ class GridExecutor:
                     tiempo_desde_ultimo = ahora - self._grid_pending_creation[symbol]
                     if tiempo_desde_ultimo < 60:
                         print(f"  ⚠️ [V7.1] {symbol} Debounce activo: {tiempo_desde_ultimo:.0f}s < 60s. Ignorando CREAR_GRID.")
+                        self._ultimo_rechazo.pop(symbol, None)   # I69: sin residuos
                         await self._notificar_resultado_grid(symbol, False, 'debounce_activo')
                         return
                 self._grid_pending_creation[symbol] = ahora   # ← REGISTRADO AQUÍ
@@ -5821,12 +5822,20 @@ class GridExecutor:
                 print(f"  [EXECUTOR] {symbol} excepcion creando grid: {e}")
                 self._ultimo_rechazo[symbol] = f'excepcion: {type(e).__name__}'
             finally:
-                # I39: ok=True SOLO si el grid quedo activo en RAM
+                # I39/I69: el MOTIVO del rechazo manda sobre la presencia del
+                # grid (puede existir un grid previo, p.ej. NEUTRAL, en _grids).
+                # El pop se ejecuta SIEMPRE para no arrastrar residuos.
                 if direction in ('LONG', 'SHORT'):
-                    st = self._grids.get(symbol)
-                    ok = bool(st and st.activa)
-                    motivo = '' if ok else self._ultimo_rechazo.pop(symbol, 'rechazo_sin_motivo')
-                    await self._notificar_resultado_grid(symbol, ok, motivo)
+                    motivo = self._ultimo_rechazo.pop(symbol, None)
+                    if motivo is None:
+                        st = self._grids.get(symbol)
+                        ok = bool(st and st.activa)
+                        if ok:
+                            print(f"  [EXECUTOR->SIGNALS] {symbol} grid OK (sin motivo residual)")
+                    else:
+                        ok = False
+                    await self._notificar_resultado_grid(
+                        symbol, ok, motivo if motivo else ('' if ok else 'rechazo_sin_motivo'))
         elif tipo == 'ABORTAR_GRID':
             await self._abortar_grid(msg['symbol'], msg.get('razon', 'aborto_manual'))
 

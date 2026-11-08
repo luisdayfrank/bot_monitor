@@ -1714,6 +1714,16 @@ class SignalGenerator:
                                 "AND evento_asociado = 'FIRE'", (sym, ts))
                             conn.commit()
                         await _ldb._run(_desmarcar)
+                        # I67: quitar la marca pendiente del collector (si el
+                        # flush aun no la habia persistido, el UPDATE no matcheo
+                        # y el flush posterior la re-marcaria).
+                        if self.learning_engine is not None:
+                            collector = self.learning_engine.collector
+                            with collector._lock:
+                                collector._pending_markings = [
+                                    (s, t, e, ts) for (s, t, e, ts) in collector._pending_markings
+                                    if not (s == symbol and ts == _ts_fire)
+                                ]
                     except Exception as e_unmark:
                         print(f"  [F0.6] desmarcar FIRE {symbol}: {e_unmark}")
                     # Pausa 30 min tras 3 fallos (B6: escape via notifier)
