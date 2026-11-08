@@ -49,6 +49,9 @@ MINING_FEATURES = [
     'volume_ratio', 'price_rel_ema50_pct', 'price_rel_ema200_pct',
     'ema7_ema25_spread_pct', 'dist_to_recent_high_pct', 'dist_to_recent_low_pct',
     'ema50_slope_3v', 'adx_slope_3v', 'rsi_divergence', 'rsi_7_1m', 'score_macro',
+    # v1.1 (F1.3)
+    'bb_width_pct', 'bb_width_pct_pct', 'pct_b',
+    'er_15m', 'atr_ratio_1m_15m', 'roc_4v_pct',
 ]
 
 LABEL_OBJETIVOS = ['LONG_STRONG', 'SHORT_STRONG', 'NEUTRAL_RANGE', 'WHIPSAW']
@@ -147,64 +150,85 @@ def _bh_fdr(pares: list, q: float = 0.10) -> list:
 # ═══════════════════════════════════════════════════════════════════════════
 class RegimeClassifier:
     """
-    Reglas deterministas (corrección §3F):
+    Clasificador UNICO de regimen (5 estados) — Plan Blindado F2.
 
-        trend_up   := ema7 > ema25 and close > ema50 and adx >= adx_min (20)
-        trend_dn   := ema7 < ema25 and close < ema50 and adx >= adx_min
-        volatile   := atr_pct >= p80(atr_hist)  [y no tendencia fuerte]
-        range      := resto (adx < 20 o sin tendencia clara)
+    Estados:
+      PANIC      := atr_ratio_1m_15m > 1.5 OR roc_4v_pct < -3.0 (prioridad)
+      TREND_UP   := ema7>ema25 AND close>ema50 AND ADX>=25 AND ER(10)>=0.40
+      TREND_DOWN := ema7<ema25 AND close<ema50 AND ADX>=25 AND ER(10)>=0.40
+      VOLATILE   := atr_pct >= p80(atr_hist)
+      RANGE      := resto
 
-    Histéresis: el régimen candidato debe repetirse `min_velas` (4) veces
-    seguidas antes de confirmarse y registrar la transición. Esto evita
-    flip-flop (churn) que envenenaría el RegimeTransitionTracker.
+    Alias (compat bypass_rules / near_miss_labels):
+      TREND_UP->BULLISH  TREND_DOWN->BEARISH
+      RANGE->NEUTRAL     VOLATILE->NEUTRAL     PANIC->PANIC
+
+    Histeresis: 4 velas consecutivas para confirmar + >=1h en el regimen
+    vigente antes de cambiar. EXCEPCION: PANIC entra en la 1a vela (I47-A).
     """
+
+    MIN_DURACION_SEG = 3600  # 1h minimo en el regimen previo (excepto PANIC)
 
     def __init__(self, min_velas: int = 4, ventana_atr: int = 500):
         self.min_velas = max(1, int(min_velas))
         self._atr_hist: dict = defaultdict(lambda: deque(maxlen=ventana_atr))
+        self._bb_hist: dict = defaultdict(lambda: deque(maxlen=100))
+        self._roc_hist: dict = defaultdict(lambda: deque(maxlen=5))
         self._candidato: dict = {}
         self._racha: dict = defaultdict(int)
-        self._regimen_previo: dict = {}
-        self._regimen_inicio_ts: dict = {}
+        self._regimen_desde: dict = {}
         self.regimen_actual: dict = {}          # symbol -> confirmado
 
-    def clasificar(self, f: dict) -> str:
-        """Régimen instantáneo (sin histéresis) a partir de un snapshot de features."""
-        try:
-            close = float(f.get('price') or f.get('price_rel_ema50_pct') or 0) or 0
-        except Exception:
-            close = 0
+    def _p80(self, sym, val):
+        h = list(self._atr_hist[sym])
+        if len(h) < 20:
+            return None
+        return self._percentil(h, 80)
+
+    def clasificar_inst(self, f: dict) -> str:
+        """Regimen instantaneo (sin histeresis) desde un snapshot de features."""
         adx = f.get('adx_15m') or 0
-        atr_pct = f.get('atr_pct_15m') or 0
-        ema7 = f.get('ema7_ema25_spread_pct')       # (ema7-ema25)/ema25*100
+        er = f.get('er_15m') or 0
+        ema7 = f.get('ema7_ema25_spread_pct')
         rel50 = f.get('price_rel_ema50_pct') or 0
+        atr_pct = f.get('atr_pct_15m') or 0
+        atr_ratio = f.get('atr_ratio_1m_15m') or 1.0
+        roc_4v = f.get('roc_4v_pct') or 0
 
-        trend_up = (ema7 is not None and ema7 > 0 and rel50 > 0 and adx >= 20)
-        trend_dn = (ema7 is not None and ema7 < 0 and rel50 < 0 and adx >= 20)
+        # 1. PANIC (prioridad maxima)
+        if atr_ratio > 1.5 or roc_4v < -3.0:
+            return 'PANIC'
 
-        hist = self._atr_hist.get(f.get('symbol'), deque(maxlen=500))
-        p80 = self._percentil(list(hist), 80) if len(hist) >= 20 else None
-        volatil = (p80 is not None and atr_pct >= p80)
-
-        if trend_up and not (volatil and atr_pct >= (p80 or 0) * 1.3):
+        # 2. TREND (ADX + ER; ER es el discriminador clave)
+        trend_up = (ema7 is not None and ema7 > 0 and rel50 > 0
+                    and adx >= 25 and er >= 0.40)
+        trend_dn = (ema7 is not None and ema7 < 0 and rel50 < 0
+                    and adx >= 25 and er >= 0.40)
+        if trend_up:
             return 'TREND_UP'
-        if trend_dn and not (volatil and atr_pct >= (p80 or 0) * 1.3):
+        if trend_dn:
             return 'TREND_DOWN'
-        if volatil:
+
+        # 3. VOLATILE
+        p80 = self._p80(f.get('symbol'), atr_pct)
+        if p80 and atr_pct >= p80:
             return 'VOLATILE'
-        if adx < 20:
-            return 'RANGE'
+
+        # 4. RANGE
         return 'RANGE'
 
     def actualizar(self, symbol: str, f: dict) -> dict:
-        """
-        Actualiza histéresis. Retorna:
-          {'regimen': confirmado, 'candidato': ..., 'transicion': (from,to) | None}
-        """
+        """Actualiza histeresis. Retorna {'regimen','candidato','transicion'}."""
         atr_pct = f.get('atr_pct_15m') or 0
         self._atr_hist[symbol].append(atr_pct)
+        bb_w_pct = f.get('bb_width_pct')
+        if bb_w_pct is not None:
+            self._bb_hist[symbol].append(bb_w_pct)
+        roc = f.get('roc_4v_pct')
+        if roc is not None:
+            self._roc_hist[symbol].append(roc)
 
-        inst = self.clasificar({**f, 'symbol': symbol})
+        inst = self.clasificar_inst({**f, 'symbol': symbol})
 
         if self._candidato.get(symbol) == inst:
             self._racha[symbol] += 1
@@ -214,16 +238,32 @@ class RegimeClassifier:
 
         transicion = None
         previo = self.regimen_actual.get(symbol, 'UNKNOWN')
+        ahora = _now_ms()
+
+        # I47 (ruta A): PANIC es emergencia -> entra en la 1a vela, sin racha
+        if inst == 'PANIC' and previo != 'PANIC':
+            dur_min = int((ahora - self._regimen_desde.get(symbol, ahora)) / 60000)
+            transicion = (previo, 'PANIC', dur_min)
+            self.regimen_actual[symbol] = 'PANIC'
+            self._regimen_desde[symbol] = ahora
+            return {
+                'regimen': 'PANIC',
+                'candidato': inst,
+                'transicion': transicion,
+            }
 
         if self._racha[symbol] >= self.min_velas:
-            if previo != inst:
-                dur_min = 0
-                inicio = self._regimen_inicio_ts.get(symbol)
-                if inicio:
-                    dur_min = int((_now_ms() - inicio) / 60000)
-                transicion = (previo, inst, dur_min)
-                self._regimen_inicio_ts[symbol] = _now_ms()
-            self.regimen_actual[symbol] = inst
+            dur_seg = (ahora - self._regimen_desde.get(symbol, ahora)) / 1000.0
+            puede_cambiar = (inst == 'PANIC'
+                             or dur_seg >= self.MIN_DURACION_SEG)
+            if previo != inst and puede_cambiar:
+                transicion = (previo, inst, int(dur_seg / 60))
+                self.regimen_actual[symbol] = inst
+                self._regimen_desde[symbol] = ahora
+            elif previo == 'UNKNOWN':
+                # primera confirmacion (no habia regimen previo)
+                self.regimen_actual[symbol] = inst
+                self._regimen_desde[symbol] = ahora
         elif symbol not in self.regimen_actual:
             self.regimen_actual[symbol] = 'UNKNOWN'
 
@@ -232,6 +272,13 @@ class RegimeClassifier:
             'candidato': inst,
             'transicion': transicion,
         }
+
+    @staticmethod
+    def to_alias(regimen: str) -> str:
+        """Compat con bypass_rules/near_miss_labels (BULLISH/BEARISH/NEUTRAL)."""
+        return {'TREND_UP': 'BULLISH', 'TREND_DOWN': 'BEARISH',
+                'RANGE': 'NEUTRAL', 'VOLATILE': 'NEUTRAL',
+                'PANIC': 'PANIC'}.get(regimen, 'NEUTRAL')
 
     @staticmethod
     def _percentil(vals: list, q: float):
@@ -267,6 +314,8 @@ class SnapshotCollector:
         self._ema50_hist: dict = defaultdict(lambda: deque(maxlen=6))
         self._adx_hist: dict = defaultdict(lambda: deque(maxlen=6))
         self._ci_hist: dict = defaultdict(lambda: deque(maxlen=21))  # (close, rsi)
+        self._closes_15m: dict = defaultdict(lambda: deque(maxlen=25))   # (ts, close)
+        self._bb_width_hist: dict = defaultdict(lambda: deque(maxlen=100))
         self._prev_fila: dict = {}
         self._ultimo_ts: dict = {}   # idempotencia por (symbol, timestamp)
 
@@ -299,6 +348,10 @@ class SnapshotCollector:
         with self._lock:
             filas, self.transiciones_pendientes = self.transiciones_pendientes, []
         return filas
+
+    def ultima_fila(self, symbol: str) -> dict:
+        """F2.2 (I48): ultima fila de features extraida para symbol (o {})."""
+        return self._prev_fila.get(symbol) or {}
 
     # P0.3: Marcar evento en buffer RAM o en pending si flush ya ocurrió
     def marcar_evento(self, symbol: str, tipo: str, evento_id: int, timestamp_15m: int):
@@ -352,12 +405,65 @@ class SnapshotCollector:
         ts = int(i15.get('timestamp') or _now_ms())
         dt = datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc)
 
+        # ── F1.1: features v1.1 (I5: antes de pre_features para F2) ──
+        _nueva_vela = (not self._closes_15m[symbol]
+                       or self._closes_15m[symbol][-1][0] != ts)
+        if _nueva_vela:
+            self._closes_15m[symbol].append((ts, price))
+        closes = [c for (_t, c) in self._closes_15m[symbol]]
+
+        bb_width_pct = None
+        bb_width_pct_pct = None
+        pct_b = None
+        if len(closes) >= 20:
+            ventana = closes[-20:]
+            sma20 = sum(ventana) / 20.0
+            var20 = sum((c - sma20) ** 2 for c in ventana) / 20.0
+            std20 = var20 ** 0.5
+            if sma20 > 0:
+                bb_width_pct = (4.0 * std20 / sma20) * 100.0
+            if std20 > 0:
+                pct_b = ((ventana[-1] - (sma20 - 2.0 * std20))
+                         / (4.0 * std20))
+            else:
+                pct_b = 0.5
+            if _nueva_vela and bb_width_pct is not None:
+                hist_w = self._bb_width_hist[symbol]
+                if len(hist_w) >= 30:
+                    bb_width_pct_pct = (100.0 * sum(
+                        1 for w in hist_w if w < bb_width_pct) / len(hist_w))
+                hist_w.append(bb_width_pct)
+
+        er_15m = None
+        if len(closes) >= 11:
+            c_er = closes[-11:]
+            er_num = abs(c_er[-1] - c_er[0])
+            er_den = sum(abs(c_er[j] - c_er[j - 1])
+                         for j in range(1, len(c_er)))
+            er_15m = (er_num / er_den) if er_den > 0 else 0.0
+
+        roc_4v = None
+        if len(closes) >= 5 and closes[-5] > 0:
+            roc_4v = ((closes[-1] - closes[-5]) / closes[-5]) * 100.0
+
+        atr_ratio = None
+        _atr_1m = i1m.get('atr_1m')
+        if _atr_1m and atr and atr > 0:
+            atr_ratio = float(_atr_1m) / float(atr)
+
+        donchian_high_20 = i15.get('donchian_high_20')   # I41-A
+        donchian_low_20 = i15.get('donchian_low_20')     # I41-A
+        vwap_24h = i15.get('vwap_24h')                   # I41-A
+
         # Régimen con histéresis
         pre_features = {
             'symbol': symbol, 'price': price, 'adx_15m': adx,
             'atr_pct_15m': _safe_div(atr * 100.0, price) if atr else 0.0,
             'ema7_ema25_spread_pct': _safe_div((ema7 - ema25) * 100.0, ema25) if (ema7 and ema25) else None,
             'price_rel_ema50_pct': _safe_div((price - ema50) * 100.0, ema50) if ema50 else 0.0,
+            'er_15m': er_15m,
+            'atr_ratio_1m_15m': atr_ratio,
+            'roc_4v_pct': roc_4v,
         }
         reg = self.regime_cls.actualizar(symbol, pre_features)
 
@@ -388,6 +494,17 @@ class SnapshotCollector:
             'adx_slope_3v': adx_slope,
             'rsi_divergence': 1 if rsi_div else 0,
 
+            # F1.1 features v1.1
+            'bb_width_pct': bb_width_pct,
+            'bb_width_pct_pct': bb_width_pct_pct,
+            'pct_b': pct_b,
+            'er_15m': er_15m,
+            'donchian_high_20': donchian_high_20,
+            'donchian_low_20': donchian_low_20,
+            'atr_ratio_1m_15m': atr_ratio,
+            'roc_4v_pct': roc_4v,
+            'vwap_24h': vwap_24h,
+
             'rsi_7_1m': i1m.get('rsi_7'),
             'wick_upper_pct_1m': i1m.get('wick_upper_pct'),
             'wick_lower_pct_1m': i1m.get('wick_lower_pct'),
@@ -407,7 +524,7 @@ class SnapshotCollector:
             'estado_maquina': getattr(state, 'estado', None),
             'evento_asociado': None,
             'evento_id': None,
-            'feature_schema_version': 'v1.0',   # ANEXO A §2.2
+            'feature_schema_version': 'v1.1',   # F1 (ANEXO A §2.2)
         }
 
         # Transición de régimen confirmada → fila para regime_transitions
@@ -1760,6 +1877,15 @@ class LearningEngine:
         if ahora - self._last_sync_velas > 900:
             self._last_sync_velas = ahora
             await self.labeler.sincronizar_velas(list(self.cfg.symbols))
+            # F1.4: backfill v1.1 una sola vez por proceso (tras el 1er sync)
+            if not getattr(self, '_backfill_v11_hecho', False):
+                try:
+                    n_bf = await ldb.backfill_features_v1_1()
+                    self._backfill_v11_hecho = True
+                    if n_bf:
+                        print(f"  [F1.4] backfill v1.1: {n_bf} snapshots actualizados")
+                except Exception as e_bf:
+                    print(f"  [F1.4] backfill v1.1 error: {e_bf}")
 
         # 4) Labeler cada 10 min
         if ahora - self._last_label_run > 600:

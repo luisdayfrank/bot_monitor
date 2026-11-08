@@ -79,6 +79,30 @@ async def init_learning_db(db_path: str = "crypto_learning.db"):
         except Exception:
             pass  # columna ya existe
     await _run(_add_direction_col)
+    # F1.2: 9 columnas v1.1 en feature_snapshots (idempotente)
+    def _add_features_v11_cols():
+        cols = [
+            'bb_width_pct REAL', 'bb_width_pct_pct REAL', 'pct_b REAL',
+            'er_15m REAL', 'donchian_high_20 REAL', 'donchian_low_20 REAL',
+            'atr_ratio_1m_15m REAL', 'roc_4v_pct REAL', 'vwap_24h REAL',
+        ]
+        for col in cols:
+            try:
+                _conn.execute(f"ALTER TABLE feature_snapshots ADD COLUMN {col}")
+            except Exception:
+                pass  # columna ya existe
+        try:
+            _conn.commit()
+        except Exception:
+            pass
+    await _run(_add_features_v11_cols)
+    # F1.3 (I44): version activa del componente FEATURES
+    try:
+        await registrar_schema_version(
+            'FEATURES', 'v1.1',
+            'F1: BB/%b/ER/Donchian/ATR-ratio/ROC/VWAP + backfill')
+    except Exception as e:
+        print(f"  [LEARN-DB] F1.2 registro FEATURES v1.1: {e}")
     # 3.2 (convención schema_versions §2.1): registrar el cambio de esquema
     def _register_direction_version():
         try:
@@ -197,6 +221,83 @@ async def cargar_velas_mirror(symbol: str, desde_ms: int, hasta_ms: int):
     return await _run(_op)
 
 
+async def backfill_features_v1_1():
+    """F1.4: rellena columnas v1.1 en snapshots v1.0 desde velas_15m_mirror.
+
+    One-shot (marcador FEATURES/v1.1_backfill). Rellena 5/9 columnas:
+    bb_width_pct, pct_b, er_15m, donchian_high_20, donchian_low_20.
+    (atr_ratio/roc/bb_pct_pct/vwap requieren 1m o ventana historica -> NULL)
+    """
+    def _op():
+        conn = _get_conn()
+        ya = conn.execute(
+            "SELECT 1 FROM schema_versions WHERE componente = 'FEATURES' "
+            "AND version = 'v1.1_backfill'").fetchone()
+        if ya:
+            return 0
+        rows = conn.execute(
+            "SELECT id, symbol, timestamp_15m FROM feature_snapshots "
+            "WHERE feature_schema_version = 'v1.0' "
+            "ORDER BY symbol, timestamp_15m").fetchall()
+        if not rows:
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_versions "
+                "(componente, version, aplicado_utc, changelog, activo) "
+                "VALUES ('FEATURES','v1.1_backfill',?, 'F1.4: sin filas v1.0', 1)",
+                (int(time.time() * 1000),))
+            conn.commit()
+            return 0
+        por_sym = {}
+        for r in rows:
+            por_sym.setdefault(r['symbol'], []).append(r)
+        total = 0
+        for sym, filas_sym in por_sym.items():
+            velas = conn.execute(
+                "SELECT timestamp, open, high, low, close, volume "
+                "FROM velas_15m_mirror WHERE symbol = ? ORDER BY timestamp",
+                (sym,)).fetchall()
+            if len(velas) < 20:
+                continue
+            idx_by_ts = {v['timestamp']: i for i, v in enumerate(velas)}
+            updates = []
+            for r in filas_sym:
+                i = idx_by_ts.get(r['timestamp_15m'])
+                if i is None or i < 19:
+                    continue
+                ventana = velas[i - 19:i + 1]
+                closes = [float(v['close']) for v in ventana]
+                sma = sum(closes) / len(closes)
+                std = (sum((c - sma) ** 2 for c in closes) / len(closes)) ** 0.5
+                bb_w = (4.0 * std / sma * 100.0) if sma > 0 else None
+                pct_b = (((closes[-1] - (sma - 2.0 * std)) / (4.0 * std))
+                         if std > 0 else 0.5)
+                er_num = abs(closes[-1] - closes[0])
+                er_den = sum(abs(closes[j] - closes[j - 1])
+                             for j in range(1, len(closes)))
+                er = (er_num / er_den) if er_den > 0 else 0.0
+                updates.append((
+                    bb_w, pct_b, er,
+                    max(float(v['high']) for v in ventana),
+                    min(float(v['low']) for v in ventana),
+                    r['id']))
+            if updates:
+                conn.executemany(
+                    "UPDATE feature_snapshots SET bb_width_pct = ?, pct_b = ?, "
+                    "er_15m = ?, donchian_high_20 = ?, donchian_low_20 = ?, "
+                    "feature_schema_version = 'v1.1' WHERE id = ?", updates)
+                total += len(updates)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_versions "
+            "(componente, version, aplicado_utc, changelog, activo) "
+            "VALUES ('FEATURES','v1.1_backfill',?, "
+            "'F1.4: backfill desde velas_15m_mirror', 1)",
+            (int(time.time() * 1000),))
+        conn.commit()
+        return total
+
+    return await _run(_op)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # feature_snapshots
 # ═══════════════════════════════════════════════════════════════════════════
@@ -207,6 +308,10 @@ _SNAPSHOT_COLS = [
     'price_rel_ema50_pct', 'price_rel_ema200_pct', 'ema7_ema25_spread_pct',
     'dist_to_recent_high_pct', 'dist_to_recent_low_pct',
     'ema50_slope_3v', 'adx_slope_3v', 'rsi_divergence',
+    # F1.1 v1.1
+    'bb_width_pct', 'bb_width_pct_pct', 'pct_b', 'er_15m',
+    'donchian_high_20', 'donchian_low_20', 'atr_ratio_1m_15m',
+    'roc_4v_pct', 'vwap_24h',
     'rsi_7_1m', 'wick_upper_pct_1m', 'wick_lower_pct_1m',
     'body_direction_1m', 'mecha_short_1m', 'mecha_long_1m',
     'ema200_4h', 'close_4h', 'hora_sin', 'hora_cos', 'dia_semana',

@@ -399,6 +399,14 @@ class IndicatorEngineV3:
             # FASE 5.2: Nuevos campos MFM
             'mfm_15m': round(mfm_15m, 4),
             'mfm_sma5': round(mfm_sma5, 4),
+            # F1.1 (I41-A): features v1.1 desde el df (no accesibles via i15)
+            'donchian_high_20': float(df['high'].tail(20).max()),
+            'donchian_low_20': float(df['low'].tail(20).min()),
+            'vwap_24h': (
+                float((((df['high'] + df['low'] + df['close']) / 3.0)
+                       * df['volume']).tail(96).sum()
+                      / df['volume'].tail(96).sum())
+                if df['volume'].tail(96).sum() > 0 else None),
         }
 
     # ================================================================

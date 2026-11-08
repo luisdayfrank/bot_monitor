@@ -109,6 +109,17 @@ CREATE TABLE IF NOT EXISTS feature_snapshots (
     adx_slope_3v REAL,
     rsi_divergence INTEGER,               -- 0|1
 
+    -- Features v1.1 (F1)
+    bb_width_pct REAL,
+    bb_width_pct_pct REAL,
+    pct_b REAL,
+    er_15m REAL,
+    donchian_high_20 REAL,
+    donchian_low_20 REAL,
+    atr_ratio_1m_15m REAL,
+    roc_4v_pct REAL,
+    vwap_24h REAL,
+
     -- Contexto micro 1m
     rsi_7_1m REAL,
     wick_upper_pct_1m REAL,

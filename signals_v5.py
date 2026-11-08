@@ -717,11 +717,22 @@ class SignalGenerator:
         _ema200_15m = _i15_ctx.get('ema200_15m')
         _ema200_dist_pct = ((price - _ema200_15m) / _ema200_15m) * 100.0 if _ema200_15m and price else 0.0
         _atr_pct_15m = (atr / price * 100) if price > 0 else 0
+        _feat_v11 = {}
+        if self.learning_engine is not None:
+            try:
+                _feat_v11 = self.learning_engine.collector.ultima_fila(symbol)
+            except Exception:
+                _feat_v11 = {}
         _bypass_ctx = {
             # P2-1a: claves canónicas alineadas con near_miss_labels / _generar_bins_bypass
             'adx_15m': adx, 'rsi_15m': rsi, 'ema200_dist_pct': _ema200_dist_pct,
             'atr_pct_15m': _atr_pct_15m,
             'mfm': mfm, 'mfm_sma5': mfm_sma5,
+            # F2.2 (I48): features v1.1 (para reglas minadas en F7)
+            'er_15m': _feat_v11.get('er_15m'),
+            'bb_width_pct_pct': _feat_v11.get('bb_width_pct_pct'),
+            'atr_ratio_1m_15m': _feat_v11.get('atr_ratio_1m_15m'),
+            'roc_4v_pct': _feat_v11.get('roc_4v_pct'),
             # alias heredados (compatibilidad con reglas pre-fix con claves sin sufijo)
             'adx': adx, 'rsi': rsi, 'atr_pct': _atr_pct_15m,
         }
@@ -1143,6 +1154,18 @@ class SignalGenerator:
         return 'NEUTRAL', 'NINGUNA'
 
     def _determinar_regimen_4h(self, symbol: str) -> str:
+        """F2.2 (I49): wrapper -> alias del RegimeClassifier unificado.
+
+        Fallback al regimen 4h por EMAs si no hay learning_engine o si el
+        regimen aun es UNKNOWN (primeras velas tras arranque).
+        """
+        if self.learning_engine is not None:
+            try:
+                _reg = self.learning_engine.regime_cls.regimen_actual.get(symbol)
+                if _reg and _reg != 'UNKNOWN':
+                    return self.learning_engine.regime_cls.to_alias(_reg)
+            except Exception:
+                pass
         i4h = self.indicadores_4h.get(symbol, {})
         if not i4h:
             return 'NEUTRAL'
