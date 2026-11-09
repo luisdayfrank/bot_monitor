@@ -4032,6 +4032,26 @@ class GridExecutor:
         if not state.activa or state.cerrando:
             return
 
+        # F4.4 (I9): invalidacion de nivel de la ruta breakout (F4.2).
+        # El nivel vive en el SignalState (signals); el executor lo lee via
+        # self.signal_states (B5, mismo dict inyectado en __init__).
+        _sig = (self.signal_states.get(symbol)
+                if getattr(self, 'signal_states', None) else None)
+        _inval = getattr(_sig, 'breakout_invalidation_level', None)
+        if _inval:
+            _px = self.precios_vivo.get(symbol, 0) or 0
+            if _px > 0:
+                if state.grid_mode == 'SHORT' and _px > _inval:
+                    print(f"  [INVALIDACION] {symbol} SHORT invalidado "
+                          f"(precio {_px:.4f} > {_inval:.4f})")
+                    await self._abortar_grid(symbol, 'breakout_invalidado')
+                    return
+                if state.grid_mode == 'LONG' and _px < _inval:
+                    print(f"  [INVALIDACION] {symbol} LONG invalidado "
+                          f"(precio {_px:.4f} < {_inval:.4f})")
+                    await self._abortar_grid(symbol, 'breakout_invalidado')
+                    return
+
         # Timeout global del grid (no por posición, ya que es posición neta)
         tiempo_vida = int(time.time()) - int(state.timestamp_inicio)
         timeout_grid = getattr(CONFIG, 'grid_direccional_timeout_min', 120) * 60  # default 2h

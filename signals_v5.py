@@ -72,6 +72,9 @@ class SignalState:
         self.grid_pausa_hasta = 0        # time.time() (segundos)
         self.fire_payload = None         # I24-A: contextos/prob para emitir al confirmar
 
+        # F4.2: nivel de invalidacion de la ruta breakout (lo consume F3.2/F4.4)
+        self.breakout_invalidation_level = None
+
         # FASE 5.5: Metricas diarias acumuladas
         self.metricas_dia: dict = {
             'score_max': 0,
@@ -1612,8 +1615,9 @@ class SignalGenerator:
         }
 
         self._historial_1m[symbol].append(registro)
-        if len(self._historial_1m[symbol]) > 5:
-            self._historial_1m[symbol] = self._historial_1m[symbol][-5:]
+        # I8 (F4.1): el gatillo breakout necesita Donchian12 + 2 cierres (14)
+        if len(self._historial_1m[symbol]) > 20:
+            self._historial_1m[symbol] = self._historial_1m[symbol][-20:]
 
     async def _actualizar_estado_maquina(self, symbol: str):
         state = self.states[symbol]
@@ -1711,7 +1715,8 @@ class SignalGenerator:
                             conn.execute(
                                 "UPDATE feature_snapshots SET evento_asociado = NULL, "
                                 "evento_id = NULL WHERE symbol = ? AND timestamp_15m = ? "
-                                "AND evento_asociado = 'FIRE'", (sym, ts))
+                                "AND evento_asociado IN ('FIRE', 'FIRE_BREAKOUT')",
+                                (sym, ts))
                             conn.commit()
                         await _ldb._run(_desmarcar)
                         # I67: quitar la marca pendiente del collector (si el
@@ -2040,6 +2045,105 @@ class SignalGenerator:
     # GATILLO Y DISPARO
     # ═══════════════════════════════════════════════════════════════════════════════
     async def evaluar_gatillo(self, symbol: str):
+        """F4.3: dispatch por regimen -> breakout (TREND/PANIC) o mean-rev."""
+        state = self.states[symbol]
+        if not self.indicadores_1m.get(symbol):
+            return
+        if state.estado != 'ARMED':
+            return
+        if state.grid_pausa_hasta > time.time():
+            return
+        _reg = 'RANGE'
+        if self.learning_engine is not None:
+            try:
+                _reg = self.learning_engine.regime_cls.regimen_actual.get(
+                    symbol, 'RANGE')
+            except Exception:
+                _reg = 'RANGE'
+        if _reg in ('TREND_UP', 'TREND_DOWN', 'PANIC'):
+            await self.evaluar_gatillo_breakout(symbol)
+        else:
+            await self.evaluar_gatillo_mean_rev(symbol)
+
+    async def evaluar_gatillo_breakout(self, symbol: str):
+        """F4.1: gatillo breakout (BOS Donchian12 1m + volumen + MFM).
+
+        Ruta paralela a mean-rev; solo activa en TREND_UP/TREND_DOWN/PANIC.
+        """
+        i1m = self.indicadores_1m.get(symbol)
+        i15 = self.indicadores_15m.get(symbol)
+        state = self.states[symbol]
+        if not i1m or not i15 or state.estado != 'ARMED':
+            return
+        if state.grid_pausa_hasta > time.time():
+            return
+        if state.moneda_pausada or state.moneda_pausada_manual:
+            return
+
+        _reg = 'RANGE'
+        if self.learning_engine is not None:
+            try:
+                _reg = self.learning_engine.regime_cls.regimen_actual.get(
+                    symbol, 'RANGE')
+            except Exception:
+                _reg = 'RANGE'
+        if _reg not in ('TREND_UP', 'TREND_DOWN', 'PANIC'):
+            return
+
+        direction = 'SHORT' if _reg in ('TREND_DOWN', 'PANIC') else 'LONG'
+
+        # -- BOS (I75 ruta A): Donchian12 de las 12 velas PREVIAS a los 2
+        #    cierres de confirmacion. Requiere >= 14 velas (I8: cap 20). --
+        hist = self._historial_1m.get(symbol) or []
+        if len(hist) < 14:
+            return
+        nivel_ventana = hist[-14:-2]
+        highs = [h.get('high') for h in nivel_ventana if h.get('high') is not None]
+        lows = [h.get('low') for h in nivel_ventana if h.get('low') is not None]
+        closes_conf = [h.get('close') for h in hist[-2:] if h.get('close') is not None]
+        if len(highs) < 12 or len(lows) < 12 or len(closes_conf) < 2:
+            return
+        don_high_12 = max(highs)
+        don_low_12 = min(lows)
+        precio_actual = float(i1m.get('close') or 0)
+        if precio_actual <= 0:
+            return
+
+        if direction == 'SHORT':
+            rompio = precio_actual < don_low_12
+            confirmado = all(c < don_low_12 for c in closes_conf)
+        else:
+            rompio = precio_actual > don_high_12
+            confirmado = all(c > don_high_12 for c in closes_conf)
+        if not (rompio and confirmado):
+            return
+
+        # -- Volumen: 1m Y 15m deben confirmar --
+        vol_ratio_1m = (i1m.get('volume') or 0) / max(i1m.get('volume_sma20') or 1, 1)
+        vol_ratio_15m = (i15.get('volume') or 0) / max(i15.get('volume_sma20') or 1, 1)
+        if vol_ratio_1m < 2.0 or vol_ratio_15m < 1.5:
+            return
+
+        # -- MFM alineado (relax en PANIC) --
+        mfm = i15.get('mfm_sma5') or 0
+        umbral_mfm = -0.40 if _reg == 'PANIC' else -0.25
+        if direction == 'SHORT' and mfm > umbral_mfm:
+            return
+        if direction == 'LONG' and mfm < -umbral_mfm:
+            return
+
+        # -- Anti-duplicacion (I74): 1 grid por simbolo --
+        if hasattr(self, 'executor') and self.executor:
+            if symbol in self.executor._grids:
+                print(f"  [BREAKOUT] {symbol} ya tiene grid activo, no re-dispara")
+                return
+
+        state.score_macro_actual = 80
+        state.direccion_filtro = direction
+        await self._procesar_disparo_breakout(
+            symbol, direction, precio_actual, i1m, i15, _reg)
+
+    async def evaluar_gatillo_mean_rev(self, symbol: str):
         i1m = self.indicadores_1m.get(symbol)
         state = self.states[symbol]
 
@@ -2105,6 +2209,138 @@ class SignalGenerator:
             rsi_trigger = rsi_7 <= CONFIG.rsi_micro_long_trigger
             if rsi_trigger and mecha_valida_long:
                 await self._procesar_disparo(symbol, direction, price, i1m, i15)
+
+    async def _procesar_disparo_breakout(self, symbol, direction, price,
+                                         i1m, i15, regimen):
+        """F4.2: disparo de la ruta breakout (paralela a mean-rev).
+
+        F0.6: encola y espera confirmacion (sin COOLDOWN ciego).
+        I24-A: log_fire/alerta se emiten en la confirmacion OK (payload).
+        F3.2/I56/I66: setea breakout_invalidation_level y campos de CB.
+        """
+        state = self.states[symbol]
+        i4h = self.indicadores_4h.get(symbol, {})
+        atr_15m = i15.get('atr') or (price * 0.001)
+
+        params, rechazos = self.calcular_parametros_grid_blindado(
+            price, direction, atr_15m, i15, i4h, symbol, state)
+        if rechazos or not params:
+            print(f"  [BREAKOUT] {symbol} rechazado: "
+                  f"{rechazos[0] if rechazos else 'sin params'}")
+            return
+
+        # Invalidacion de nivel (F3.2/F4.4, I75 ruta A): MISMA ventana del
+        # gatillo (Donchian12 de hist[-14:-2]) +- 0.5*ATR15m.
+        hist = self._historial_1m.get(symbol) or []
+        state.breakout_invalidation_level = None
+        if len(hist) >= 14:
+            nivel_ventana = hist[-14:-2]
+            highs = [h.get('high') for h in nivel_ventana if h.get('high') is not None]
+            lows = [h.get('low') for h in nivel_ventana if h.get('low') is not None]
+            if len(highs) >= 12 and len(lows) >= 12:
+                margen = atr_15m * 0.5
+                state.breakout_invalidation_level = (
+                    min(lows) + margen if direction == 'SHORT'
+                    else max(highs) - margen)
+
+        state.estado = 'FIRE'
+        state.ultimo_disparo_timestamp_15m = i15.get('timestamp', 0)
+        state.ultima_direccion = direction
+        state.ultimo_score = 80
+        state.ultimos_params = params
+        state.ultimo_disparo_precio = price
+        state.ultimo_disparo_direccion = direction
+        state.ultimo_disparo_evaluado = False
+
+        # F0.2: marcar snapshot (I71: B8-A desmarca FIRE_BREAKOUT tambien)
+        if self.learning_engine is not None:
+            try:
+                self.learning_engine.collector.marcar_evento(
+                    symbol=symbol, tipo='FIRE_BREAKOUT',
+                    evento_id=state.ultimo_disparo_timestamp_15m,
+                    timestamp_15m=i15.get('timestamp', 0))
+            except Exception as e:
+                print(f"  [BREAKOUT] marcar FIRE_BREAKOUT {symbol}: {e}")
+
+        print(f"  [BREAKOUT] {symbol} FIRE {direction} | regimen {regimen} | "
+              f"invalidacion {state.breakout_invalidation_level}")
+
+        # I24-A: payload diferido (misma forma que mean-rev; prob=None)
+        state.fire_payload = {
+            'direction': direction,
+            'price': price,
+            'score': 80,
+            'params': params,
+            'prob': None,
+            'regime': regimen,
+            'contexto_1m': {
+                'rsi_7': i1m.get('rsi_7'),
+                'ema_300': i1m.get('ema_300'),
+                'close': i1m.get('close'),
+                'high': i1m.get('high'),
+                'low': i1m.get('low'),
+                'wick_upper_pct': i1m.get('wick_upper_pct'),
+                'wick_lower_pct': i1m.get('wick_lower_pct'),
+                'body_direction': i1m.get('body_direction'),
+                'volume': i1m.get('volume'),
+                'volume_sma20': i1m.get('volume_sma20'),
+                'atr_1m': i1m.get('atr_1m'),
+                'mecha_valida_short': i1m.get('mecha_valida_short'),
+                'mecha_valida_long': i1m.get('mecha_valida_long'),
+                'ema300_distancia_pct': i1m.get('ema300_distancia_pct'),
+            },
+            'contexto_15m': {
+                'rsi': i15.get('rsi'),
+                'adx': i15.get('adx'),
+                'macd_hist': i15.get('macd_hist'),
+                'atr': i15.get('atr'),
+                'ema200_15m': i15.get('ema200_15m'),
+                'ema50_15m': i15.get('ema50_15m'),
+                'volume': i15.get('volume'),
+                'volume_sma20': i15.get('volume_sma20'),
+                'recent_high': i15.get('recent_high'),
+                'recent_low': i15.get('recent_low'),
+                'mfm_15m': i15.get('mfm_15m'),
+                'mfm_sma5': i15.get('mfm_sma5'),
+            },
+            'contexto_4h': {
+                'ema200_4h': i4h.get('ema200_4h'),
+                'close': i4h.get('close'),
+            },
+        }
+
+        # F0.6: enqueue + esperar confirmacion (NO COOLDOWN ciego)
+        if (CONFIG.trading_mode in ('TESTNET', 'REAL') and
+                hasattr(self, 'executor') and self.executor):
+            try:
+                self.executor._grid_pending_creation.pop(symbol, None)   # B7
+            except Exception:
+                pass
+            state.esperando_grid_ok = True
+            state.grid_creado_ok = None
+            state.grid_creado_motivo = None
+            state.grid_creado_ts = time.time()
+            try:
+                await self.executor.queue.put({
+                    'tipo': 'CREAR_GRID',
+                    'symbol': symbol,
+                    'direction': direction,
+                    'params': params,
+                    'price': price
+                })
+                print(f"  [FASE 1] {symbol} CREAR_GRID (breakout) encolado, "
+                      f"esperando confirmacion...")
+            except Exception as e:
+                state.esperando_grid_ok = False
+                state.grid_creado_ok = False
+                state.grid_creado_motivo = f'enqueue_error: {e}'
+                print(f"  [BREAKOUT] {symbol} error enqueue: {e}")
+            return
+
+        # I19: sin executor -> cooldown real
+        state.estado = 'COOLDOWN'
+        state.cooldown_hasta = int(datetime.now(pytz.UTC).timestamp() * 1000) + 900_000
+        print(f"  [ESTADO] {symbol} -> COOLDOWN (breakout sin executor, cooldown 15m)")
 
     async def _procesar_disparo(self, symbol: str, direction: str, price: float, i1m: dict, i15: dict):
         state = self.states[symbol]
