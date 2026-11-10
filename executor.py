@@ -1950,9 +1950,11 @@ class GridExecutor:
             _atr15_ex = _i15_ex.get('atr') if _i15_ex else None
             if _atr1_ex and _atr15_ex and float(_atr15_ex) > 0:
                 _ratio_ex = float(_atr1_ex) / float(_atr15_ex)
-                if _ratio_ex > 1.5:
-                    print(f"  [EXECUTOR] {state.symbol} expansion ATR ratio "
-                          f"{_ratio_ex:.2f} > 1.5 -> abortando grid neutral")
+                _ratio_norm_ex = _ratio_ex * (15 ** 0.5)   # I80-A
+                if _ratio_norm_ex > 1.5:
+                    print(f"  [EXECUTOR] {state.symbol} expansion ATR ratio_norm "
+                          f"{_ratio_norm_ex:.2f} > 1.5 (raw={_ratio_ex:.2f}) "
+                          f"-> abortando grid neutral")
                     await self._abortar_grid(state.symbol, 'expansion_atr_ratio')
                     return []
 

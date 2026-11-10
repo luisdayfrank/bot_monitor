@@ -221,6 +221,30 @@ async def cargar_velas_mirror(symbol: str, desde_ms: int, hasta_ms: int):
     return await _run(_op)
 
 
+async def cargar_bb_width_hist(limit: int = 30):
+    """F5.1/I79-A: ultimos N bb_width_pct por simbolo (warm-start del histograma).
+
+    Retorna dict symbol -> lista de bb_width_pct (orden ASC, mas viejo primero).
+    """
+    def _op():
+        conn = _get_conn()
+        syms = [r[0] for r in conn.execute(
+            "SELECT DISTINCT symbol FROM feature_snapshots "
+            "WHERE bb_width_pct IS NOT NULL").fetchall()]
+        out = {}
+        for sym in syms:
+            rows = conn.execute(
+                "SELECT bb_width_pct FROM feature_snapshots "
+                "WHERE symbol = ? AND bb_width_pct IS NOT NULL "
+                "ORDER BY timestamp_15m DESC LIMIT ?",
+                (sym, int(limit))).fetchall()
+            vals = [float(r[0]) for r in reversed(rows)]
+            if vals:
+                out[sym] = vals
+        return out
+    return await _run(_op)
+
+
 async def backfill_features_v1_1():
     """F1.4: rellena columnas v1.1 en snapshots v1.0 desde velas_15m_mirror.
 

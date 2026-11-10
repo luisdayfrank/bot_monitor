@@ -192,11 +192,13 @@ class RegimeClassifier:
         ema7 = f.get('ema7_ema25_spread_pct')
         rel50 = f.get('price_rel_ema50_pct') or 0
         atr_pct = f.get('atr_pct_15m') or 0
-        atr_ratio = f.get('atr_ratio_1m_15m') or 1.0
+        atr_ratio = f.get('atr_ratio_1m_15m')
         roc_4v = f.get('roc_4v_pct') or 0
 
-        # 1. PANIC (prioridad maxima)
-        if atr_ratio > 1.5 or roc_4v < -3.0:
+        # 1. PANIC (prioridad maxima) — I80-A: ratio normalizado por sqrt(15)
+        _atr_ratio_norm = (float(atr_ratio) * (15 ** 0.5)
+                           if atr_ratio is not None else 0.0)
+        if _atr_ratio_norm > 1.5 or roc_4v < -3.0:
             return 'PANIC'
 
         # 2. TREND (ADX + ER; ER es el discriminador clave)
@@ -1833,8 +1835,31 @@ class LearningEngine:
             tick += 1
             await asyncio.sleep(60)
 
+    async def _warm_start_bb_hist(self):
+        """F5.1/I79-A: siembra _bb_width_hist desde SQLite (ultimos 30 valores).
+
+        Evita que el veto SQUEEZE quede ciego ~12.5h tras cada reinicio.
+        """
+        try:
+            hist = await ldb.cargar_bb_width_hist(limit=30)
+            c = self.collector
+            with c._lock:
+                for sym, vals in hist.items():
+                    dq = c._bb_width_hist[sym]
+                    for v in vals:
+                        dq.append(v)
+            self._bb_warm_hecho = True
+            print(f"  [F5.1/I79] warm-start bb_width_hist: "
+                  f"{len(hist)} simbolos sembrados")
+        except Exception as e:
+            print(f"  [F5.1/I79] warm-start bb_width_hist error: {e}")
+
     async def _tick(self, tick: int):
         ahora = time.time()
+
+        # F5.1/I79-A: warm-start del histograma bb_width (una vez por proceso)
+        if not getattr(self, '_bb_warm_hecho', False):
+            await self._warm_start_bb_hist()
 
         # 1) Flush de snapshots + transiciones de régimen (batch executemany)
         filas = self.collector.drenar_buffer()

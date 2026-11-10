@@ -313,14 +313,16 @@ class SignalGenerator:
             if tiempo_min > timeout_moneda:
                 return True, f"Timeout: {tiempo_min:.0f}min > {timeout_moneda}min"
 
-        # 2. F5.2/I76: EXPANSION DE VOLATILIDAD 1m vs 15m (live)
+        # 2. F5.2/I76/I80-A: EXPANSION DE VOLATILIDAD 1m vs 15m (live, normalizado)
         _i1m_ab = self.indicadores_1m.get(symbol, {})
         _atr_1m_ab = _i1m_ab.get('atr_1m') if _i1m_ab else None
         _atr15_ab = i15.get('atr', 0)
         if _atr_1m_ab and _atr15_ab and float(_atr15_ab) > 0:
             _ratio_ab = float(_atr_1m_ab) / float(_atr15_ab)
-            if _ratio_ab > 1.5:
-                return True, f"EXPANSION_ATR: atr_ratio={_ratio_ab:.2f} > 1.5"
+            _ratio_norm = _ratio_ab * (15 ** 0.5)
+            if _ratio_norm > 1.5:
+                return True, (f"EXPANSION_ATR: atr_ratio_norm={_ratio_norm:.2f}"
+                              f" > 1.5 (raw={_ratio_ab:.2f})")
 
         # 2. ATR explosivo: umbral más alto (2.5 en vez de 1.5)
         atr = i15.get('atr', 0)
