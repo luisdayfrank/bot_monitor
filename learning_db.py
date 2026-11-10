@@ -161,6 +161,44 @@ async def init_learning_db(db_path: str = "crypto_learning.db"):
         except Exception as e:
             print(f"  [LEARN-DB] F0.4 purga v1.2: {e}")
     await _run(_purgar_bypass_rules_v2)
+    # I68: normalizar tipo_rechazo (texto libre -> codigos minables)
+    def _normalizar_tipos_rechazo_v13():
+        try:
+            ya = _conn.execute(
+                "SELECT 1 FROM schema_versions WHERE componente = 'PATTERNS' "
+                "AND version = 'v1.3_norm_tipos'").fetchone()
+            if ya:
+                return
+            _conn.execute("""
+                UPDATE near_miss_labels SET tipo_rechazo = CASE
+                  WHEN tipo_rechazo IN ('MFM_BAJO','RSI_EXTREMO','ADX_EXTREMO',
+                       'ATR_COMPRIMIDO','VOLUMEN_BAJO','MACD_EXPLOSIVO',
+                       'COMPRESION_SQUEEZE','EXPANSION_ATR','STEP_PCT_BAJO',
+                       'QTY_INSUFICIENTE','NEUTRAL_CONVICCION','OTRO')
+                       THEN tipo_rechazo
+                  WHEN tipo_rechazo LIKE '%SQUEEZE%' THEN 'COMPRESION_SQUEEZE'
+                  WHEN tipo_rechazo LIKE '%EXPANSION%' THEN 'EXPANSION_ATR'
+                  WHEN tipo_rechazo LIKE 'MFM contradictorio%' THEN 'MFM_BAJO'
+                  WHEN tipo_rechazo LIKE 'RSI %' THEN 'RSI_EXTREMO'
+                  WHEN tipo_rechazo LIKE 'ADX %' THEN 'ADX_EXTREMO'
+                  WHEN tipo_rechazo LIKE 'ATR %' THEN 'ATR_COMPRIMIDO'
+                  WHEN tipo_rechazo LIKE 'Volumen bajo%' THEN 'VOLUMEN_BAJO'
+                  WHEN tipo_rechazo LIKE 'MACD%' THEN 'MACD_EXPLOSIVO'
+                  WHEN tipo_rechazo LIKE 'step_pct%' THEN 'STEP_PCT_BAJO'
+                  WHEN tipo_rechazo LIKE 'Qty%' THEN 'QTY_INSUFICIENTE'
+                  ELSE 'OTRO' END
+            """)
+            _conn.execute(
+                "INSERT OR IGNORE INTO schema_versions "
+                "(componente, version, aplicado_utc, changelog, activo) "
+                "VALUES ('PATTERNS', 'v1.3_norm_tipos', ?, "
+                "'I68: codigos limpios de tipo_rechazo para mineria', 1)",
+                (int(time.time() * 1000),))
+            _conn.commit()
+            print("  [LEARN-DB] I68: tipo_rechazo normalizado (v1.3)")
+        except Exception as e:
+            print(f"  [LEARN-DB] I68 norm_tipos: {e}")
+    await _run(_normalizar_tipos_rechazo_v13)
     print(f"  🧠 [LEARN-DB] crypto_learning.db abierta ({db_path}) | journal_mode={modo}")
     return modo
 
@@ -611,6 +649,102 @@ async def guardar_near_miss_labels_batch(rows: list):
         conn.executemany(sql, filas)
         conn.commit()
         return len(filas)
+
+    return await _run(_op)
+
+
+_FIRE_LABEL_COLS = [
+    'fire_evento_id', 'snapshot_id', 'symbol', 'timestamp_fire', 'direction',
+    'regime', 'score_macro', 'adx_15m', 'rsi_15m', 'mfm_15m', 'atr_pct_15m',
+    'er_15m', 'bb_width_pct_pct', 'pct_b', 'atr_ratio_1m_15m', 'roc_4v_pct',
+    'ema200_dist_pct', 'volume_ratio', 'rsi_7_1m', 'wick_pct_1m', 'body_dir_1m',
+    'precio_entrada', 'precio_salida_2h', 'precio_salida_4h',
+    'ret_neto_2h_pct', 'ret_neto_4h_pct', 'mfe_2h_pct', 'mae_2h_pct',
+    'grid_levels_touched', 'grid_roundtrips', 'grid_pnl_usdt',
+    'rentable_neto_2h', 'rentable_neto_4h', 'significativo_katr',
+    'feature_schema_version',
+]
+
+
+async def guardar_fire_labels_batch(rows: list):
+    """F6.3: INSERT OR IGNORE batch en fire_labels."""
+    if not rows:
+        return 0
+    filas = [tuple(r.get(c) for c in _FIRE_LABEL_COLS) for r in rows]
+    ph = ", ".join(["?"] * len(_FIRE_LABEL_COLS))
+    sql = (f"INSERT OR IGNORE INTO fire_labels "
+           f"({', '.join(_FIRE_LABEL_COLS)}) VALUES ({ph})")
+
+    def _op():
+        conn = _get_conn()
+        conn.executemany(sql, filas)
+        conn.commit()
+        return len(filas)
+
+    return await _run(_op)
+
+
+_BREAKOUT_LABEL_COLS = [
+    'symbol', 'timestamp_15m', 'direction', 'regimen', 'nivel_roto',
+    'donchian_high_20', 'donchian_low_20', 'er_15m', 'bb_width_pct_pct',
+    'pct_b', 'atr_ratio_1m_15m', 'roc_4v_pct', 'volume_ratio_1m',
+    'volume_ratio_15m', 'mfm_sma5', 'vwap_24h', 'continuacion', 'fakeout',
+    'mfe_pct_2h', 'mae_pct_2h', 'minutos_continuacion', 'nivel_invalidacion',
+    'feature_schema_version',
+]
+
+
+async def guardar_breakout_labels_batch(rows: list):
+    """F6.4: INSERT OR IGNORE batch en breakout_labels."""
+    if not rows:
+        return 0
+    filas = [tuple(r.get(c) for c in _BREAKOUT_LABEL_COLS) for r in rows]
+    ph = ", ".join(["?"] * len(_BREAKOUT_LABEL_COLS))
+    sql = (f"INSERT OR IGNORE INTO breakout_labels "
+           f"({', '.join(_BREAKOUT_LABEL_COLS)}) VALUES ({ph})")
+
+    def _op():
+        conn = _get_conn()
+        conn.executemany(sql, filas)
+        conn.commit()
+        return len(filas)
+
+    return await _run(_op)
+
+
+async def cargar_snapshots_breakout_candidatos(horas: int = 24 * 7,
+                                                antes_de_ms: int = 0,
+                                                limit: int = 400):
+    """F6.4: snapshots TREND/PANIC con cierre fuera de Donchian20 sin label."""
+    def _op():
+        conn = _get_conn()
+        ts_corte = int(time.time() * 1000) - horas * 3600_000
+        rows = conn.execute(
+            "SELECT fs.* FROM feature_snapshots fs "
+            "LEFT JOIN breakout_labels bl ON bl.symbol = fs.symbol "
+            "AND bl.timestamp_15m = fs.timestamp_15m "
+            "WHERE fs.timestamp_15m >= ? AND fs.timestamp_15m <= ? "
+            "AND fs.regime_confirmado IN ('TREND_UP','TREND_DOWN','PANIC') "
+            "AND fs.donchian_high_20 IS NOT NULL "
+            "AND fs.donchian_low_20 IS NOT NULL AND bl.id IS NULL "
+            "ORDER BY fs.timestamp_15m ASC LIMIT ?",
+            (ts_corte, int(antes_de_ms), int(limit))).fetchall()
+        return [dict(r) for r in rows]
+
+    return await _run(_op)
+
+
+async def cargar_snapshot_cercano(symbol: str, ts_ms: int,
+                                  ventana_ms: int = 45 * 60_000):
+    """F6.3/I82: snapshot mas cercano hacia atras (ventana acotada)."""
+    def _op():
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT * FROM feature_snapshots WHERE symbol = ? "
+            "AND timestamp_15m <= ? AND timestamp_15m >= ? "
+            "ORDER BY timestamp_15m DESC LIMIT 1",
+            (symbol, int(ts_ms), int(ts_ms - ventana_ms))).fetchone()
+        return dict(row) if row else None
 
     return await _run(_op)
 

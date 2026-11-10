@@ -503,3 +503,68 @@ CREATE TABLE IF NOT EXISTS bypass_rules (
 );
 CREATE INDEX IF NOT EXISTS idx_br_active ON bypass_rules(is_active);
 CREATE INDEX IF NOT EXISTS idx_br_regime_filter ON bypass_rules(regime, rejected_filter);
+
+-- ----------------------------------------------------------------------------
+-- F6.1: fire_labels — outcome de cada FIRE confirmado (grid real)
+-- Fuente: FireOutcomeImporter (MySQL auditoria_eventos + muestras + grids)
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS fire_labels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fire_evento_id INTEGER,
+    snapshot_id INTEGER,
+    symbol TEXT NOT NULL,
+    timestamp_fire INTEGER NOT NULL,          -- epoch_ms UTC
+    direction TEXT NOT NULL,
+    regime TEXT,
+    score_macro INTEGER,
+    adx_15m REAL, rsi_15m REAL, mfm_15m REAL, atr_pct_15m REAL,
+    er_15m REAL, bb_width_pct_pct REAL, pct_b REAL,
+    atr_ratio_1m_15m REAL, roc_4v_pct REAL,
+    ema200_dist_pct REAL, volume_ratio REAL,
+    rsi_7_1m REAL, wick_pct_1m REAL, body_dir_1m INTEGER,
+    precio_entrada REAL,
+    precio_salida_2h REAL, precio_salida_4h REAL,
+    ret_neto_2h_pct REAL, ret_neto_4h_pct REAL,
+    mfe_2h_pct REAL, mae_2h_pct REAL,
+    grid_levels_touched INTEGER,
+    grid_roundtrips INTEGER,
+    grid_pnl_usdt REAL,
+    rentable_neto_2h INTEGER,
+    rentable_neto_4h INTEGER,
+    significativo_katr INTEGER,
+    feature_schema_version TEXT DEFAULT 'v1.1',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(symbol, timestamp_fire, direction)
+);
+CREATE INDEX IF NOT EXISTS idx_fl_symbol_ts ON fire_labels(symbol, timestamp_fire);
+CREATE INDEX IF NOT EXISTS idx_fl_regime ON fire_labels(regime);
+CREATE INDEX IF NOT EXISTS idx_fl_rentable ON fire_labels(rentable_neto_2h);
+
+-- ----------------------------------------------------------------------------
+-- F6.2: breakout_labels — continuacion vs fakeout de rupturas 15m
+-- Fuente: BreakoutOutcomeLabeler (snapshots + velas_15m_mirror)
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS breakout_labels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    timestamp_15m INTEGER NOT NULL,
+    direction TEXT NOT NULL,
+    regimen TEXT NOT NULL,
+    nivel_roto REAL,
+    donchian_high_20 REAL, donchian_low_20 REAL,
+    er_15m REAL, bb_width_pct_pct REAL, pct_b REAL,
+    atr_ratio_1m_15m REAL, roc_4v_pct REAL,
+    volume_ratio_1m REAL, volume_ratio_15m REAL,
+    mfm_sma5 REAL, vwap_24h REAL,
+    continuacion BOOLEAN,
+    fakeout BOOLEAN,
+    mfe_pct_2h REAL, mae_pct_2h REAL,
+    minutos_continuacion INTEGER,
+    nivel_invalidacion REAL,
+    feature_schema_version TEXT DEFAULT 'v1.1',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(symbol, timestamp_15m, direction)
+);
+CREATE INDEX IF NOT EXISTS idx_bl_symbol_ts ON breakout_labels(symbol, timestamp_15m);
+CREATE INDEX IF NOT EXISTS idx_bl_regimen ON breakout_labels(regimen);
+CREATE INDEX IF NOT EXISTS idx_bl_cont ON breakout_labels(continuacion);

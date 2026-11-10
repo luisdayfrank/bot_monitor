@@ -2027,6 +2027,21 @@ async def cargar_grid_ejecuciones_activos():
         return [dict(row) for row in rows]
 
 
+async def cargar_grid_ejecuciones_por_ventana(symbol: str, ts_epoch: float,
+                                              before_s: int = 120,
+                                              after_s: int = 600):
+    """F6.3/I69: grids del symbol creados alrededor de un FIRE (epoch seg)."""
+    async with _conexion() as db:
+        db.row_factory = Row
+        cursor = await db.execute(
+            "SELECT * FROM grid_ejecuciones WHERE symbol = ? "
+            "AND timestamp_inicio BETWEEN ? AND ? "
+            "ORDER BY timestamp_inicio ASC",
+            (symbol, int(ts_epoch - before_s), int(ts_epoch + after_s)))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
 async def cargar_ordenes_por_grid(grid_ejecucion_id):
     """Carga órdenes de un grid de ejecución."""
     async with _conexion() as db:

@@ -34,12 +34,19 @@ import math
 import threading
 import time
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
 import learning_db as ldb
 
-from database_v5 import cargar_near_miss_seguimientos_finalizados  # F1.6
+from database_v5 import (  # F1.6 / F6
+    cargar_near_miss_seguimientos_finalizados,
+    cargar_eventos_dia,
+    cargar_muestras_post_evento,
+    cargar_grid_ejecuciones_por_ventana,
+    cargar_niveles_grid,
+    now_local,
+)
 
 MODEL_VERSION = "patterns_v1"
 
@@ -1588,6 +1595,329 @@ class DriftDetector:
 # ═══════════════════════════════════════════════════════════════════════════
 # LearningEngine — fachada + loop de background + serving
 # ═══════════════════════════════════════════════════════════════════════════
+def _parse_iso_to_ms(valor) -> Optional[int]:
+    """F6.3 (I11): ISO8601 -> epoch_ms. None si invalido."""
+    if not valor:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(valor))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return None
+
+
+_TIPOS_RECHAZO_VALIDOS = {
+    'MFM_BAJO', 'RSI_EXTREMO', 'ADX_EXTREMO', 'ATR_COMPRIMIDO',
+    'VOLUMEN_BAJO', 'MACD_EXPLOSIVO', 'COMPRESION_SQUEEZE', 'EXPANSION_ATR',
+    'STEP_PCT_BAJO', 'QTY_INSUFICIENTE', 'NEUTRAL_CONVICCION', 'OTRO',
+}
+_TIPO_RECHAZO_PREFIJOS = (
+    ('SQUEEZE', 'COMPRESION_SQUEEZE'),
+    ('EXPANSION', 'EXPANSION_ATR'),
+    ('MFM contradictorio', 'MFM_BAJO'),
+    ('RSI', 'RSI_EXTREMO'),
+    ('ADX', 'ADX_EXTREMO'),
+    ('ATR', 'ATR_COMPRIMIDO'),
+    ('Volumen bajo', 'VOLUMEN_BAJO'),
+    ('MACD', 'MACD_EXPLOSIVO'),
+    ('step_pct', 'STEP_PCT_BAJO'),
+    ('Qty', 'QTY_INSUFICIENTE'),
+)
+
+
+def _normalizar_tipo_rechazo(tipo) -> str:
+    """I68: texto libre -> codigo limpio (para mineria F0.1/F7)."""
+    if not tipo:
+        return 'OTRO'
+    t = str(tipo)
+    if t in _TIPOS_RECHAZO_VALIDOS:
+        return t
+    tl = t.lower()
+    for pref, code in _TIPO_RECHAZO_PREFIJOS:
+        if pref.lower() in tl:
+            return code
+    return 'OTRO'
+
+
+class FireOutcomeImporter:
+    """F6.3: MySQL auditoria_eventos FIRE -> SQLite fire_labels.
+
+    I69/I24: SOLO importa FIREs con grid real en grid_ejecuciones
+    (descarta los 'fantasma' que el executor rechazo).
+    """
+
+    def __init__(self, le, madurez_ms: int = 4 * 3600_000):
+        self.le = le
+        self.madurez_ms = madurez_ms
+        self._importados = set()
+        self._last_run = 0.0
+
+    def _construir_fila(self, fire, muestras, grids, snap, niveles):
+        """I11: ret/mfe/mae/grid desde muestras + grid + niveles."""
+        direction = fire.get('direccion')
+        try:
+            precio = float(fire.get('precio') or 0)
+        except Exception:
+            return None
+        if precio <= 0 or direction not in ('LONG', 'SHORT'):
+            return None
+        ts_ms = _parse_iso_to_ms(fire.get('timestamp_utc'))
+        if not ts_ms:
+            return None
+        serie = []
+        for m in muestras:
+            p = m.get('precio')
+            if p is None:
+                continue
+            mins = m.get('minutos_desde_disparo')
+            serie.append((float(mins or 0), float(p)))
+        if not serie:
+            return None
+        serie.sort(key=lambda x: x[0])
+
+        def _precio_en(minutos_obj):
+            dentro = [p for (mm, p) in serie if mm <= minutos_obj]
+            return dentro[-1] if dentro else None
+
+        p2 = _precio_en(120)
+        p4 = _precio_en(240)
+        sgn = 1.0 if direction == 'LONG' else -1.0
+        fee_total_pct = 2.0 * float(getattr(self.le, 'fee_pct', 0.05))
+
+        def _ret(p):
+            if p is None:
+                return None
+            return sgn * (p - precio) / precio * 100.0 - fee_total_pct
+
+        ret2 = _ret(p2)
+        ret4 = _ret(p4)
+        vals2 = [p for (mm, p) in serie if mm <= 120]
+        if not vals2:
+            return None
+        if direction == 'LONG':
+            mfe = (max(vals2) - precio) / precio * 100.0
+            mae = (precio - min(vals2)) / precio * 100.0
+        else:
+            mfe = (precio - min(vals2)) / precio * 100.0
+            mae = (max(vals2) - precio) / precio * 100.0
+        mfe = max(0.0, mfe)
+        mae = max(0.0, mae)
+        atr_pct = (snap or {}).get('atr_pct_15m') or 0.5
+        _mult = getattr(self.le.cfg, 'learning_atr_significance_mult', 1.5)
+        grid = grids[0] if grids else {}
+        rt = 0
+        touched = 0
+        for n in (niveles or []):
+            try:
+                v = int(n.get('roundtrips') or 0)
+            except Exception:
+                v = 0
+            rt += v
+            if v > 0:
+                touched += 1
+        wick = ((snap or {}).get('wick_upper_pct_1m') if direction == 'SHORT'
+                else (snap or {}).get('wick_lower_pct_1m'))
+        return {
+            'fire_evento_id': fire.get('id'),
+            'snapshot_id': (snap or {}).get('id'),
+            'symbol': fire.get('symbol'),
+            'timestamp_fire': ts_ms,
+            'direction': direction,
+            'regime': (snap or {}).get('regime_confirmado'),
+            'score_macro': fire.get('score'),
+            'adx_15m': (snap or {}).get('adx_15m'),
+            'rsi_15m': (snap or {}).get('rsi_15m'),
+            'mfm_15m': (snap or {}).get('mfm_15m'),
+            'atr_pct_15m': (snap or {}).get('atr_pct_15m'),
+            'er_15m': (snap or {}).get('er_15m'),
+            'bb_width_pct_pct': (snap or {}).get('bb_width_pct_pct'),
+            'pct_b': (snap or {}).get('pct_b'),
+            'atr_ratio_1m_15m': (snap or {}).get('atr_ratio_1m_15m'),
+            'roc_4v_pct': (snap or {}).get('roc_4v_pct'),
+            'ema200_dist_pct': (snap or {}).get('price_rel_ema200_pct'),
+            'volume_ratio': (snap or {}).get('volume_ratio'),
+            'rsi_7_1m': (snap or {}).get('rsi_7_1m'),
+            'wick_pct_1m': wick,
+            'body_dir_1m': (snap or {}).get('body_direction_1m'),
+            'precio_entrada': precio,
+            'precio_salida_2h': p2,
+            'precio_salida_4h': p4,
+            'ret_neto_2h_pct': round(ret2, 4) if ret2 is not None else None,
+            'ret_neto_4h_pct': round(ret4, 4) if ret4 is not None else None,
+            'mfe_2h_pct': round(mfe, 4),
+            'mae_2h_pct': round(mae, 4),
+            'grid_levels_touched': touched,
+            'grid_roundtrips': rt,
+            'grid_pnl_usdt': grid.get('pnl_real'),
+            'rentable_neto_2h': 1 if (ret2 or 0) > 0 else 0,
+            'rentable_neto_4h': 1 if (ret4 or 0) > 0 else 0,
+            'significativo_katr': 1 if mfe >= atr_pct * _mult else 0,
+            'feature_schema_version': 'v1.1',
+        }
+
+    async def run(self, ahora: float):
+        """F6.3: importa (cada 15 min) FIREs maduros con grid real."""
+        if ahora - self._last_run < 900:
+            return 0
+        self._last_run = ahora
+        filas = []
+        try:
+            hoy = now_local().strftime("%Y-%m-%d")
+            ayer = (now_local() - timedelta(days=1)).strftime("%Y-%m-%d")
+            for fecha in (hoy, ayer):
+                eventos = await cargar_eventos_dia(fecha)
+                for fire in eventos:
+                    if (fire.get('tipo') or '') != 'FIRE':
+                        continue
+                    fid = fire.get('id')
+                    if fid in self._importados:
+                        continue
+                    ts_ms = _parse_iso_to_ms(fire.get('timestamp_utc'))
+                    if not ts_ms:
+                        self._importados.add(fid)
+                        continue
+                    if (ahora * 1000.0) - ts_ms < self.madurez_ms:
+                        continue
+                    symbol = fire.get('symbol')
+                    grids = await cargar_grid_ejecuciones_por_ventana(
+                        symbol, ts_ms / 1000.0)
+                    if not grids:
+                        # I69/I24: FIRE fantasma (sin grid real) -> descartar
+                        self._importados.add(fid)
+                        continue
+                    muestras = await cargar_muestras_post_evento(fid)
+                    if not muestras:
+                        self._importados.add(fid)
+                        continue
+                    snap = await ldb.cargar_snapshot_cercano(symbol, ts_ms)
+                    niveles = await cargar_niveles_grid(grids[0].get('id'))
+                    fila = self._construir_fila(fire, muestras, grids, snap, niveles)
+                    if fila:
+                        filas.append(fila)
+                    self._importados.add(fid)
+            if filas:
+                n = await ldb.guardar_fire_labels_batch(filas)
+                print(f"  [FIRE-IMPORTER] {n} fire_labels importados")
+            return len(filas)
+        except Exception as e:
+            print(f"  [FIRE-IMPORTER] Error: {e}")
+            return 0
+
+
+class BreakoutOutcomeLabeler:
+    """F6.4: etiqueta rupturas 15m (continuacion vs fakeout) -> breakout_labels."""
+
+    def __init__(self, atr_significance_mult: float = 2.0,
+                 horas_atras: int = 24 * 7, madurez_ms: int = 150 * 60_000):
+        self.mult = atr_significance_mult
+        self.horas_atras = horas_atras
+        self.madurez_ms = madurez_ms
+        self._last_run = 0.0
+
+    def etiquetar(self, snap, velas_15m, nivel_roto, direction):
+        ts = int(snap.get('timestamp_15m') or 0)
+        atr_pct = snap.get('atr_pct_15m') or 0.5
+        umbral_mfe = atr_pct * self.mult
+        margen_inval = atr_pct * 0.5
+        inval = (nivel_roto + margen_inval if direction == 'SHORT'
+                 else nivel_roto - margen_inval)
+        futuras = [v for v in velas_15m
+                   if ts < int(v.get('timestamp') or 0) <= ts + 2 * 3600_000]
+        if len(futuras) < 4:
+            return None
+        precio0 = float(snap.get('price') or 0)
+        if precio0 <= 0:
+            return None
+        mfe = mae = 0.0
+        minuto_cont = None
+        invalido = False
+        for idx, v in enumerate(futuras, start=1):
+            hi = float(v.get('high') or 0)
+            lo = float(v.get('low') or 0)
+            if direction == 'SHORT':
+                mfe = max(mfe, (precio0 - lo) / precio0 * 100.0)
+                mae = max(mae, (hi - precio0) / precio0 * 100.0)
+                if hi > inval:
+                    invalido = True
+                    break
+            else:
+                mfe = max(mfe, (hi - precio0) / precio0 * 100.0)
+                mae = max(mae, (precio0 - lo) / precio0 * 100.0)
+                if lo < inval:
+                    invalido = True
+                    break
+            if mfe >= umbral_mfe and minuto_cont is None:
+                minuto_cont = idx * 15
+        continuacion = (minuto_cont is not None and not invalido)
+        return {
+            'symbol': snap.get('symbol'),
+            'timestamp_15m': ts,
+            'direction': direction,
+            'regimen': snap.get('regime_confirmado'),
+            'nivel_roto': float(nivel_roto),
+            'donchian_high_20': snap.get('donchian_high_20'),
+            'donchian_low_20': snap.get('donchian_low_20'),
+            'er_15m': snap.get('er_15m'),
+            'bb_width_pct_pct': snap.get('bb_width_pct_pct'),
+            'pct_b': snap.get('pct_b'),
+            'atr_ratio_1m_15m': snap.get('atr_ratio_1m_15m'),
+            'roc_4v_pct': snap.get('roc_4v_pct'),
+            'volume_ratio_1m': snap.get('volume_ratio'),
+            'volume_ratio_15m': snap.get('volume_ratio'),
+            'mfm_sma5': snap.get('mfm_sma5'),
+            'vwap_24h': snap.get('vwap_24h'),
+            'continuacion': 1 if continuacion else 0,
+            'fakeout': 1 if (not continuacion and invalido) else 0,
+            'mfe_pct_2h': round(mfe, 4),
+            'mae_pct_2h': round(mae, 4),
+            'minutos_continuacion': minuto_cont,
+            'nivel_invalidacion': inval,
+            'feature_schema_version': 'v1.1',
+        }
+
+    async def run(self, ahora: float):
+        """F6.4: etiqueta candidatos maduros (cada hora)."""
+        if ahora - self._last_run < 3600:
+            return 0
+        self._last_run = ahora
+        filas = []
+        try:
+            cands = await ldb.cargar_snapshots_breakout_candidatos(
+                horas=self.horas_atras,
+                antes_de_ms=int(ahora * 1000.0) - self.madurez_ms)
+            for snap in cands:
+                reg = snap.get('regime_confirmado')
+                if reg == 'TREND_UP':
+                    direction = 'LONG'
+                    nivel = snap.get('donchian_high_20')
+                    broke = (nivel is not None
+                             and float(snap.get('price') or 0) > float(nivel))
+                elif reg in ('TREND_DOWN', 'PANIC'):
+                    direction = 'SHORT'
+                    nivel = snap.get('donchian_low_20')
+                    broke = (nivel is not None
+                             and float(snap.get('price') or 0) < float(nivel))
+                else:
+                    continue
+                if not broke:
+                    continue
+                ts = int(snap.get('timestamp_15m') or 0)
+                velas = await ldb.cargar_velas_mirror(
+                    snap['symbol'], ts, ts + 2 * 3600_000)
+                fila = self.etiquetar(snap, velas, nivel, direction)
+                if fila:
+                    filas.append(fila)
+            if filas:
+                n = await ldb.guardar_breakout_labels_batch(filas)
+                print(f"  [BREAKOUT-LABELER] {n} breakout_labels")
+            return len(filas)
+        except Exception as e:
+            print(f"  [BREAKOUT-LABELER] Error: {e}")
+            return 0
+
+
 class LearningEngine:
     """
     Punto único de integración:
@@ -1638,6 +1968,12 @@ class LearningEngine:
 
         # F1.6: NearMissOutcomeImporter (MySQL → SQLite)
         self.nmi_importer = self.NearMissOutcomeImporter(self)
+
+        # F6.3/F6.4: importadores de labels FIRE / BREAKOUT
+        self.fire_importer = FireOutcomeImporter(self)
+        self.breakout_labeler = BreakoutOutcomeLabeler(
+            atr_significance_mult=getattr(
+                CONFIG, 'learning_atr_significance_mult', 1.5))
 
         self.learner_hora_local = learner_hora_local
         self.tz_offset = timezone_offset_horas
@@ -1972,6 +2308,10 @@ class LearningEngine:
         # F1.6: NearMissOutcomeImporter — MySQL → SQLite (cada 15 min)
         await self.nmi_importer.run(ahora)
 
+        # F6.3: FireOutcomeImporter (cada 15 min) y F6.4 labeler (cada hora)
+        await self.fire_importer.run(ahora)
+        await self.breakout_labeler.run(ahora)
+
         # F1.7: Health NMI monitor (cada hora)
         if ahora - getattr(self, '_last_nmi_health_run', 0) > 3600:
             self._last_nmi_health_run = ahora
@@ -2287,7 +2627,8 @@ class LearningEngine:
                         "timestamp_fin": int(r["timestamp_fin"] * 1000) if r.get("timestamp_fin") else None,
                         "regime": r.get("regime_4h") or "NEUTRAL",
                         "direction": r.get("direccion_nm"),
-                        "tipo_rechazo": r.get("tipo_rechazo") or "DESCONOCIDO",
+                        "tipo_rechazo": _normalizar_tipo_rechazo(
+                            r.get("tipo_rechazo") or "DESCONOCIDO"),
                         "adx_15m": r.get("adx_15m"),
                         "rsi_15m": r.get("rsi_15m"),
                         "ema200_dist_pct": r.get("ema200_dist_pct"),
