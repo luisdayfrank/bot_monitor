@@ -85,6 +85,9 @@ async def lifespan(fastapi_app):
     signals.executor = executor  # ← FASE 1: Inyectar executor
     if executor:
         executor.notifier = notifier  # ← FASE 1: Executor puede notificar
+        # F5.2 (I10): indicadores vivos para el aborto por expansion ATR
+        executor.indicadores_1m = signals.indicadores_1m
+        executor.indicadores_15m = signals.indicadores_15m
     signals.notifier = notifier  # FASE 3.2: Para alertas pre-disparo Telegram
 
     # ── LEARNING ENGINE Fases 1-8: crear e inyectar en signals + executor ──

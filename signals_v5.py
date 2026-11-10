@@ -225,8 +225,23 @@ class SignalGenerator:
         3. ATR percentil 30-70 (volatilidad moderada)
         4. Precio cerca de EMA50 (< 1% distancia)
         5. MACD histograma cerca de 0 (|hist| < 0.2 * ATR en terminos de precio)
+        6. F5.1 VETO SQUEEZE: bb_width_pct_pct < 30 (compresion previa a
+           expansion) -> NO entrar a neutral
         """
         rechazos = []
+
+        # 6. F5.1/I76: VETO DE SQUEEZE (primero, para que el motivo lo incluya)
+        _fila_v11 = {}
+        if self.learning_engine is not None:
+            try:
+                _fila_v11 = self.learning_engine.collector.ultima_fila(symbol)
+            except Exception:
+                _fila_v11 = {}
+        bb_width_pct_pct = _fila_v11.get('bb_width_pct_pct')
+        if bb_width_pct_pct is not None and bb_width_pct_pct < 30:
+            rechazos.append(
+                f"SQUEEZE: BB width en p{bb_width_pct_pct:.0f} "
+                f"(<30, compresion previa a expansion)")
 
         # 1. ADX bajo
         adx = i15.get('adx', 0)
@@ -297,6 +312,15 @@ class SignalGenerator:
             tiempo_min = (ahora - state.neutral_grid_timestamp) / 60
             if tiempo_min > timeout_moneda:
                 return True, f"Timeout: {tiempo_min:.0f}min > {timeout_moneda}min"
+
+        # 2. F5.2/I76: EXPANSION DE VOLATILIDAD 1m vs 15m (live)
+        _i1m_ab = self.indicadores_1m.get(symbol, {})
+        _atr_1m_ab = _i1m_ab.get('atr_1m') if _i1m_ab else None
+        _atr15_ab = i15.get('atr', 0)
+        if _atr_1m_ab and _atr15_ab and float(_atr15_ab) > 0:
+            _ratio_ab = float(_atr_1m_ab) / float(_atr15_ab)
+            if _ratio_ab > 1.5:
+                return True, f"EXPANSION_ATR: atr_ratio={_ratio_ab:.2f} > 1.5"
 
         # 2. ATR explosivo: umbral más alto (2.5 en vez de 1.5)
         atr = i15.get('atr', 0)
@@ -480,6 +504,31 @@ class SignalGenerator:
                         if symbol in self._grid_pending_creation:
                             del self._grid_pending_creation[symbol]
                         print(f"  [NEUTRAL_GRID] {symbol} -> MONITOREO (aborto: {razon})")
+                        # F5.3/I77: expansion ATR -> label para el learning
+                        if razon.startswith('EXPANSION_ATR') and self.audit_logger:
+                            try:
+                                _ema200_ex = data.get('ema200_15m')
+                                _px_ex = data.get('close', 0)
+                                await self.audit_logger.iniciar_seguimiento_near_miss(
+                                    symbol=symbol,
+                                    score=state.score_macro_actual,
+                                    umbral=70,
+                                    direccion='NEUTRAL', precio=_px_ex,
+                                    filtros_rechazo=[razon],
+                                    contexto={
+                                        'tipo': 'EXPANSION_ATR',
+                                        'razon': razon,
+                                        'timestamp_15m': data.get('timestamp', 0),
+                                    },
+                                    regime_4h=self._determinar_regimen_4h(symbol),
+                                    adx_15m=data.get('adx'),
+                                    rsi_15m=data.get('rsi'),
+                                    ema200_dist_pct=(
+                                        ((_px_ex - _ema200_ex) / _ema200_ex) * 100.0
+                                        if _ema200_ex and _px_ex else 0.0),
+                                    tipo_rechazo='EXPANSION_ATR')
+                            except Exception as e_nm_ex:
+                                print(f"  [F5.3] near-miss EXPANSION {symbol}: {e_nm_ex}")
                         await self._enviar_aborto_seguro(symbol, razon)
                         
                         if self.audit_logger:
@@ -953,6 +1002,29 @@ class SignalGenerator:
                 entrar_grid, razon_grid = self.evaluar_grid_neutro(symbol, i15)
                 if not entrar_grid:
                     state.neutral_grid_last_rechazo_ts = ahora_ts
+                    # F5.3/I77: label de squeeze para el learning (F7)
+                    if 'SQUEEZE' in razon_grid and self.audit_logger:
+                        try:
+                            _ema200_sq = i15.get('ema200_15m')
+                            await self.audit_logger.iniciar_seguimiento_near_miss(
+                                symbol=symbol, score=score_macro,
+                                umbral=umbral_entrada if umbral_entrada > 0 else 70,
+                                direccion='NEUTRAL', precio=price,
+                                filtros_rechazo=[razon_grid],
+                                contexto={
+                                    'tipo': 'COMPRESION_SQUEEZE',
+                                    'razon': razon_grid,
+                                    'timestamp_15m': i15.get('timestamp', 0),
+                                },
+                                regime_4h=self._determinar_regimen_4h(symbol),
+                                adx_15m=i15.get('adx'),
+                                rsi_15m=i15.get('rsi'),
+                                ema200_dist_pct=(
+                                    ((price - _ema200_sq) / _ema200_sq) * 100.0
+                                    if _ema200_sq and price else 0.0),
+                                tipo_rechazo='COMPRESION_SQUEEZE')
+                        except Exception as e_nm_sq:
+                            print(f"  [F5.3] near-miss SQUEEZE {symbol}: {e_nm_sq}")
                     return False
 
                 if entrar_grid and state.estado != 'NEUTRAL_GRID':

@@ -1940,7 +1940,22 @@ class GridExecutor:
         """
         if not state.grid_state or not state.grid_state.activa:
             return []
-        
+
+        # F5.2 (I10/I76): expansion de volatilidad en grid NEUTRAL (cada ~3s).
+        # atr_ratio = atr_1m / atr_15m (datos vivos inyectados desde main.py).
+        if state.grid_mode == 'NEUTRAL':
+            _i1m_ex = getattr(self, 'indicadores_1m', {}).get(state.symbol, {})
+            _i15_ex = getattr(self, 'indicadores_15m', {}).get(state.symbol, {})
+            _atr1_ex = _i1m_ex.get('atr_1m') if _i1m_ex else None
+            _atr15_ex = _i15_ex.get('atr') if _i15_ex else None
+            if _atr1_ex and _atr15_ex and float(_atr15_ex) > 0:
+                _ratio_ex = float(_atr1_ex) / float(_atr15_ex)
+                if _ratio_ex > 1.5:
+                    print(f"  [EXECUTOR] {state.symbol} expansion ATR ratio "
+                          f"{_ratio_ex:.2f} > 1.5 -> abortando grid neutral")
+                    await self._abortar_grid(state.symbol, 'expansion_atr_ratio')
+                    return []
+
         gs = state.grid_state
         acciones = []
 
