@@ -684,6 +684,19 @@ async def guardar_fire_labels_batch(rows: list):
     return await _run(_op)
 
 
+async def cargar_fire_labels(horas: int = 24 * 90):
+    """F7.2: fire_labels recientes para minar_fires."""
+    def _op():
+        conn = _get_conn()
+        ts_corte = int(time.time() * 1000) - horas * 3600_000
+        rows = conn.execute(
+            "SELECT * FROM fire_labels WHERE timestamp_fire >= ? "
+            "ORDER BY timestamp_fire DESC", (ts_corte,)).fetchall()
+        return [dict(r) for r in rows]
+
+    return await _run(_op)
+
+
 _BREAKOUT_LABEL_COLS = [
     'symbol', 'timestamp_15m', 'direction', 'regimen', 'nivel_roto',
     'donchian_high_20', 'donchian_low_20', 'er_15m', 'bb_width_pct_pct',
@@ -708,6 +721,19 @@ async def guardar_breakout_labels_batch(rows: list):
         conn.executemany(sql, filas)
         conn.commit()
         return len(filas)
+
+    return await _run(_op)
+
+
+async def cargar_breakout_labels(horas: int = 24 * 90):
+    """F7.4: breakout_labels recientes para minar_breakouts."""
+    def _op():
+        conn = _get_conn()
+        ts_corte = int(time.time() * 1000) - horas * 3600_000
+        rows = conn.execute(
+            "SELECT * FROM breakout_labels WHERE timestamp_15m >= ? "
+            "ORDER BY timestamp_15m DESC", (ts_corte,)).fetchall()
+        return [dict(r) for r in rows]
 
     return await _run(_op)
 
@@ -836,6 +862,67 @@ async def cargar_bypass_rules_todas():
         conn = _get_conn()
         cursor = conn.execute("SELECT * FROM bypass_rules")
         rows = cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    return await _run(_op)
+
+
+_ENTRY_RULE_COLS = [
+    'tipo_entrada', 'accion', 'symbol', 'direction', 'regime',
+    'condition_json', 'score_bonus', 'n_occurrences', 'win_rate',
+    'wilson_lower', 'lift_vs_baseline', 'is_active',
+]
+
+
+async def guardar_entry_rules_batch(rows: list):
+    """F7.1: upsert de entry_rules (globales symbol NULL incluidos).
+
+    I87: SQLite trata NULL como distinto en UNIQUE(...), asi que el upsert
+    se hace con SELECT + UPDATE/INSERT comparando COALESCE(...).
+    """
+    if not rows:
+        return 0
+
+    def _op():
+        conn = _get_conn()
+        ph = ", ".join(["?"] * len(_ENTRY_RULE_COLS))
+        sql_ins = (f"INSERT INTO entry_rules ({', '.join(_ENTRY_RULE_COLS)}) "
+                   f"VALUES ({ph})")
+        n = 0
+        for r in rows:
+            found = conn.execute(
+                "SELECT id FROM entry_rules WHERE tipo_entrada = ? "
+                "AND COALESCE(symbol,'') = COALESCE(?,'') "
+                "AND COALESCE(direction,'') = COALESCE(?,'') "
+                "AND COALESCE(regime,'') = COALESCE(?,'') "
+                "AND condition_json = ?",
+                (r.get('tipo_entrada'), r.get('symbol'), r.get('direction'),
+                 r.get('regime'), r.get('condition_json'))).fetchone()
+            if found:
+                conn.execute(
+                    "UPDATE entry_rules SET accion=?, score_bonus=?, "
+                    "n_occurrences=?, win_rate=?, wilson_lower=?, "
+                    "lift_vs_baseline=?, is_active=?, updated_at=CURRENT_TIMESTAMP "
+                    "WHERE id=?",
+                    (r.get('accion'), r.get('score_bonus') or 0,
+                     r.get('n_occurrences'), r.get('win_rate'),
+                     r.get('wilson_lower'), r.get('lift_vs_baseline'),
+                     1 if r.get('is_active') else 0, found[0]))
+            else:
+                conn.execute(sql_ins, tuple(r.get(c) for c in _ENTRY_RULE_COLS))
+            n += 1
+        conn.commit()
+        return n
+
+    return await _run(_op)
+
+
+async def cargar_entry_rules_activas():
+    """F7.5: entry_rules activas para cache RAM (F8 las consume)."""
+    def _op():
+        conn = _get_conn()
+        rows = conn.execute(
+            "SELECT * FROM entry_rules WHERE is_active = 1").fetchall()
         return [dict(r) for r in rows]
 
     return await _run(_op)

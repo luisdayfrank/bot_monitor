@@ -2042,6 +2042,106 @@ async def cargar_grid_ejecuciones_por_ventana(symbol: str, ts_epoch: float,
         return [dict(row) for row in rows]
 
 
+async def cargar_grid_outcomes(dias: int = 90, direction: str = None,
+                               engine_version_min: int = None):
+    """F7.3: outcomes de grids cerrados + features de entrada (I85).
+
+    Fuentes: grid_ejecuciones (pnl_real/razon_cierre/timestamp_inicio en
+    segundos + engine_version), grid_niveles (roundtrips) y auditoria_eventos
+    (CAMBIO_ESTADO / estado_maquina='NEUTRAL_GRID' / direccion='NEUTRAL',
+    contexto_json) emparejado por symbol y ventana de +-300 s.
+    Filas sin match de auditoria: features NULL (el minero las ignora).
+
+    I90 (F7 Ruta A): engine_version_min filtra grids que SI tienen tracking
+    de niveles (roundtrips > 0 solo existen con engine_version>=2). Sin el
+    filtro, los grids legacy (engine_version=1) entran con n_roundtrips=0
+    SIEMPRE y sesgan p_base a la baja (lift artificialmente inflado).
+    """
+    desde_s = int(datetime.now(pytz.UTC).timestamp()) - dias * 86400
+    async with _conexion() as db:
+        db.row_factory = Row
+        sql = ("SELECT id, symbol, direction, estado, pnl_real, fees_real, "
+               "razon_cierre, timestamp_inicio, precio_entrada, engine_version "
+               "FROM grid_ejecuciones WHERE estado <> 'ACTIVO' "
+               "AND pnl_real IS NOT NULL AND timestamp_inicio >= ?")
+        args = [desde_s]
+        if direction:
+            sql += " AND direction = ?"
+            args.append(direction)
+        if engine_version_min is not None:
+            sql += " AND COALESCE(engine_version, 1) >= ?"
+            args.append(int(engine_version_min))
+        cursor = await db.execute(sql, args)
+        grids = [dict(r) for r in await cursor.fetchall()]
+        if not grids:
+            return []
+
+        ids = [g['id'] for g in grids]
+        ph_ids = ", ".join(["?"] * len(ids))
+        cursor = await db.execute(
+            f"SELECT grid_ejecucion_id, "
+            f"COALESCE(SUM(roundtrips), 0) AS n_roundtrips, "
+            f"COUNT(*) AS levels FROM grid_niveles "
+            f"WHERE grid_ejecucion_id IN ({ph_ids}) "
+            f"GROUP BY grid_ejecucion_id", ids)
+        niveles = {r['grid_ejecucion_id']: dict(r)
+                   for r in await cursor.fetchall()}
+
+        symbols = sorted({g['symbol'] for g in grids})
+        ph_sym = ", ".join(["?"] * len(symbols))
+        ts_min = min(g['timestamp_inicio'] for g in grids) - 600
+        ts_max = max(g['timestamp_inicio'] for g in grids) + 600
+        iso_min = datetime.fromtimestamp(ts_min, tz=pytz.UTC).isoformat()
+        iso_max = datetime.fromtimestamp(ts_max, tz=pytz.UTC).isoformat()
+        cursor = await db.execute(
+            "SELECT symbol, timestamp_utc, contexto_json "
+            "FROM auditoria_eventos WHERE tipo = 'CAMBIO_ESTADO' "
+            "AND estado_maquina = 'NEUTRAL_GRID' AND direccion = 'NEUTRAL' "
+            f"AND timestamp_utc >= ? AND timestamp_utc <= ? "
+            f"AND symbol IN ({ph_sym})",
+            [iso_min, iso_max] + symbols)
+        auditorias = [dict(r) for r in await cursor.fetchall()]
+
+    por_symbol = {}
+    for a in auditorias:
+        try:
+            ts = datetime.fromisoformat(a['timestamp_utc']).timestamp()
+        except Exception:
+            continue
+        por_symbol.setdefault(a['symbol'], []).append(
+            (ts, a.get('contexto_json')))
+
+    out = []
+    for g in grids:
+        fila = dict(g)
+        nv = niveles.get(g['id'], {})
+        fila['n_roundtrips'] = int(nv.get('n_roundtrips') or 0)
+        fila['levels'] = int(nv.get('levels') or 0)
+        mejor = None
+        for ts, ctx_json in por_symbol.get(g['symbol'], []):
+            dist = abs(ts - float(g['timestamp_inicio']))
+            if mejor is None or dist < mejor[0]:
+                mejor = (dist, ctx_json)
+        if mejor and mejor[0] <= 300 and mejor[1]:
+            try:
+                ctx = json.loads(mejor[1])
+            except Exception:
+                ctx = {}
+            precio = ctx.get('precio') or g.get('precio_entrada')
+            atr = ctx.get('atr')
+            ema200 = ctx.get('ema200_15m')
+            fila['adx_15m'] = ctx.get('adx')
+            fila['rsi_15m'] = ctx.get('rsi')
+            fila['mfm_sma5'] = ctx.get('mfm_sma5')
+            fila['volume_ratio'] = ctx.get('volumen_ratio')
+            if precio and atr is not None:
+                fila['atr_pct_15m'] = atr / precio * 100.0
+            if precio and ema200:
+                fila['ema200_dist_pct'] = (precio - ema200) / ema200 * 100.0
+        out.append(fila)
+    return out
+
+
 async def cargar_ordenes_por_grid(grid_ejecucion_id):
     """Carga órdenes de un grid de ejecución."""
     async with _conexion() as db:

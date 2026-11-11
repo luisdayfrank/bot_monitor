@@ -568,3 +568,27 @@ CREATE TABLE IF NOT EXISTS breakout_labels (
 CREATE INDEX IF NOT EXISTS idx_bl_symbol_ts ON breakout_labels(symbol, timestamp_15m);
 CREATE INDEX IF NOT EXISTS idx_bl_regimen ON breakout_labels(regimen);
 CREATE INDEX IF NOT EXISTS idx_bl_cont ON breakout_labels(continuacion);
+
+-- ----------------------------------------------------------------------------
+-- F7.1: entry_rules — reglas de entrada minadas (FIRE/NEUTRAL/BREAKOUT).
+-- SHADOW por defecto (is_active=0); F9 promueve, F8 consume.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS entry_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tipo_entrada TEXT NOT NULL,         -- 'FIRE' | 'NEUTRAL' | 'BREAKOUT'
+    accion TEXT NOT NULL,               -- 'ALLOW' | 'BLOCK' | 'REQUIRE_SCORE'
+    symbol TEXT,                        -- NULL = global
+    direction TEXT,
+    regime TEXT,
+    condition_json TEXT NOT NULL,
+    score_bonus INTEGER DEFAULT 0,
+    n_occurrences INTEGER NOT NULL,
+    win_rate REAL NOT NULL,
+    wilson_lower REAL NOT NULL,
+    lift_vs_baseline REAL,
+    is_active INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(tipo_entrada, symbol, direction, regime, condition_json)
+);
+CREATE INDEX IF NOT EXISTS idx_er_tipo ON entry_rules(tipo_entrada, is_active);

@@ -39,12 +39,13 @@ from typing import Callable, Optional
 
 import learning_db as ldb
 
-from database_v5 import (  # F1.6 / F6
+from database_v5 import (  # F1.6 / F6 / F7
     cargar_near_miss_seguimientos_finalizados,
     cargar_eventos_dia,
     cargar_muestras_post_evento,
     cargar_grid_ejecuciones_por_ventana,
     cargar_niveles_grid,
+    cargar_grid_outcomes,
     now_local,
 )
 
@@ -1052,24 +1053,26 @@ class PatternLearner:
 
         return candidatos
 
-    def _generar_bins_bypass(self, filas: list) -> list:
+    def _generar_bins_bypass(self, filas: list, feature_keys: list = None,
+                             bins_def: dict = None) -> list:
         """
-        Genera combinaciones de bins de features para buscar reglas de bypass.
+        Genera combinaciones de bins de features.
+
+        F0.1: defaults = bypass (comportamiento intacto).
+        F7 (I84): feature_keys/bins_def parametrizables para F7.3 (atr_pct) y
+        F7.4 (features propias de breakout_labels).
         Retorna lista de (condition_json, filas_que_coinciden).
         """
         import json as _json
 
-        # Features a discretizar por régimen
-        # P2-1b: 'atr_pct_15m' ELIMINADO — no es columna de near_miss_labels y el
-        # mining la descartaba en silencio (f.get(fk) → None → valores vacío → skip).
-        feature_keys = ['adx_15m', 'rsi_15m', 'ema200_dist_pct']
-
-        # Definir bins por feature (umbrales típicos)
-        bins_def = {
-            'adx_15m': [25, 40, 50, 60],
-            'rsi_15m': [25, 30, 70, 75],
-            'ema200_dist_pct': [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0],
-        }
+        if feature_keys is None:
+            feature_keys = ['adx_15m', 'rsi_15m', 'ema200_dist_pct']
+        if bins_def is None:
+            bins_def = {
+                'adx_15m': [25, 40, 50, 60],
+                'rsi_15m': [25, 30, 70, 75],
+                'ema200_dist_pct': [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0],
+            }
 
         # Generar condiciones combinando umbrales min/max por feature
         resultados = []
@@ -1116,6 +1119,286 @@ class PatternLearner:
                             resultados.append((_json.dumps(cond), filas_c))
 
         return resultados
+
+
+    async def minar_fires(self, min_samples: int = 30,
+                          min_lift_block: float = 0.7) -> list:
+        """F7.2: entry_rules FIRE (ALLOW/BLOCK) con baseline + lift + Wilson."""
+        rows = await ldb.cargar_fire_labels(horas=24 * 90)
+        if len(rows) < min_samples * 2:
+            print("  [ENTRY-MINE] FIRE: sin labels suficientes")
+            return []
+
+        total_win = sum(1 for r in rows if r.get('rentable_neto_2h'))
+        p_base = total_win / len(rows)
+
+        grupos = defaultdict(list)
+        for r in rows:
+            grupos[(r.get('direction'), r.get('regime'))].append(r)
+
+        candidatos = []
+        for (direction, regime), filas in grupos.items():
+            if len(filas) < min_samples:
+                continue
+            for cond_json, filas_bin in self._generar_bins_bypass(filas):
+                n = len(filas_bin)
+                if n < min_samples:
+                    continue
+                wins = sum(1 for f in filas_bin if f.get('rentable_neto_2h'))
+                win_rate = wins / n
+                lo, hi = _wilson(wins, n)
+                lift = win_rate / p_base if p_base > 0 else 0.0
+
+                if hi < p_base * 0.9 and lift < min_lift_block:
+                    accion = 'BLOCK'
+                elif lo > p_base * 1.2 and lift >= 1.5:
+                    accion = 'ALLOW'
+                else:
+                    continue
+                candidatos.append({
+                    'tipo_entrada': 'FIRE', 'accion': accion,
+                    'symbol': None, 'direction': direction, 'regime': regime,
+                    'condition_json': cond_json, 'score_bonus': 0,
+                    'n_occurrences': n, 'win_rate': round(win_rate, 4),
+                    'wilson_lower': round(lo, 4),
+                    'lift_vs_baseline': round(lift, 2),
+                    'is_active': 0,
+                })
+
+        if candidatos:
+            await ldb.guardar_entry_rules_batch(candidatos)
+        print(f"  [ENTRY-MINE] FIRE: {len(candidatos)} reglas "
+              f"(baseline={p_base:.3f})")
+        return candidatos
+
+
+    async def minar_neutral_grids(self, min_samples: int = 30) -> list:
+        """F7.3: features de entrada NEUTRAL vs exito del grid.
+
+        Exito = n_roundtrips >= 3 AND pnl_real > 0.
+
+        I90 Ruta A: se filtran SOLO grids engine_version>=2. Los legacy
+        (engine_version=1) no tienen grid_niveles -> n_roundtrips=0 por
+        construccion -> hundirian p_base y duplicarian el lift de reglas
+        espurias (falso ALLOW con win_rate=0.60 y lift real 1.5).
+        """
+        outcomes = await cargar_grid_outcomes(
+            dias=90, direction='NEUTRAL', engine_version_min=2)
+        if len(outcomes) < min_samples * 2:
+            print("  [ENTRY-MINE] NEUTRAL: sin grids v2 suficientes")
+            return []
+
+        def _es_exito(o):
+            return (o.get('n_roundtrips', 0) >= 3
+                    and (o.get('pnl_real') or 0) > 0)
+
+        total_exitos = sum(1 for o in outcomes if _es_exito(o))
+        p_base = total_exitos / len(outcomes)
+
+        feas = ['adx_15m', 'rsi_15m', 'ema200_dist_pct', 'atr_pct_15m']
+        bins = {
+            'adx_15m': [25, 40, 50, 60],
+            'rsi_15m': [25, 30, 70, 75],
+            'ema200_dist_pct': [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0],
+            'atr_pct_15m': [0.5, 1.0, 1.5, 2.0],
+        }
+
+        candidatos = []
+        for cond_json, filas_bin in self._generar_bins_bypass(
+                outcomes, feature_keys=feas, bins_def=bins):
+            n = len(filas_bin)
+            if n < min_samples:
+                continue
+            exitos = sum(1 for o in filas_bin if _es_exito(o))
+            wr = exitos / n
+            lo, hi = _wilson(exitos, n)
+            lift = wr / p_base if p_base > 0 else 0.0
+
+            if lo > p_base * 1.2 and lift >= 1.5:
+                accion = 'ALLOW'
+            elif hi < p_base * 0.7:
+                accion = 'BLOCK'
+            else:
+                continue
+            candidatos.append({
+                'tipo_entrada': 'NEUTRAL', 'accion': accion,
+                'symbol': None, 'direction': 'NEUTRAL', 'regime': None,
+                'condition_json': cond_json, 'score_bonus': 0,
+                'n_occurrences': n, 'win_rate': round(wr, 4),
+                'wilson_lower': round(lo, 4),
+                'lift_vs_baseline': round(lift, 2),
+                'is_active': 0,
+            })
+
+        if candidatos:
+            await ldb.guardar_entry_rules_batch(candidatos)
+        print(f"  [ENTRY-MINE] NEUTRAL: {len(candidatos)} reglas "
+              f"(baseline={p_base:.3f})")
+        return candidatos
+
+
+    async def minar_breakouts(self, min_samples: int = 30) -> list:
+        """F7.4: calibra que features predicen continuacion vs fakeout."""
+        rows = await ldb.cargar_breakout_labels(horas=24 * 90)
+        if len(rows) < min_samples * 2:
+            print("  [ENTRY-MINE] BREAKOUT: sin labels suficientes")
+            return []
+
+        total_cont = sum(1 for r in rows if r.get('continuacion'))
+        p_base = total_cont / len(rows)
+
+        feas = ['er_15m', 'volume_ratio_15m', 'bb_width_pct_pct',
+                'atr_ratio_1m_15m', 'roc_4v_pct']
+        bins = {
+            'er_15m': [0.2, 0.4, 0.5, 0.6],
+            'volume_ratio_15m': [0.5, 1.0, 2.0],
+            'bb_width_pct_pct': [20, 50, 80],
+            'atr_ratio_1m_15m': [0.5, 1.0, 1.5],
+            'roc_4v_pct': [-2.0, -1.0, 1.0, 2.0],
+        }
+
+        candidatos = []
+        for cond_json, filas_bin in self._generar_bins_bypass(
+                rows, feature_keys=feas, bins_def=bins):
+            n = len(filas_bin)
+            if n < min_samples:
+                continue
+            conts = sum(1 for r in filas_bin if r.get('continuacion'))
+            wr = conts / n
+            lo, hi = _wilson(conts, n)
+            lift = wr / p_base if p_base > 0 else 0.0
+
+            if lo > p_base * 1.2 and lift >= 1.5:
+                accion = 'ALLOW'
+            elif hi < p_base * 0.6:
+                accion = 'BLOCK'
+            else:
+                continue
+            candidatos.append({
+                'tipo_entrada': 'BREAKOUT', 'accion': accion,
+                'symbol': None, 'direction': None, 'regime': None,
+                'condition_json': cond_json, 'score_bonus': 0,
+                'n_occurrences': n, 'win_rate': round(wr, 4),
+                'wilson_lower': round(lo, 4),
+                'lift_vs_baseline': round(lift, 2),
+                'is_active': 0,
+            })
+
+        if candidatos:
+            await ldb.guardar_entry_rules_batch(candidatos)
+        print(f"  [ENTRY-MINE] BREAKOUT: {len(candidatos)} reglas "
+              f"(baseline={p_base:.3f})")
+        return candidatos
+
+
+class EntryRuleEngine:
+    """
+    F8.1: evalua entry_rules activas contra el contexto de features.
+
+    Cache: (tipo_entrada, symbol|None, direction|None, regime|None) -> [rules]
+
+    I95 Ruta A: lookup con fallback a None en las 3 dimensiones. Las reglas
+    minadas por F7 son globales en symbol y, para NEUTRAL/BREAKOUT, tambien
+    en direction/regime (None); una key exacta jamas matchearia.
+
+    I96 Ruta A: FIRE usa el regimen 5-estado (regime_confirmado) porque asi
+    lo persiste FireOutcomeImporter en fire_labels.regime.
+
+    I100 Ruta A: precedencia determinista BLOCK > REQUIRE_SCORE > ALLOW
+    (coherente con I93 de F9), independientemente del orden de insercion.
+
+    D-F8-1: cache vacia = sin reglas -> evaluar devuelve (False, "", 0)
+    (default permisivo; NO bloquear).
+    """
+
+    _PRIO_ACCION = {'BLOCK': 0, 'REQUIRE_SCORE': 1, 'ALLOW': 2}
+
+    def __init__(self):
+        self._cache: dict = {}
+
+    def cargar(self, reglas: list):
+        """Carga reglas (de cargar_entry_rules_activas) en cache RAM."""
+        cache = defaultdict(list)
+        for r in reglas or []:
+            if not r.get('is_active'):
+                continue
+            key = (r.get('tipo_entrada'), r.get('symbol'),
+                   r.get('direction'), r.get('regime'))
+            cache[key].append(r)
+        self._cache = dict(cache)
+
+    def _candidatas(self, tipo: str, symbol: str, direction: str,
+                    regime: str) -> list:
+        """I95: reglas de la key exacta + fallback a None en las 3 dims."""
+        reglas = []
+        vistos = set()
+        for sym in (symbol, None):
+            for d in (direction, None):
+                for reg in (regime, None):
+                    key = (tipo, sym, d, reg)
+                    if key in vistos:
+                        continue
+                    vistos.add(key)
+                    reglas.extend(self._cache.get(key, []))
+        reglas.sort(key=lambda r: self._PRIO_ACCION.get(
+            r.get('accion'), 9))
+        return reglas
+
+    def evaluar(self, tipo: str, symbol: str, direction: str,
+                regime: str, context: dict, score_actual: int = 0):
+        """Retorna (block: bool, motivo: str, score_delta: int)."""
+        if not self._cache:
+            return False, "", 0
+        for r in self._candidatas(tipo, symbol, direction, regime):
+            if not self._match_condition(r.get('condition_json', '{}'),
+                                         context or {}):
+                continue
+            accion = r.get('accion')
+            if accion == 'BLOCK':
+                return True, (f"entry_rule_{tipo}: "
+                              f"{r.get('condition_json')}"), 0
+            if accion == 'REQUIRE_SCORE':
+                if (score_actual or 0) < 70:
+                    return True, (f"score {score_actual} insuficiente "
+                                  f"(REQUIRE_SCORE)"), 0
+            if accion == 'ALLOW':
+                return False, "", int(r.get('score_bonus') or 0)
+        return False, "", 0
+
+    @staticmethod
+    def _match_condition(condition_json: str, context: dict) -> bool:
+        """I98 Ruta A: mismo contrato que _match_bypass_condition.
+
+        Anidado {"adx_15m": {"_min": 25, "_max": 50}} y plano
+        {"adx_15m_min": 25}; feature ausente -> no matchea (conservador).
+        """
+        import json as _json
+        try:
+            cond = _json.loads(condition_json)
+        except Exception:
+            return False
+        if not isinstance(cond, dict):
+            return False
+        for key, threshold in cond.items():
+            if isinstance(threshold, dict):
+                value = context.get(key)
+                if value is None:
+                    return False
+                for op, val in threshold.items():
+                    if op == '_min' and value < val:
+                        return False
+                    if op == '_max' and value > val:
+                        return False
+            else:
+                feature = key.replace('_min', '').replace('_max', '')
+                value = context.get(feature)
+                if value is None:
+                    return False
+                if '_min' in key and value < threshold:
+                    return False
+                if '_max' in key and value > threshold:
+                    return False
+        return True
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1993,6 +2276,8 @@ class LearningEngine:
         self._last_nmi_import = 0.0     # F1.6: último run del importador
         self._drift_notificado: dict = {}   # symbol -> ts (anti-spam 24h)
         self._bypass_cache: dict = {}       # (symbol, direction, regime, rejected_filter) -> rule dict
+        self._entry_rules_cache: dict = {}  # (tipo, symbol, direction, regime) -> [rules] (F7.5/F8)
+        self.entry_engine = EntryRuleEngine()   # F8.1: serving de entry_rules
 
     # ── loader por defecto: database_v5 (MySQL del trading) ───────────────
     @staticmethod
@@ -2459,6 +2744,39 @@ class LearningEngine:
             await self._auto_promote_demote_bypass_rules()
         except Exception as e:
             print(f"  ⚠️ [BYPASS-PROMOTE] Error: {e}")
+
+        # F7.2-F7.4: mineros de entry_rules (FIRE / NEUTRAL / BREAKOUT)
+        try:
+            await self.pattern_learner.minar_fires()
+        except Exception as e:
+            print(f"  ⚠️ [ENTRY-MINE] FIRE error: {e}")
+        try:
+            await self.pattern_learner.minar_neutral_grids()
+        except Exception as e:
+            print(f"  ⚠️ [ENTRY-MINE] NEUTRAL error: {e}")
+        try:
+            await self.pattern_learner.minar_breakouts()
+        except Exception as e:
+            print(f"  ⚠️ [ENTRY-MINE] BREAKOUT error: {e}")
+
+        # F7.5: cache RAM de entry_rules (F8 la consume)
+        try:
+            await self._recargar_entry_rules_cache()
+        except Exception as e:
+            print(f"  ⚠️ [ENTRY-RULES] Error cargando cache: {e}")
+
+    async def _recargar_entry_rules_cache(self):
+        """F7.5: carga entry_rules activas a RAM para F8 (EntryRuleEngine)."""
+        reglas = await ldb.cargar_entry_rules_activas()
+        cache = defaultdict(list)
+        for r in reglas:
+            key = (r.get('tipo_entrada'), r.get('symbol'),
+                   r.get('direction'), r.get('regime'))
+            cache[key].append(r)
+        self._entry_rules_cache = dict(cache)
+        self.entry_engine.cargar(reglas)   # F8.1: cache de serving
+        print(f"  🧠 [ENTRY-RULES] {len(reglas)} reglas activas en cache RAM "
+              f"({len(self._entry_rules_cache)} claves)")
 
     async def _auto_promote_demote_bypass_rules(self):
         """

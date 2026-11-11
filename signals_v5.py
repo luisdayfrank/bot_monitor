@@ -214,6 +214,47 @@ class SignalGenerator:
     # FASE 5: GRID NEUTRAL — EVALUACION DE ENTRADA
     # ═══════════════════════════════════════════════════════════════════════════════
     # ═══════════════════════════════════════════════════════════════════════════════
+    def _contexto_entry_rules(self, symbol: str, i15: dict = None) -> dict:
+        """F8 - I97 Ruta A: contexto con claves canonicas de los mineros F7.
+
+        Merge de collector.ultima_fila (features v1.1) + aliases calculados
+        desde i15. No sobreescribe valores ya presentes.
+        Claves: adx_15m, rsi_15m, atr_pct_15m, ema200_dist_pct,
+        volume_ratio, volume_ratio_15m, mfm_sma5, er_15m,
+        bb_width_pct_pct, atr_ratio_1m_15m, roc_4v_pct.
+        """
+        i15 = i15 or self.indicadores_15m.get(symbol, {}) or {}
+        ctx = {}
+        if self.learning_engine is not None:
+            try:
+                ctx.update(
+                    self.learning_engine.collector.ultima_fila(symbol) or {})
+            except Exception:
+                pass
+
+        price = i15.get('close') or 0
+        atr = i15.get('atr') or 0
+        ema200 = i15.get('ema200_15m')
+        vol = i15.get('volume') or 0
+        vol_sma = i15.get('volume_sma20') or 0
+        vol_ratio = (vol / vol_sma) if vol_sma else None
+
+        def _set_si_falta(k, v):
+            if ctx.get(k) is None and v is not None:
+                ctx[k] = v
+
+        _set_si_falta('adx_15m', i15.get('adx'))
+        _set_si_falta('rsi_15m', i15.get('rsi'))
+        _set_si_falta('atr_pct_15m',
+                      (atr / price * 100.0) if price > 0 and atr else None)
+        _set_si_falta('ema200_dist_pct',
+                      ((price - ema200) / ema200 * 100.0)
+                      if ema200 and price else None)
+        _set_si_falta('volume_ratio', vol_ratio)
+        _set_si_falta('volume_ratio_15m', vol_ratio)
+        _set_si_falta('mfm_sma5', i15.get('mfm_sma5'))
+        return ctx
+
     def evaluar_grid_neutro(self, symbol: str, i15: dict) -> Tuple[bool, str]:
         """
         Evalua las 5 condiciones de entrada al estado NEUTRAL_GRID.
@@ -286,6 +327,27 @@ class SignalGenerator:
 
         if rechazos:
             return False, f"Grid neutral rechazado: {'; '.join(rechazos[:2])}"
+
+        # -- F8.3: entry_rules NEUTRAL (F7: direction='NEUTRAL', regime=None)
+        _entry_mode = getattr(CONFIG, 'learning_apply_mode', 'OFF')
+        if (self.learning_engine is not None and
+                _entry_mode in ('SHADOW', 'ACTIVE')):
+            try:
+                _block, _motivo, _ = (
+                    self.learning_engine.entry_engine.evaluar(
+                        tipo='NEUTRAL', symbol=symbol, direction='NEUTRAL',
+                        regime=None,
+                        context=self._contexto_entry_rules(symbol, i15),
+                        score_actual=0))
+                if _block and _entry_mode == 'ACTIVE':
+                    return False, f"entry_rule_bloquea: {_motivo}"
+                if _block:
+                    print(f"  [ENTRY-RULE-SHADOW] {symbol} NEUTRAL "
+                          f"bloquearia | {_motivo}")
+            except Exception as e_entry:
+                print(f"  [ENTRY-RULE] NEUTRAL {symbol}: {e_entry}")
+        # -- fin F8.3 -------------------------------------------------------
+
         return True, "Condiciones de grid neutral cumplidas"
 
     # ═══════════════════════════════════════════════════════════════════════════════
@@ -2212,6 +2274,28 @@ class SignalGenerator:
                 print(f"  [BREAKOUT] {symbol} ya tiene grid activo, no re-dispara")
                 return
 
+        # -- F8.4: entry_rules BREAKOUT (F7: symbol/direction/regime=None) ---
+        _entry_mode = getattr(CONFIG, 'learning_apply_mode', 'OFF')
+        if (self.learning_engine is not None and
+                _entry_mode in ('SHADOW', 'ACTIVE')):
+            try:
+                _block, _motivo, _ = (
+                    self.learning_engine.entry_engine.evaluar(
+                        tipo='BREAKOUT', symbol=symbol, direction=direction,
+                        regime=_reg,
+                        context=self._contexto_entry_rules(symbol, i15),
+                        score_actual=80))
+                if _block and _entry_mode == 'ACTIVE':
+                    print(f"  [ENTRY-RULE] {symbol} BREAKOUT bloqueado | "
+                          f"{_motivo}")
+                    return
+                if _block:
+                    print(f"  [ENTRY-RULE-SHADOW] {symbol} BREAKOUT "
+                          f"bloquearia | {_motivo}")
+            except Exception as e_entry:
+                print(f"  [ENTRY-RULE] BREAKOUT {symbol}: {e_entry}")
+        # -- fin F8.4 -------------------------------------------------------
+
         state.score_macro_actual = 80
         state.direccion_filtro = direction
         await self._procesar_disparo_breakout(
@@ -2445,6 +2529,43 @@ class SignalGenerator:
 
             await self.emitir_alerta(symbol, 'RECHAZADO', direction, 0, rechazos, None, price)
             return
+
+        # -- F8.2: entry_rules FIRE (I101 Ruta A: learning_apply_mode) -----
+        _entry_mode = getattr(CONFIG, 'learning_apply_mode', 'OFF')
+        if (self.learning_engine is not None and
+                _entry_mode in ('SHADOW', 'ACTIVE')):
+            try:
+                _reg_entry = (self.learning_engine.regime_cls
+                              .regimen_actual.get(symbol, 'RANGE'))  # I96
+                _score_macro = self._calcular_score_macro(i15)
+                _block, _motivo, _delta = (
+                    self.learning_engine.entry_engine.evaluar(
+                        tipo='FIRE', symbol=symbol, direction=direction,
+                        regime=_reg_entry,
+                        context=self._contexto_entry_rules(symbol, i15),
+                        score_actual=_score_macro))
+                if _block and _entry_mode == 'ACTIVE':
+                    _razon = f"entry_rule_FIRE: {_motivo}"
+                    print(f"  [ENTRY-RULE] {symbol} FIRE bloqueado | {_razon}")
+                    if self.audit_logger:
+                        await self.audit_logger.log_rechazado(
+                            symbol=symbol, direccion=direction, precio=price,
+                            contexto_1m=i1m,
+                            contexto_macro={'score_macro': _score_macro},
+                            rechazos=[_razon],
+                            score_macro=_score_macro)
+                    await self.emitir_alerta(symbol, 'RECHAZADO', direction,
+                                             0, [_razon], None, price)
+                    return
+                if _block:
+                    print(f"  [ENTRY-RULE-SHADOW] {symbol} FIRE "
+                          f"bloquearia | {_motivo}")
+                elif _delta:
+                    print(f"  [ENTRY-RULE] {symbol} FIRE ALLOW "
+                          f"(score_delta={_delta}, no aplicado en F8)")
+            except Exception as e_entry:
+                print(f"  [ENTRY-RULE] FIRE {symbol}: {e_entry}")
+        # -- fin F8.2 -------------------------------------------------------
 
         # ── LEARNING ENGINE Fase 5 — REFUSAL-FIRST (corrección C-3) ─────────
         # Se evalúa ANTES de mutar state.estado='FIRE' y antes de log_fire:
