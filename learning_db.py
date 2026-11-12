@@ -199,6 +199,21 @@ async def init_learning_db(db_path: str = "crypto_learning.db"):
         except Exception as e:
             print(f"  [LEARN-DB] I68 norm_tipos: {e}")
     await _run(_normalizar_tipos_rechazo_v13)
+    # F9.5: marcador de cierre de gaps P1/P2/P3 (punto 7 del diff F9).
+    # Solo inserta una FILA de datos en schema_versions (sin schema change).
+    def _registrar_f95():
+        try:
+            _conn.execute(
+                "INSERT OR IGNORE INTO schema_versions "
+                "(componente, version, aplicado_utc, changelog, activo) "
+                "VALUES ('ENTRY_RULES', 'v1.0_f95', ?, "
+                "'F9.5: P1 matcher unificado; P2 p_base=0 -> BLOCK; "
+                "P3 score real FIRE', 1)",
+                (int(time.time() * 1000),))
+            _conn.commit()
+        except Exception as e:
+            print(f"  [LEARN-DB] F9.5 marker: {e}")
+    await _run(_registrar_f95)
     print(f"  🧠 [LEARN-DB] crypto_learning.db abierta ({db_path}) | journal_mode={modo}")
     return modo
 
@@ -984,6 +999,19 @@ async def ultimo_guardrail_entry_rules(horas: float = 24 * 7) -> int:
             "WHERE tipo = 'ENTRY_RULE_BLOCK_RATE' AND timestamp_ms >= ?",
             (desde,)).fetchone()
         return int(row[0]) if row and row[0] else 0
+
+    return await _run(_op)
+
+
+async def f95_aplicado() -> bool:
+    """F9.5: True si el marcador ENTRY_RULES v1.0_f95 esta registrado."""
+    def _op():
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT 1 FROM schema_versions "
+            "WHERE componente = 'ENTRY_RULES' AND version = 'v1.0_f95' "
+            "AND activo = 1").fetchone()
+        return bool(row)
 
     return await _run(_op)
 

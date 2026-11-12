@@ -93,6 +93,42 @@ def _created_at_ms(created_at) -> int:
             return 0
 
 
+def _match_condition_json(condition_json: str, context: dict) -> bool:
+    """F9.5-P1: contrato UNICO de matcheo bypass_rules / entry_rules.
+
+    Formatos: anidado {"adx_15m": {"_min": 25, "_max": 50}} y plano
+    {"adx_15m_min": 25}. Feature ausente -> no matchea (conservador).
+    JSON no-dict -> False (I-F9.5-3: antes bypass lanzaba AttributeError).
+    """
+    import json as _json
+    try:
+        cond = _json.loads(condition_json)
+    except Exception:
+        return False
+    if not isinstance(cond, dict):
+        return False
+    for key, threshold in cond.items():
+        if isinstance(threshold, dict):
+            value = context.get(key)
+            if value is None:
+                return False
+            for op, val in threshold.items():
+                if op == '_min' and value < val:
+                    return False
+                if op == '_max' and value > val:
+                    return False
+        else:
+            feature = key.replace('_min', '').replace('_max', '')
+            value = context.get(feature)
+            if value is None:
+                return False
+            if '_min' in key and value < threshold:
+                return False
+            if '_max' in key and value > threshold:
+                return False
+    return True
+
+
 def _clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
@@ -1157,6 +1193,21 @@ class PatternLearner:
         for (direction, regime), filas in grupos.items():
             if len(filas) < min_samples:
                 continue
+            # F9.5-P2 (I94/I-F9.5-1): p_base=0 => TODOS pierden => una
+            # regla global BLOCK por grupo (condition_json='{}').
+            if p_base == 0:
+                wins_g = sum(1 for f in filas if f.get('rentable_neto_2h'))
+                if wins_g == 0:
+                    lo, _hi = _wilson(0, len(filas))
+                    candidatos.append({
+                        'tipo_entrada': 'FIRE', 'accion': 'BLOCK',
+                        'symbol': None, 'direction': direction,
+                        'regime': regime, 'condition_json': '{}',
+                        'score_bonus': 0, 'n_occurrences': len(filas),
+                        'win_rate': 0.0, 'wilson_lower': round(lo, 4),
+                        'lift_vs_baseline': None, 'is_active': 0,
+                    })
+                continue
             for cond_json, filas_bin in self._generar_bins_bypass(filas):
                 n = len(filas_bin)
                 if n < min_samples:
@@ -1221,6 +1272,18 @@ class PatternLearner:
         }
 
         candidatos = []
+        # F9.5-P2 (I94/I-F9.5-1): p_base=0 => una regla global BLOCK.
+        # El bin-loop de abajo no produce nada con p_base=0 (lift=0).
+        if p_base == 0 and len(outcomes) >= min_samples:
+            lo, _hi = _wilson(0, len(outcomes))
+            candidatos.append({
+                'tipo_entrada': 'NEUTRAL', 'accion': 'BLOCK',
+                'symbol': None, 'direction': 'NEUTRAL', 'regime': None,
+                'condition_json': '{}', 'score_bonus': 0,
+                'n_occurrences': len(outcomes), 'win_rate': 0.0,
+                'wilson_lower': round(lo, 4),
+                'lift_vs_baseline': None, 'is_active': 0,
+            })
         for cond_json, filas_bin in self._generar_bins_bypass(
                 outcomes, feature_keys=feas, bins_def=bins):
             n = len(filas_bin)
@@ -1275,6 +1338,17 @@ class PatternLearner:
         }
 
         candidatos = []
+        # F9.5-P2 (I94/I-F9.5-1): p_base=0 => una regla global BLOCK.
+        if p_base == 0 and len(rows) >= min_samples:
+            lo, _hi = _wilson(0, len(rows))
+            candidatos.append({
+                'tipo_entrada': 'BREAKOUT', 'accion': 'BLOCK',
+                'symbol': None, 'direction': None, 'regime': None,
+                'condition_json': '{}', 'score_bonus': 0,
+                'n_occurrences': len(rows), 'win_rate': 0.0,
+                'wilson_lower': round(lo, 4),
+                'lift_vs_baseline': None, 'is_active': 0,
+            })
         for cond_json, filas_bin in self._generar_bins_bypass(
                 rows, feature_keys=feas, bins_def=bins):
             n = len(filas_bin)
@@ -1388,34 +1462,9 @@ class EntryRuleEngine:
 
         Anidado {"adx_15m": {"_min": 25, "_max": 50}} y plano
         {"adx_15m_min": 25}; feature ausente -> no matchea (conservador).
+        F9.5-P1: delega en _match_condition_json (contrato unico).
         """
-        import json as _json
-        try:
-            cond = _json.loads(condition_json)
-        except Exception:
-            return False
-        if not isinstance(cond, dict):
-            return False
-        for key, threshold in cond.items():
-            if isinstance(threshold, dict):
-                value = context.get(key)
-                if value is None:
-                    return False
-                for op, val in threshold.items():
-                    if op == '_min' and value < val:
-                        return False
-                    if op == '_max' and value > val:
-                        return False
-            else:
-                feature = key.replace('_min', '').replace('_max', '')
-                value = context.get(feature)
-                if value is None:
-                    return False
-                if '_min' in key and value < threshold:
-                    return False
-                if '_max' in key and value > threshold:
-                    return False
-        return True
+        return _match_condition_json(condition_json, context)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2465,6 +2514,7 @@ class LearningEngine:
         print("  🧠 [LEARN] LearningEngine iniciado "
               f"(modo={getattr(self.cfg, 'learning_apply_mode', 'OFF')}, "
               f"exit={getattr(self.cfg, 'learning_exit_mode', 'OFF')})")
+        await self._verificar_f95_activo()
         tick = 0
         while not self._stop.is_set():
             try:
@@ -2931,6 +2981,33 @@ class LearningEngine:
         except Exception as e_guard:
             print(f"  [ENTRY-GUARDRAIL] Error: {e_guard}")
 
+    async def _verificar_f95_activo(self):
+        """F9.5 punto 7: ACTIVE sin F9.5 aplicado -> forzar SHADOW.
+
+        Si el marker ENTRY_RULES v1.0_f95 falta (deploy antiguo/mixto) y
+        learning_apply_mode=ACTIVE, degrada a SHADOW y avisa. No hace nada
+        en OFF/SHADOW. Errores de DB: no bloquea el arranque.
+        """
+        if getattr(self.cfg, 'learning_apply_mode', 'OFF') != 'ACTIVE':
+            return
+        try:
+            ok = await ldb.f95_aplicado()
+        except Exception as e_f95:
+            print(f"  [F9.5] verificacion marker: {e_f95}")
+            return
+        if ok:
+            return
+        self.cfg.learning_apply_mode = 'SHADOW'
+        print("  [WARN] learning_apply_mode=ACTIVE sin F9.5 aplicado "
+              "(P1/P2/P3 sin cerrar) -> forzado a SHADOW")
+        if self.notifier:
+            try:
+                await self.notifier.enviar_telegram(
+                    "LEARNING ENGINE\nACTIVE sin F9.5 aplicado -> "
+                    "forzado a SHADOW (P1/P2/P3 sin cerrar).")
+            except Exception:
+                pass
+
     async def etiquetar_trend_ends(self, symbols: list, max_lote: int = 500):
         ahora = _now_ms()
         snaps = await ldb.cargar_snapshots_por_regimen(
@@ -2979,34 +3056,9 @@ class LearningEngine:
           anidado: {"adx_15m": {"_min": 40, "_max": 60}}   (producido por _generar_bins_bypass)
           plano:   {"adx_15m_min": 40}                      (formato heredado)
         Conservador: feature ausente en contexto → no matchea (False).
+        F9.5-P1: delega en _match_condition_json (contrato unico).
         """
-        import json as _json
-        try:
-            cond = _json.loads(condition_json)
-        except Exception:
-            return False
-        for key, threshold in cond.items():
-            if isinstance(threshold, dict):
-                # Formato anidado: {feature: {_min: X, _max: Y}}
-                value = context.get(key)
-                if value is None:
-                    return False
-                for op, val in threshold.items():
-                    if op == "_min" and value < val:
-                        return False
-                    if op == "_max" and value > val:
-                        return False
-            else:
-                # Formato plano heredado: {feature_min: X}
-                feature = key.replace('_min', '').replace('_max', '')
-                value = context.get(feature)
-                if value is None:
-                    return False
-                if '_min' in key and value < threshold:
-                    return False
-                if '_max' in key and value > threshold:
-                    return False
-        return True
+        return _match_condition_json(condition_json, context)
 
     def _log_bypass_shadow(self, symbol: str, direction: str, regime: str,
                            rejected_filter: str, rule: dict):

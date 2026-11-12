@@ -338,7 +338,7 @@ class SignalGenerator:
                         tipo='NEUTRAL', symbol=symbol, direction='NEUTRAL',
                         regime=None,
                         context=self._contexto_entry_rules(symbol, i15),
-                        score_actual=0))
+                        score_actual=0))  # F9.5-P3: placeholder (sin score)
                 if _block and _entry_mode == 'ACTIVE':
                     return False, f"entry_rule_bloquea: {_motivo}"
                 if _block:
@@ -2284,7 +2284,7 @@ class SignalGenerator:
                         tipo='BREAKOUT', symbol=symbol, direction=direction,
                         regime=_reg,
                         context=self._contexto_entry_rules(symbol, i15),
-                        score_actual=80))
+                        score_actual=80))  # F9.5-P3: fijo 80 (placeholder)
                 if _block and _entry_mode == 'ACTIVE':
                     print(f"  [ENTRY-RULE] {symbol} BREAKOUT bloqueado | "
                           f"{_motivo}")
@@ -2543,7 +2543,9 @@ class SignalGenerator:
                         tipo='FIRE', symbol=symbol, direction=direction,
                         regime=_reg_entry,
                         context=self._contexto_entry_rules(symbol, i15),
-                        score_actual=_score_macro))
+                        # F9.5-P3: score REAL del disparo (no el macro)
+                        score_actual=self._calcular_score_disparo(
+                            i1m, direction)))
                 if _block and _entry_mode == 'ACTIVE':
                     _razon = f"entry_rule_FIRE: {_motivo}"
                     print(f"  [ENTRY-RULE] {symbol} FIRE bloqueado | {_razon}")
