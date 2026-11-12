@@ -928,6 +928,66 @@ async def cargar_entry_rules_activas():
     return await _run(_op)
 
 
+async def cargar_entry_rules_todas():
+    """F9.3: todas las entry_rules (ACTIVE y SHADOW) para promocion/demote."""
+    def _op():
+        conn = _get_conn()
+        rows = conn.execute("SELECT * FROM entry_rules").fetchall()
+        return [dict(r) for r in rows]
+
+    return await _run(_op)
+
+
+async def update_entry_rule_estado(rule_id, is_active):
+    """F9.3: cambia is_active de una entry_rule por id."""
+    def _op():
+        conn = _get_conn()
+        conn.execute(
+            "UPDATE entry_rules SET is_active = ?, "
+            "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (1 if is_active else 0, int(rule_id)))
+        conn.commit()
+
+    return await _run(_op)
+
+
+async def demote_all_entry_rules():
+    """F9.1: ACTIVE -> SHADOW en todas las entry_rules. Retorna rowcount."""
+    def _op():
+        conn = _get_conn()
+        cur = conn.execute(
+            "UPDATE entry_rules SET is_active = 0, "
+            "updated_at = CURRENT_TIMESTAMP WHERE is_active = 1")
+        conn.commit()
+        return cur.rowcount
+
+    return await _run(_op)
+
+
+async def contar_entry_rule_blocks(horas: float = 24):
+    """F9.1: (n_block, n_total) de intentos FIRE; delega en MySQL.
+
+    Import lazy para evitar dependencia circular learning_db <-> database_v5.
+    """
+    from database_v5 import contar_entry_rule_blocks as _contar_mysql
+    return await _contar_mysql(horas=horas)
+
+
+async def ultimo_guardrail_entry_rules(horas: float = 24 * 7) -> int:
+    """F9.1/I-F9-4: timestamp_ms del ultimo guardrail de entry_rules (o 0)."""
+    desde = int(time.time() * 1000) - int(horas * 3600_000)
+
+    def _op():
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT MAX(timestamp_ms) FROM guardrail_events "
+            "WHERE tipo = 'ENTRY_RULE_BLOCK_RATE' AND timestamp_ms >= ?",
+            (desde,)).fetchone()
+        return int(row[0]) if row and row[0] else 0
+
+    return await _run(_op)
+
+
 async def guardar_bypass_rule_estado(symbol, direction, regime, rejected_filter, is_active, wilson_lower, n_occurrences):
     """Actualiza is_active de una regla de bypass individual."""
     def _op():

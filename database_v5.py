@@ -2142,6 +2142,31 @@ async def cargar_grid_outcomes(dias: int = 90, direction: str = None,
     return out
 
 
+async def contar_entry_rule_blocks(horas: float = 24):
+    """F9.1/I-F9-1: cuenta (n_block, n_total) de intentos FIRE.
+
+    n_block = eventos RECHAZADO cuyo rechazos_json contiene 'entry_rule_'
+    n_total = n_block + eventos FIRE confirmados en la ventana
+    Depende de CONFIG.modo_auditoria=True (audit_logger -> MySQL).
+    """
+    desde_iso = (datetime.now(pytz.UTC) - timedelta(hours=horas)).isoformat()
+    async with _conexion() as db:
+        db.row_factory = Row
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM auditoria_eventos "
+            "WHERE tipo = 'RECHAZADO' AND timestamp_utc >= ? "
+            "AND rechazos_json LIKE ?",
+            (desde_iso, '%entry_rule_%'))
+        row = await cur.fetchone()
+        n_block = int((row or [0])[0] or 0)
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM auditoria_eventos "
+            "WHERE tipo = 'FIRE' AND timestamp_utc >= ?", (desde_iso,))
+        row = await cur.fetchone()
+        n_fire = int((row or [0])[0] or 0)
+    return n_block, n_block + n_fire
+
+
 async def cargar_ordenes_por_grid(grid_ejecucion_id):
     """Carga órdenes de un grid de ejecución."""
     async with _conexion() as db:

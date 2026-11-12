@@ -76,6 +76,23 @@ def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _created_at_ms(created_at) -> int:
+    """F9.3/I-F9-5: entry_rules.created_at (TIMESTAMP UTC) -> epoch ms."""
+    if not created_at:
+        return 0
+    try:
+        dt = datetime.strptime(str(created_at), "%Y-%m-%d %H:%M:%S")
+        return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+    except Exception:
+        try:
+            dt = datetime.fromisoformat(str(created_at))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            return 0
+
+
 def _clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
@@ -2272,6 +2289,7 @@ class LearningEngine:
         self._last_transiciones_run = 0.0
         self._last_outcomes_run = 0.0
         self._last_guardrails_run = 0.0
+        self._last_entry_rule_guard = 0.0   # F9.1: throttle 1/hora
         self._last_drift_run = 0.0
         self._last_nmi_import = 0.0     # F1.6: último run del importador
         self._drift_notificado: dict = {}   # symbol -> ts (anti-spam 24h)
@@ -2649,6 +2667,9 @@ class LearningEngine:
             except Exception as e:
                 print(f"  ⚠️ [FIRE-GUARDRAIL] Error: {e}")
 
+        # F9.1: entry_rules block-rate guardrail (cada hora, ventana 24h)
+        await self._guardrail_entry_rule_blocks(ahora)
+
         # 7) Learner diario a la hora configurada
         if self._es_hora_learner() and (ahora - self._last_learner_run > 20 * 3600):
             self._last_learner_run = ahora
@@ -2759,6 +2780,12 @@ class LearningEngine:
         except Exception as e:
             print(f"  ⚠️ [ENTRY-MINE] BREAKOUT error: {e}")
 
+        # F9.3: promocion/demote ANTES de recargar cache (I-F9-2/I-F9-3)
+        try:
+            await self._auto_promote_demote_entry_rules()
+        except Exception as e:
+            print(f"  [ENTRY-PROMOTE] Error: {e}")
+
         # F7.5: cache RAM de entry_rules (F8 la consume)
         try:
             await self._recargar_entry_rules_cache()
@@ -2817,6 +2844,93 @@ class LearningEngine:
                       f"ACTIVE→SHADOW (wilson={wilson_lower:.3f} < 0.50)")
 
     # ── trend-end labels batch (P4) ───────────────────────────────────────
+    async def _auto_promote_demote_entry_rules(self):
+        """F9.3: promocion conservadora de entry_rules.
+
+        SHADOW->ACTIVE: n>=50, wilson_lower>=0.65 y created_at >= 7 dias.
+        ACTIVE->SHADOW: wilson_lower < 0.50.
+        I-F9-4: no promueve si hubo guardrail ENTRY_RULE_BLOCK_RATE en 7d.
+        """
+        reglas = await ldb.cargar_entry_rules_todas()
+        ahora = _now_ms()
+        siete_dias_ms = 7 * 86400_000
+        cuarentena = await ldb.ultimo_guardrail_entry_rules(horas=24 * 7)
+        for r in reglas:
+            rid = r.get('id')
+            if rid is None:
+                continue
+            n = int(r.get('n_occurrences') or 0)
+            wilson = float(r.get('wilson_lower') or 0)
+            created = _created_at_ms(r.get('created_at'))
+            if not r.get('is_active'):
+                if cuarentena:
+                    continue
+                if (n >= 50 and wilson >= 0.65
+                        and created and (ahora - created) >= siete_dias_ms):
+                    await ldb.update_entry_rule_estado(rid, True)
+                    print(f"  [ENTRY-PROMOTE] id={rid} "
+                          f"{r.get('tipo_entrada')}/{r.get('direction')}/"
+                          f"{r.get('regime')} SHADOW->ACTIVE "
+                          f"(wilson={wilson:.3f}, n={n})")
+            else:
+                if wilson < 0.50:
+                    await ldb.update_entry_rule_estado(rid, False)
+                    print(f"  [ENTRY-DEMOTE] id={rid} "
+                          f"{r.get('tipo_entrada')}/{r.get('direction')}/"
+                          f"{r.get('regime')} ACTIVE->SHADOW "
+                          f"(wilson={wilson:.3f} < 0.50)")
+
+    async def _guardrail_entry_rule_blocks(self, ahora: float):
+        """F9.1: BLOCK > max_pct de FIREs (24h) -> SHADOW all + cuarentena.
+
+        I-F9-7: criterio global (no por direccion), igual que demote_all.
+        I-F9-8: solo audita/notifica si demote_all afecto reglas activas.
+        """
+        if ahora - getattr(self, '_last_entry_rule_guard', 0) <= 3600:
+            return
+        self._last_entry_rule_guard = ahora
+        try:
+            n_block, n_total = await ldb.contar_entry_rule_blocks(horas=24)
+            max_pct = getattr(self.cfg,
+                              'learning_entry_rule_max_block_pct', 0.40)
+            if n_total > 20 and (n_block / n_total) > max_pct:
+                n_dem = await ldb.demote_all_entry_rules()
+                if not n_dem:
+                    return
+                await ldb.guardar_guardrail_event({
+                    'timestamp_ms': int(ahora * 1000),
+                    'tipo': 'ENTRY_RULE_BLOCK_RATE',
+                    'severidad': 'ALTO',
+                    'razon': (f"entry_rules bloquea {n_block}/{n_total} "
+                              f"FIREs ({(n_block / n_total):.1%} > "
+                              f"{max_pct:.0%}) en 24h"),
+                    'accion_tomada': 'DEMOTE_ALL_ENTRY_RULES',
+                    'modo_antes': getattr(self.cfg,
+                                          'learning_apply_mode', 'OFF'),
+                    'modo_despues': 'entry_rules=SHADOW',
+                    'revisado_por_humano': 0,
+                })
+                print(f"  [ENTRY-GUARDRAIL] {n_block}/{n_total} FIREs "
+                      f"bloqueados > {max_pct:.0%} -> "
+                      f"{n_dem} entry_rules a SHADOW")
+                try:
+                    await self._recargar_entry_rules_cache()
+                except Exception as e_reload:
+                    print(f"  [ENTRY-GUARDRAIL] reload: {e_reload}")
+                if (self.notifier and getattr(
+                        self.cfg, 'learning_alerta_telegram', True)):
+                    try:
+                        await self.notifier.enviar_telegram(
+                            f"ENTRY_RULES GUARDRAIL\n"
+                            f"BLOCK {n_block}/{n_total} "
+                            f"({(n_block / n_total):.1%}) > {max_pct:.0%} "
+                            f"en 24h\n{n_dem} reglas -> SHADOW. "
+                            f"Reactivacion manual.")
+                    except Exception:
+                        pass
+        except Exception as e_guard:
+            print(f"  [ENTRY-GUARDRAIL] Error: {e_guard}")
+
     async def etiquetar_trend_ends(self, symbols: list, max_lote: int = 500):
         ahora = _now_ms()
         snaps = await ldb.cargar_snapshots_por_regimen(

@@ -67,6 +67,9 @@ class Config(BaseModel):
     learning_enabled: bool = True              # master switch (Fase 0) - ON para recolectar datos
     learning_db_path: str = "crypto_learning.db"
     learning_apply_mode: str = "OFF"            # OFF | SHADOW | ACTIVE (refusal-first) - OFF = no bloquea
+    # F9.1: guardrail de entry_rules (si BLOCK > pct de FIREs en 24h ->
+    # demote all a SHADOW + cuarentena de promocion 7d)
+    learning_entry_rule_max_block_pct: float = 0.40
     learning_exit_mode: str = "OFF"             # OFF | SHADOW | ACTIVE (Fase 8) - OFF = no ajusta salidas
     learning_regime_tracking: bool = True       # Fase 6
 
