@@ -31,6 +31,7 @@ pesadas — LightGBM llega en Fase 9 con su propio módulo.
 import asyncio
 import json
 import math
+import os
 import threading
 import time
 from collections import defaultdict, deque
@@ -248,6 +249,7 @@ class RegimeClassifier:
 
     def clasificar_inst(self, f: dict) -> str:
         """Regimen instantaneo (sin histeresis) desde un snapshot de features."""
+        from config import CONFIG
         adx = f.get('adx_15m') or 0
         er = f.get('er_15m') or 0
         ema7 = f.get('ema7_ema25_spread_pct')
@@ -259,14 +261,18 @@ class RegimeClassifier:
         # 1. PANIC (prioridad maxima) — I80-A: ratio normalizado por sqrt(15)
         _atr_ratio_norm = (float(atr_ratio) * (15 ** 0.5)
                            if atr_ratio is not None else 0.0)
-        if _atr_ratio_norm > 1.5 or roc_4v < -3.0:
+        _panic_atr = getattr(
+            CONFIG, 'learning_panic_atr_ratio_threshold', 1.5)
+        _panic_roc = getattr(CONFIG, 'learning_panic_roc_threshold', -3.0)
+        if _atr_ratio_norm > _panic_atr or roc_4v < _panic_roc:
             return 'PANIC'
 
         # 2. TREND (ADX + ER; ER es el discriminador clave)
+        _er_min = getattr(CONFIG, 'learning_breakout_min_er', 0.40)
         trend_up = (ema7 is not None and ema7 > 0 and rel50 > 0
-                    and adx >= 25 and er >= 0.40)
+                    and adx >= 25 and er >= _er_min)
         trend_dn = (ema7 is not None and ema7 < 0 and rel50 < 0
-                    and adx >= 25 and er >= 0.40)
+                    and adx >= 25 and er >= _er_min)
         if trend_up:
             return 'TREND_UP'
         if trend_dn:
@@ -2328,6 +2334,9 @@ class LearningEngine:
         self.tz_offset = timezone_offset_horas
 
         self._stop = threading.Event()
+        # F10/B2/B4: flags manuales (archivos en el cwd del bot)
+        self._flag_force_run = 'learning_force_run.flag'
+        self._flag_revisar_guardrails = 'learning_revisar_guardrails.flag'
         self._task: Optional[asyncio.Task] = None
         self._pending_transiciones: list = []
         self._lock_t = threading.Lock()
@@ -2550,6 +2559,9 @@ class LearningEngine:
         if not getattr(self, '_bb_warm_hecho', False):
             await self._warm_start_bb_hist()
 
+        # F10/B2/B4: flags manuales de mantenimiento
+        await self._procesar_flags_manuales()
+
         # 1) Flush de snapshots + transiciones de régimen (batch executemany)
         filas = self.collector.drenar_buffer()
         if filas:
@@ -2638,7 +2650,9 @@ class LearningEngine:
                             print(f"  ⚠️ [LEARN-DRIFT] {symbol}: features con drift "
                                   f"{drift['features_con_drift']} "
                                   f"(PSI {drift['psi_por_feature']})")
-                            if self.notifier and getattr(CONFIG, 'learning_alerta_telegram', True):
+                            if (self.notifier and getattr(
+                                    self.cfg, 'learning_alerta_telegram',
+                                    True)):
                                 try:
                                     await self.notifier.enviar_telegram(
                                         f"⚠️ <b>DRIFT DETECTADO — {symbol}</b>\n"
@@ -2911,24 +2925,49 @@ class LearningEngine:
                 continue
             n = int(r.get('n_occurrences') or 0)
             wilson = float(r.get('wilson_lower') or 0)
+            wr = float(r.get('win_rate') or 0)
+            accion = r.get('accion')
+            wins = int(round(wr * n)) if n > 0 else 0
+            _lo, hi = _wilson(wins, n) if n > 0 else (0.0, 1.0)
+            es_block = (accion == 'BLOCK')
             created = _created_at_ms(r.get('created_at'))
             if not r.get('is_active'):
                 if cuarentena:
                     continue
-                if (n >= 50 and wilson >= 0.65
-                        and created and (ahora - created) >= siete_dias_ms):
+                if not (created and (ahora - created) >= siete_dias_ms):
+                    continue
+                if es_block:
+                    max_hi = getattr(
+                        self.cfg, 'learning_entry_block_promote_max_hi',
+                        0.35)
+                    if n >= 50 and hi <= max_hi:
+                        await ldb.update_entry_rule_estado(rid, True)
+                        print(f"  [ENTRY-PROMOTE] id={rid} "
+                              f"{r.get('tipo_entrada')}/"
+                              f"{r.get('direction')}/{r.get('regime')} "
+                              f"SHADOW->ACTIVE BLOCK "
+                              f"(hi={hi:.3f}, n={n})")
+                elif n >= 50 and wilson >= 0.65:
                     await ldb.update_entry_rule_estado(rid, True)
                     print(f"  [ENTRY-PROMOTE] id={rid} "
                           f"{r.get('tipo_entrada')}/{r.get('direction')}/"
                           f"{r.get('regime')} SHADOW->ACTIVE "
                           f"(wilson={wilson:.3f}, n={n})")
             else:
-                if wilson < 0.50:
+                demotear = False
+                if es_block:
+                    min_hi = getattr(
+                        self.cfg, 'learning_entry_block_demote_min_hi',
+                        0.50)
+                    demotear = (hi >= min_hi)
+                else:
+                    demotear = (wilson < 0.50)
+                if demotear:
                     await ldb.update_entry_rule_estado(rid, False)
                     print(f"  [ENTRY-DEMOTE] id={rid} "
                           f"{r.get('tipo_entrada')}/{r.get('direction')}/"
                           f"{r.get('regime')} ACTIVE->SHADOW "
-                          f"(wilson={wilson:.3f} < 0.50)")
+                          f"(accion={accion})")
 
     async def _guardrail_entry_rule_blocks(self, ahora: float):
         """F9.1: BLOCK > max_pct de FIREs (24h) -> SHADOW all + cuarentena.
@@ -3007,6 +3046,31 @@ class LearningEngine:
                     "forzado a SHADOW (P1/P2/P3 sin cerrar).")
             except Exception:
                 pass
+
+    async def _procesar_flags_manuales(self):
+        """F10/B2/B4: flags de archivo procesados por _tick (<=60s).
+
+        learning_force_run.flag         -> entrenar_todo() inmediato
+        learning_revisar_guardrails.flag -> limpia cuarentena F9.5
+        """
+        try:
+            if os.path.exists(self._flag_force_run):
+                try:
+                    os.remove(self._flag_force_run)
+                except OSError:
+                    pass
+                print("  [F10] flag manual: forzando entrenar_todo()")
+                self._last_learner_run = time.time()
+                await self.entrenar_todo()
+            if os.path.exists(self._flag_revisar_guardrails):
+                try:
+                    os.remove(self._flag_revisar_guardrails)
+                except OSError:
+                    pass
+                n = await ldb.marcar_guardrails_entry_revisados()
+                print(f"  [F10] flag manual: {n} guardrails revisados")
+        except Exception as e_flags:
+            print(f"  [F10] flags manuales error: {e_flags}")
 
     async def etiquetar_trend_ends(self, symbols: list, max_lote: int = 500):
         ahora = _now_ms()

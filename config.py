@@ -70,6 +70,14 @@ class Config(BaseModel):
     # F9.1: guardrail de entry_rules (si BLOCK > pct de FIREs en 24h ->
     # demote all a SHADOW + cuarentena de promocion 7d)
     learning_entry_rule_max_block_pct: float = 0.40
+    # F10/B1: promocion simetrica de entry_rules BLOCK (confianza de perdida)
+    learning_entry_block_promote_max_hi: float = 0.35
+    learning_entry_block_demote_min_hi: float = 0.50
+    # F10/B3: umbrales configurables (defaults = literales previos)
+    learning_panic_atr_ratio_threshold: float = 1.5
+    learning_panic_roc_threshold: float = -3.0
+    learning_squeeze_bb_pct_threshold: float = 30.0
+    learning_breakout_min_er: float = 0.40
     learning_exit_mode: str = "OFF"             # OFF | SHADOW | ACTIVE (Fase 8) - OFF = no ajusta salidas
     learning_regime_tracking: bool = True       # Fase 6
 

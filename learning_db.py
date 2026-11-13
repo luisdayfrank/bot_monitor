@@ -996,7 +996,8 @@ async def ultimo_guardrail_entry_rules(horas: float = 24 * 7) -> int:
         conn = _get_conn()
         row = conn.execute(
             "SELECT MAX(timestamp_ms) FROM guardrail_events "
-            "WHERE tipo = 'ENTRY_RULE_BLOCK_RATE' AND timestamp_ms >= ?",
+            "WHERE tipo = 'ENTRY_RULE_BLOCK_RATE' "
+            "AND revisado_por_humano = 0 AND timestamp_ms >= ?",
             (desde,)).fetchone()
         return int(row[0]) if row and row[0] else 0
 
@@ -1012,6 +1013,20 @@ async def f95_aplicado() -> bool:
             "WHERE componente = 'ENTRY_RULES' AND version = 'v1.0_f95' "
             "AND activo = 1").fetchone()
         return bool(row)
+
+    return await _run(_op)
+
+
+async def marcar_guardrails_entry_revisados():
+    """F10/B4: reactivacion manual -> limpia la cuarentena de F9.5."""
+    def _op():
+        conn = _get_conn()
+        cur = conn.execute(
+            "UPDATE guardrail_events SET revisado_por_humano = 1 "
+            "WHERE tipo = 'ENTRY_RULE_BLOCK_RATE' "
+            "AND revisado_por_humano = 0")
+        conn.commit()
+        return cur.rowcount
 
     return await _run(_op)
 

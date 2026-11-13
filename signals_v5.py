@@ -279,10 +279,13 @@ class SignalGenerator:
             except Exception:
                 _fila_v11 = {}
         bb_width_pct_pct = _fila_v11.get('bb_width_pct_pct')
-        if bb_width_pct_pct is not None and bb_width_pct_pct < 30:
+        _squeeze_umbral = getattr(
+            CONFIG, 'learning_squeeze_bb_pct_threshold', 30.0)
+        if (bb_width_pct_pct is not None
+                and bb_width_pct_pct < _squeeze_umbral):
             rechazos.append(
                 f"SQUEEZE: BB width en p{bb_width_pct_pct:.0f} "
-                f"(<30, compresion previa a expansion)")
+                f"(<{_squeeze_umbral:.0f}, compresion previa a expansion)")
 
         # 1. ADX bajo
         adx = i15.get('adx', 0)
