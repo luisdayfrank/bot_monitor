@@ -1415,6 +1415,17 @@ async def get_stats_learning_summary(request: Request, dias: int = 7):
                 "bypass_rules_inactivas": 0, "pipeline_ok": False}
 
 
+@app.get("/api/stats/learning-dashboard")
+async def get_stats_learning_dashboard(request: Request):
+    """F10: estado completo del Learning Engine para la pestana Learning."""
+    try:
+        import learning_dashboard as ldash
+        return await ldash.resumen(CONFIG)
+    except Exception as e:
+        logger.warning(f"learning-dashboard error: {e}")
+        return {"estado": "sin_datos", "mensaje": str(e)}
+
+
 @app.get("/api/stats/near-miss-detail")
 async def get_stats_near_miss_detail(request: Request, dias: int = 7, symbol: str = None,
                                      solo_fn: bool = True):
