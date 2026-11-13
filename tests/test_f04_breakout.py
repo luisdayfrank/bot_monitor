@@ -10,11 +10,25 @@ import time
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from signals_v5 import SignalGenerator  # noqa: E402
+from signals_v5 import SignalGenerator, SignalState  # noqa: E402
 from executor import GridExecutor        # noqa: E402
 
 SYM = 'TESTUSDT'
 TS0 = 1794000000000
+
+
+def _ensure_symbol(sg, sym):
+    """Registra un simbolo ficticio (TESTUSDT) en todos los dicts del sg."""
+    if sym not in sg.states:
+        sg.states[sym] = SignalState()
+    if sym not in sg._atr_historico:
+        sg._atr_historico[sym] = []
+    if sym not in sg._atr15m_historico:
+        sg._atr15m_historico[sym] = []
+    if sym not in sg._rango_reciente:
+        sg._rango_reciente[sym] = {'highs': [], 'lows': []}
+    if sym not in sg._historial_1m:
+        sg._historial_1m[sym] = []
 
 
 class FakeRegime:
@@ -24,6 +38,7 @@ class FakeRegime:
 
 def nuevo_sg(regime):
     sg = SignalGenerator(asyncio.Queue(), asyncio.Queue())
+    _ensure_symbol(sg, SYM)
     sg.learning_engine = SimpleNamespace(
         regime_cls=FakeRegime(regime),
         collector=SimpleNamespace(ultima_fila=lambda s: {}),
