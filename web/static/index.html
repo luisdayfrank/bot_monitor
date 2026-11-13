@@ -237,6 +237,7 @@
             <button onclick="switchTab('chart-view')" id="tab-chart" class="tab-btn flex-1 py-3 text-sm font-semibold text-blue-400 border-b-2 border-blue-500 bg-gray-800/50">📈 Gráfico</button>
             <button onclick="switchTab('stats-view')" id="tab-stats" class="tab-btn flex-1 py-3 text-sm font-semibold text-gray-400 hover:text-gray-200 border-b-2 border-transparent">📊 Estadísticas</button>
             <button onclick="switchTab('analysis-view')" id="tab-analysis" class="tab-btn flex-1 py-3 text-sm font-semibold text-gray-400 hover:text-gray-200 border-b-2 border-transparent">🔬 Análisis</button>
+            <button onclick="switchTab('learning-view')" id="tab-learning" class="tab-btn flex-1 py-3 text-sm font-semibold text-gray-400 hover:text-gray-200 border-b-2 border-transparent">Learning</button>
         </nav>
 
         <div class="flex-1 relative overflow-hidden">
@@ -891,6 +892,158 @@
                 </div>
             </div>
 
+
+            <!-- VISTA LEARNING (F10) -->
+            <div id="learning-view" class="hidden absolute inset-0 overflow-y-auto p-4 md:p-8 bg-[#0b0e14]">
+                <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+                    <div>
+                        <h2 class="text-2xl font-bold text-white">Learning Engine</h2>
+                        <p class="text-xs text-gray-500">Snapshots, labels, mineros, entry_rules, guardrails, modos y flags manuales (F10).</p>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <span id="ld-db" class="text-[10px] font-mono text-gray-500"></span>
+                        <button onclick="refreshLearningDashboard()" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm">Actualizar</button>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-7 gap-3 mb-5">
+                    <div class="kpi-card"><div class="text-xs text-gray-400">Snapshots</div><div class="text-2xl font-mono text-blue-400" id="ld-k-snaps">--</div><div class="text-[10px] text-gray-600">features 15m</div></div>
+                    <div class="kpi-card"><div class="text-xs text-gray-400">Fire labels</div><div class="text-2xl font-mono text-cyan-400" id="ld-k-fire">--</div><div class="text-[10px] text-gray-600">F6.3</div></div>
+                    <div class="kpi-card"><div class="text-xs text-gray-400">Breakout labels</div><div class="text-2xl font-mono text-amber-400" id="ld-k-breakout">--</div><div class="text-[10px] text-gray-600">F6.4</div></div>
+                    <div class="kpi-card"><div class="text-xs text-gray-400">Near-miss</div><div class="text-2xl font-mono text-emerald-400" id="ld-k-near">--</div><div class="text-[10px] text-gray-600">NMI</div></div>
+                    <div class="kpi-card"><div class="text-xs text-gray-400">Entry rules ACTIVE</div><div class="text-2xl font-mono text-green-400" id="ld-k-rules">--</div><div class="text-[10px] text-gray-600">shadow: <span id="ld-k-shadow">--</span></div></div>
+                    <div class="kpi-card"><div class="text-xs text-gray-400">Patterns</div><div class="text-2xl font-mono text-violet-400" id="ld-k-patterns">--</div><div class="text-[10px] text-gray-600">perfiles: <span id="ld-k-profiles">--</span></div></div>
+                    <div class="kpi-card"><div class="text-xs text-gray-400">Predictions</div><div class="text-2xl font-mono text-gray-300" id="ld-k-preds">--</div><div class="text-[10px] text-gray-600">predictions_log</div></div>
+                    <div class="kpi-card"><div class="text-xs text-gray-400">Guardrails pend.</div><div class="text-2xl font-mono text-red-400" id="ld-k-guard">--</div><div class="text-[10px] text-gray-600">revisar=0</div></div>
+                    <div class="kpi-card"><div class="text-xs text-gray-400">Bypass ACTIVE</div><div class="text-2xl font-mono text-teal-400" id="ld-k-bypass">--</div><div class="text-[10px] text-gray-600">bypass_rules</div></div>
+                    <div class="kpi-card"><div class="text-xs text-gray-400">P2 (BLOCK global)</div><div class="text-2xl font-mono text-orange-400" id="ld-k-p2">--</div><div class="text-[10px] text-gray-600">condition '{}'</div></div>
+                    <div class="kpi-card"><div class="text-xs text-gray-400">B1 elegibles</div><div class="text-2xl font-mono text-lime-400" id="ld-k-b1">--</div><div class="text-[10px] text-gray-600">BLOCK n&gt;=50 hi&lt;=0.35 7d</div></div>
+                </div>
+
+                <div class="grid grid-cols-1 lg:grid-cols-4 gap-3 mb-5">
+                    <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                        <h3 class="text-sm font-bold text-gray-300 mb-2">Modos</h3>
+                        <div class="space-y-1 text-xs">
+                            <div class="flex justify-between"><span class="text-gray-400">apply</span><span id="ld-mode-apply" class="font-mono">--</span></div>
+                            <div class="flex justify-between"><span class="text-gray-400">bypass</span><span id="ld-mode-bypass" class="font-mono">--</span></div>
+                            <div class="flex justify-between"><span class="text-gray-400">exit</span><span id="ld-mode-exit" class="font-mono">--</span></div>
+                            <div class="flex justify-between"><span class="text-gray-400">F9.5</span><span id="ld-f95" class="font-mono">--</span></div>
+                        </div>
+                    </div>
+                    <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                        <h3 class="text-sm font-bold text-gray-300 mb-2">Flags manuales</h3>
+                        <div class="space-y-2 text-xs">
+                            <div class="flex justify-between"><span class="text-gray-400">forzar entrenar_todo</span><span id="ld-flag-force" class="font-mono">--</span></div>
+                            <div class="flex justify-between"><span class="text-gray-400">revisar guardrails</span><span id="ld-flag-review" class="font-mono">--</span></div>
+                            <div class="text-[10px] text-gray-600">touch learning_force_run.flag / learning_revisar_guardrails.flag</div>
+                        </div>
+                    </div>
+                    <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                        <h3 class="text-sm font-bold text-gray-300 mb-2">Frescura</h3>
+                        <div class="space-y-1 text-xs">
+                            <div class="flex justify-between"><span class="text-gray-400">snapshots</span><span id="ld-fresh-snaps" class="font-mono">--</span></div>
+                            <div class="flex justify-between"><span class="text-gray-400">near-miss</span><span id="ld-fresh-near" class="font-mono">--</span></div>
+                            <div class="flex justify-between"><span class="text-gray-400">entry_rules updated</span><span id="ld-fresh-rules" class="font-mono text-[10px]">--</span></div>
+        
+                    <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                        <h3 class="text-sm font-bold text-gray-300 mb-2">Otros</h3>
+                        <div class="space-y-1 text-xs">
+                            <div class="flex justify-between"><span class="text-gray-400">drift alerts</span><span id="ld-k-drift" class="font-mono">--</span></div>
+                            <div class="flex justify-between"><span class="text-gray-400">exit outcomes</span><span id="ld-k-exit" class="font-mono">--</span></div>
+                            <div class="flex justify-between"><span class="text-gray-400">trend-end</span><span id="ld-k-trend" class="font-mono">--</span></div>
+                            <div class="flex justify-between"><span class="text-gray-400">regime trans.</span><span id="ld-k-regime" class="font-mono">--</span></div>
+                        </div>
+                    </div>
+                </div>
+    
+                    <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                        <h3 class="text-sm font-bold text-gray-300 mb-2">Otros</h3>
+                        <div class="space-y-1 text-xs">
+                            <div class="flex justify-between"><span class="text-gray-400">drift alerts</span><span id="ld-k-drift" class="font-mono">--</span></div>
+                            <div class="flex justify-between"><span class="text-gray-400">exit outcomes</span><span id="ld-k-exit" class="font-mono">--</span></div>
+                            <div class="flex justify-between"><span class="text-gray-400">trend-end</span><span id="ld-k-trend" class="font-mono">--</span></div>
+                            <div class="flex justify-between"><span class="text-gray-400">regime trans.</span><span id="ld-k-regime" class="font-mono">--</span></div>
+                        </div>
+                    </div>
+                </div>
+
+                    <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                        <h3 class="text-sm font-bold text-gray-300 mb-2">Otros</h3>
+                        <div class="space-y-1 text-xs">
+                            <div class="flex justify-between"><span class="text-gray-400">drift alerts</span><span id="ld-k-drift" class="font-mono">--</span></div>
+                            <div class="flex justify-between"><span class="text-gray-400">exit outcomes</span><span id="ld-k-exit" class="font-mono">--</span></div>
+                            <div class="flex justify-between"><span class="text-gray-400">trend-end</span><span id="ld-k-trend" class="font-mono">--</span></div>
+                            <div class="flex justify-between"><span class="text-gray-400">regime trans.</span><span id="ld-k-regime" class="font-mono">--</span></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-5">
+                    <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                        <h3 class="text-sm font-bold text-gray-300 mb-2">Labels por dia (14d)</h3>
+                        <div id="ld-chart-labels" class="h-64"></div>
+                    </div>
+                    <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                        <h3 class="text-sm font-bold text-gray-300 mb-2">Entry rules por accion</h3>
+                        <div id="ld-chart-rules" class="h-64"></div>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 xl:grid-cols-2 gap-4 mb-5">
+                    <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                        <h3 class="text-sm font-bold text-gray-300 mb-2">Entry Rules (top 100)</h3>
+                        <div class="overflow-x-auto max-h-96 overflow-y-auto">
+                            <table class="analysis-table" id="ld-rules-table"><thead><tr>
+                                <th>Tipo</th><th>Accion</th><th>Dir</th><th>Regime</th><th>Condicion</th><th>N</th><th>Wr</th><th>Wilson</th><th>Lift</th><th>Estado</th><th>Updated</th>
+                            </tr></thead><tbody id="ld-rules-tbody"><tr><td colspan="11" class="text-center text-gray-500 py-6">Cargando...</td></tr></tbody></table>
+                        </div>
+                    </div>
+                    <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                        <h3 class="text-sm font-bold text-gray-300 mb-2">Near-miss por tipo</h3>
+                        <div class="overflow-x-auto max-h-96 overflow-y-auto">
+                            <table class="analysis-table" id="ld-nm-table"><thead><tr>
+                                <th>Tipo rechazo</th><th>N</th><th>Falsos neg.</th><th>Bloqueo correcto</th><th>FN %</th>
+                            </tr></thead><tbody id="ld-nm-tbody"><tr><td colspan="5" class="text-center text-gray-500 py-6">Cargando...</td></tr></tbody></table>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 xl:grid-cols-2 gap-4 mb-5">
+                    <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                        <h3 class="text-sm font-bold text-gray-300 mb-2">Guardrails (ultimos 10)</h3>
+                        <table class="analysis-table"><thead><tr><th>Tipo</th><th>Sev</th><th>Razon</th><th>Accion</th><th>Modo</th><th>Revisado</th></tr></thead><tbody id="ld-guard-tbody"></tbody></table>
+                    </div>
+                    <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                        <h3 class="text-sm font-bold text-gray-300 mb-2">Perfiles aprendidos (ultimos 10)</h3>
+                        <table class="analysis-table"><thead><tr><th>Symbol</th><th>Generado</th></tr></thead><tbody id="ld-profiles-tbody"></tbody></table>
+                    </div>
+                </div>
+
+
+                <div class="grid grid-cols-1 xl:grid-cols-2 gap-4 mb-5">
+                    <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                        <h3 class="text-sm font-bold text-gray-300 mb-2">Bypass rules (top 50)</h3>
+                        <div class="overflow-x-auto max-h-80 overflow-y-auto">
+                            <table class="analysis-table"><thead><tr><th>Symbol</th><th>Dir</th><th>Regime</th><th>Filtro</th><th>Cond</th><th>N</th><th>Wr</th><th>Wilson</th><th>Estado</th></tr></thead><tbody id="ld-bypass-tbody"><tr><td colspan="9" class="text-center text-gray-500 py-6">Cargando...</td></tr></tbody></table>
+                        </div>
+                    </div>
+                    <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                        <h3 class="text-sm font-bold text-gray-300 mb-2">Patterns por estado</h3>
+                        <table class="analysis-table"><thead><tr><th>Status</th><th>N</th></tr></thead><tbody id="ld-patterns-tbody"><tr><td colspan="2" class="text-center text-gray-500 py-6">Cargando...</td></tr></tbody></table>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 xl:grid-cols-2 gap-4 mb-5">
+                    <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                        <h3 class="text-sm font-bold text-gray-300 mb-2">Schema Versions</h3>
+                        <table class="analysis-table"><thead><tr><th>Componente</th><th>Version</th><th>Activo</th><th>Aplicado</th></tr></thead><tbody id="ld-schema-tbody"></tbody></table>
+                    </div>
+                    <div class="bg-gray-800/30 p-4 rounded-xl border border-gray-700/50">
+                        <h3 class="text-sm font-bold text-gray-300 mb-2">Predicciones por modo / decision</h3>
+                        <table class="analysis-table"><thead><tr><th>Modo</th><th>Decision</th><th>N</th></tr></thead><tbody id="ld-pred-tbody"></tbody></table>
+                    </div>
+                </div>
+            </div>
         </div>
 
     </main>
@@ -936,8 +1089,7 @@
             localStorage.setItem('cm_v62_prefs', JSON.stringify({
                 activeSymbol: activeSymbol,
                 activeTimeframe: activeTimeframe,
-                activeTab: document.getElementById('chart-view').classList.contains('hidden') ? 
-                    (document.getElementById('stats-view').classList.contains('hidden') ? 'analysis-view' : 'stats-view') : 'chart-view',
+                activeTab: ['chart-view', 'stats-view', 'analysis-view', 'learning-view'].find(id => !document.getElementById(id).classList.contains('hidden')) || 'chart-view',
                 analysisTab: document.querySelector('.sub-tab-btn.active')?.id.replace('analysis-tab-', '') || 'resumen'
             }));
         }
@@ -1005,12 +1157,14 @@
             document.getElementById('chart-view').classList.add('hidden');
             document.getElementById('stats-view').classList.add('hidden');
             document.getElementById('analysis-view').classList.add('hidden');
+            document.getElementById('learning-view').classList.add('hidden');
 
             const btnChart = document.getElementById('tab-chart');
             const btnStats = document.getElementById('tab-stats');
             const btnAnalysis = document.getElementById('tab-analysis');
+            const btnLearning = document.getElementById('tab-learning');
 
-            [btnChart, btnStats, btnAnalysis].forEach(b => {
+            [btnChart, btnStats, btnAnalysis, btnLearning].forEach(b => {
                 b.classList.remove('text-blue-400', 'border-blue-500', 'bg-gray-800/50');
                 b.classList.add('text-gray-400', 'border-transparent');
             });
@@ -1034,6 +1188,10 @@
                 btnAnalysis.classList.add('text-blue-400', 'border-blue-500', 'bg-gray-800/50');
                 btnAnalysis.classList.remove('text-gray-400', 'border-transparent');
                 refreshAnalysis();
+            } else if (tabId === 'learning-view') {
+                btnLearning.classList.add('text-blue-400', 'border-blue-500', 'bg-gray-800/50');
+                btnLearning.classList.remove('text-gray-400', 'border-transparent');
+                refreshLearningDashboard();
             }
             savePreferences();
         }
@@ -2932,6 +3090,165 @@
             document.getElementById('coin-count').innerText = `${active}/${total}`;
         }
 
+
+        // ============================================
+        // LEARNING DASHBOARD (F10)
+        // ============================================
+        function _ldSet(id, value) {
+            const el = document.getElementById(id);
+            if (el) el.textContent = value;
+        }
+
+        function _ldEsc(v) {
+            return String(v === null || v === undefined ? '' : v)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
+
+        function _ldAgo(h) {
+            if (h === null || h === undefined || !isFinite(h)) return '--';
+            if (h < 1) return Math.round(h * 60) + 'm';
+            if (h < 48) return h.toFixed(1) + 'h';
+            return (h / 24).toFixed(1) + 'd';
+        }
+
+        function _ldFecha(ms) {
+            if (!ms) return '--';
+            try { return new Date(ms).toLocaleString(); } catch (e) { return '--'; }
+        }
+
+        function _ldModo(id, valor) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.textContent = valor || '--';
+            el.className = 'font-mono ' + (
+                valor === 'ACTIVE' ? 'text-green-400' :
+                valor === 'SHADOW' ? 'text-yellow-400' : 'text-gray-500');
+        }
+
+        async function refreshLearningDashboard() {
+            try {
+                const res = await fetch('/api/stats/learning-dashboard');
+                const d = await res.json();
+                if (d.estado !== 'success') {
+                    _ldSet('ld-db', 'Sin datos: ' + (d.mensaje || d.estado));
+                    return;
+                }
+                _ldSet('ld-db', (d.db_path || '') + (d.db_mb ? ' / ' + d.db_mb + ' MB' : ''));
+                const r = d.resumen || {};
+                _ldSet('ld-k-snaps', r.feature_snapshots || 0);
+                _ldSet('ld-k-fire', r.fire_labels || 0);
+                _ldSet('ld-k-breakout', r.breakout_labels || 0);
+                _ldSet('ld-k-near', r.near_miss_labels || 0);
+                _ldSet('ld-k-rules', r.entry_rules_activas || 0);
+                _ldSet('ld-k-shadow', r.entry_rules_shadow || 0);
+                _ldSet('ld-k-patterns', r.learned_patterns || 0);
+                _ldSet('ld-k-profiles', r.coin_profiles || 0);
+                _ldSet('ld-k-preds', r.predictions_log || 0);
+                _ldSet('ld-k-guard', r.guardrail_pending || 0);
+                _ldSet('ld-k-bypass', r.bypass_rules_activas || 0);
+                _ldSet('ld-k-p2', d.p2_count || 0);
+                _ldSet('ld-k-b1', d.b1_promotables || 0);
+                _ldSet('ld-k-drift', r.drift_alerts || 0);
+                _ldSet('ld-k-exit', r.exit_outcomes || 0);
+                _ldSet('ld-k-trend', r.trend_end_labels || 0);
+                _ldSet('ld-k-regime', r.regime_transitions || 0);
+
+                _ldModo('ld-mode-apply', (d.modo || {}).apply);
+                _ldModo('ld-mode-bypass', (d.modo || {}).bypass);
+                _ldModo('ld-mode-exit', (d.modo || {}).exit);
+                _ldSet('ld-f95', d.f95_aplicado ? 'APLICADO' : 'FALTA');
+                const f95el = document.getElementById('ld-f95');
+                if (f95el) f95el.className = 'font-mono ' + (d.f95_aplicado ? 'text-green-400' : 'text-red-400');
+                const fl = d.flags || {};
+                _ldSet('ld-flag-force', fl.force_run ? 'PENDIENTE' : 'libre');
+                _ldSet('ld-flag-review', fl.revisar_guardrails ? 'PENDIENTE' : 'libre');
+
+                const fr = d.frescura || {};
+                _ldSet('ld-fresh-snaps', _ldAgo(fr.snapshots_h));
+                _ldSet('ld-fresh-near', _ldAgo(fr.near_miss_h));
+                _ldSet('ld-fresh-rules', fr.entry_updated_max || '--');
+
+                const rules = d.entry_rules || [];
+                const rtbody = document.getElementById('ld-rules-tbody');
+                if (!rules.length) {
+                    rtbody.innerHTML = '<tr><td colspan="11" class="text-center text-gray-500 py-6">Sin entry_rules (F7 acumulando datos)</td></tr>';
+                } else {
+                    rtbody.innerHTML = rules.map(x => {
+                        const cond = _ldEsc((x.condition_json || '').slice(0, 60));
+                        const wr = (x.win_rate * 100).toFixed(1);
+                        const lift = (x.lift_vs_baseline === null || x.lift_vs_baseline === undefined) ? '-' : x.lift_vs_baseline.toFixed(2);
+                        const est = x.is_active ? '<span class="text-green-400">ACTIVE</span>' : '<span class="text-gray-500">SHADOW</span>';
+                        return `<tr><td>${_ldEsc(x.tipo_entrada)}</td><td class="font-bold">${_ldEsc(x.accion)}</td><td>${_ldEsc(x.direction || '')}</td><td>${_ldEsc(x.regime || '')}</td><td class="font-mono text-[10px]">${cond}</td><td class="font-mono">${x.n_occurrences}</td><td>${wr}%</td><td class="font-mono">${(x.wilson_lower || 0).toFixed(3)}</td><td class="font-mono">${lift}</td><td>${est}</td><td class="text-[10px] text-gray-500">${_ldEsc(x.updated_at || '')}</td></tr>`;
+                    }).join('');
+                }
+
+                const nm = d.near_miss_por_tipo || [];
+                const ntbody = document.getElementById('ld-nm-tbody');
+                if (!nm.length) {
+                    ntbody.innerHTML = '<tr><td colspan="5" class="text-center text-gray-500 py-6">Sin near_miss_labels</td></tr>';
+                } else {
+                    ntbody.innerHTML = nm.map(x => {
+                        const fnp = x.n ? (100 * x.falsos_negativos / x.n).toFixed(1) : '0.0';
+                        return `<tr><td>${_ldEsc(x.tipo_rechazo)}</td><td class="font-mono">${x.n}</td><td class="text-orange-400 font-mono">${x.falsos_negativos}</td><td class="text-green-400 font-mono">${x.bloqueo_correcto}</td><td class="font-mono">${fnp}%</td></tr>`;
+                    }).join('');
+                }
+
+                const g = d.guardrails || [];
+                const gtbody = document.getElementById('ld-guard-tbody');
+                if (!g.length) {
+                    gtbody.innerHTML = '<tr><td colspan="6" class="text-center text-gray-500 py-6">Sin guardrail_events</td></tr>';
+                } else {
+                    gtbody.innerHTML = g.map(x => `<tr><td>${_ldEsc(x.tipo)}</td><td>${_ldEsc(x.severidad || '')}</td><td class="text-[10px]">${_ldEsc((x.razon || '').slice(0, 80))}</td><td>${_ldEsc(x.accion_tomada || '')}</td><td class="text-[10px]">${_ldEsc(x.modo_despues || '')}</td><td>${x.revisado ? 'SI' : 'NO'}</td></tr>`).join('');
+                }
+
+                const prof = d.profiles || [];
+                const ptbody = document.getElementById('ld-profiles-tbody');
+                ptbody.innerHTML = prof.length ? prof.map(x => `<tr><td>${_ldEsc(x.symbol)}</td><td class="text-[10px] text-gray-500">${_ldEsc(x.generado_utc || '')}</td></tr>`).join('') : '<tr><td colspan="2" class="text-center text-gray-500 py-6">Sin perfiles</td></tr>';
+
+
+                const byp = d.bypass_top || [];
+                const btbody = document.getElementById('ld-bypass-tbody');
+                if (!byp.length) {
+                    btbody.innerHTML = '<tr><td colspan="9" class="text-center text-gray-500 py-6">Sin bypass_rules</td></tr>';
+                } else {
+                    btbody.innerHTML = byp.map(x => {
+                        const cond = _ldEsc((x.condition_json || '').slice(0, 40));
+                        const wr = (x.win_rate * 100).toFixed(1);
+                        const wl = (x.wilson_lower || 0).toFixed(3);
+                        return `<tr><td class="font-mono text-[11px]">${_ldEsc(x.symbol || 'GLOBAL')}</td><td>${_ldEsc(x.direction || '')}</td><td>${_ldEsc(x.regime || '')}</td><td>${_ldEsc(x.rejected_filter || '')}</td><td class="font-mono text-[10px]">${cond}</td><td class="font-mono">${x.n_occurrences}</td><td>${wr}%</td><td class="font-mono">${wl}</td><td>${x.is_active ? '<span class="text-green-400">ACTIVE</span>' : '<span class="text-gray-500">SHADOW</span>'}</td></tr>`;
+                    }).join('');
+                }
+
+                const pat = d.patterns || [];
+                const patbody = document.getElementById('ld-patterns-tbody');
+                patbody.innerHTML = pat.length ? pat.map(x => `<tr><td>${_ldEsc(x.status)}</td><td class="font-mono">${x.n}</td></tr>`).join('') : '<tr><td colspan="2" class="text-center text-gray-500 py-6">Sin patterns</td></tr>';
+
+                const sch = d.schema || [];
+                const stbody = document.getElementById('ld-schema-tbody');
+                stbody.innerHTML = sch.length ? sch.map(x => `<tr><td>${_ldEsc(x.componente)}</td><td>${_ldEsc(x.version)}</td><td>${x.activo ? 'SI' : '-'}</td><td class="text-[10px]">${_ldFecha(x.aplicado_utc)}</td></tr>`).join('') : '<tr><td colspan="4" class="text-center text-gray-500 py-6">Sin schema_versions</td></tr>';
+
+                const pred = d.predictions || [];
+                const prtbody = document.getElementById('ld-pred-tbody');
+                prtbody.innerHTML = pred.length ? pred.map(x => `<tr><td>${_ldEsc(x.modo)}</td><td>${_ldEsc(x.decision)}</td><td class="font-mono">${x.n}</td></tr>`).join('') : '<tr><td colspan="3" class="text-center text-gray-500 py-6">Sin predicciones (apply OFF)</td></tr>';
+
+                const ld = d.labels_por_dia || [];
+                Plotly.newPlot('ld-chart-labels', [
+                    { x: ld.map(x => x.fecha), y: ld.map(x => x.fire), name: 'FIRE', type: 'bar', marker: { color: '#3b82f6' } },
+                    { x: ld.map(x => x.fecha), y: ld.map(x => x.breakout), name: 'BREAKOUT', type: 'bar', marker: { color: '#f59e0b' } },
+                    { x: ld.map(x => x.fecha), y: ld.map(x => x.near_miss), name: 'NEAR-MISS', type: 'bar', marker: { color: '#10b981' } }
+                ], { barmode: 'stack', margin: { l: 35, r: 10, t: 10, b: 30 }, paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', font: { color: '#9ca3af', size: 10 }, legend: { orientation: 'h' } }, { displayModeBar: false, responsive: true });
+
+                const ra = d.entry_rules_por_accion || [];
+                Plotly.newPlot('ld-chart-rules', [{
+                    x: ra.map(x => x.key.replace(/\|/g, ' ')), y: ra.map(x => x.n),
+                    type: 'bar', marker: { color: '#8b5cf6' }
+                }], { margin: { l: 35, r: 10, t: 10, b: 70 }, paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', font: { color: '#9ca3af', size: 10 } }, { displayModeBar: false, responsive: true });
+            } catch (e) {
+                console.error('[LEARNING-DASH]', e);
+                _ldSet('ld-db', 'Error cargando learning dashboard');
+            }
+        }
         // ============================================
         // INICIALIZACION
         // ============================================
