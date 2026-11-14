@@ -99,6 +99,8 @@ async def lifespan(fastapi_app):
         if executor:
             executor.learning_engine = learning_engine
         print(f"  🧠 [LEARN] engine inyectado | apply={CONFIG.learning_apply_mode} "
+              f"entry_rules="
+              f"{getattr(CONFIG, 'learning_entry_rules_mode', 'OFF')} "
               f"exit={CONFIG.learning_exit_mode}")
 
     # P0.1: Inyectar learning_engine en audit_logger (después de crear el engine)

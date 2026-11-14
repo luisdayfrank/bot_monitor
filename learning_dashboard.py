@@ -277,6 +277,8 @@ async def resumen(cfg=None):
         data['generado_ms'] = int(time.time() * 1000)
         data['modo'] = {
             'apply': getattr(cfg, 'learning_apply_mode', 'OFF') if cfg else '?',
+            'entry_rules': (getattr(cfg, 'learning_entry_rules_mode', 'OFF')
+                            if cfg else '?'),
             'bypass': getattr(cfg, 'learning_bypass_mode', 'OFF') if cfg else '?',
             'exit': getattr(cfg, 'learning_exit_mode', 'OFF') if cfg else '?',
             'refusal_threshold': getattr(

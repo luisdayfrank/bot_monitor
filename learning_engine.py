@@ -2522,6 +2522,8 @@ class LearningEngine:
     async def run(self):
         print("  🧠 [LEARN] LearningEngine iniciado "
               f"(modo={getattr(self.cfg, 'learning_apply_mode', 'OFF')}, "
+              "entry_rules="
+              f"{getattr(self.cfg, 'learning_entry_rules_mode', 'OFF')}, "
               f"exit={getattr(self.cfg, 'learning_exit_mode', 'OFF')})")
         await self._verificar_f95_activo()
         tick = 0
@@ -2995,7 +2997,8 @@ class LearningEngine:
                               f"{max_pct:.0%}) en 24h"),
                     'accion_tomada': 'DEMOTE_ALL_ENTRY_RULES',
                     'modo_antes': getattr(self.cfg,
-                                          'learning_apply_mode', 'OFF'),
+                                          'learning_entry_rules_mode',
+                                          'OFF'),
                     'modo_despues': 'entry_rules=SHADOW',
                     'revisado_por_humano': 0,
                 })
@@ -3021,13 +3024,16 @@ class LearningEngine:
             print(f"  [ENTRY-GUARDRAIL] Error: {e_guard}")
 
     async def _verificar_f95_activo(self):
-        """F9.5 punto 7: ACTIVE sin F9.5 aplicado -> forzar SHADOW.
+        """F9.5/F11: ACTIVE (apply o entry_rules) sin F9.5 -> SHADOW.
 
-        Si el marker ENTRY_RULES v1.0_f95 falta (deploy antiguo/mixto) y
-        learning_apply_mode=ACTIVE, degrada a SHADOW y avisa. No hace nada
-        en OFF/SHADOW. Errores de DB: no bloquea el arranque.
+        Si falta el marker ENTRY_RULES v1.0_f95 (deploy antiguo/mixto),
+        degrada a SHADOW cada modo que este en ACTIVE. No hace nada en
+        OFF/SHADOW. Errores de DB: no bloquea el arranque.
         """
-        if getattr(self.cfg, 'learning_apply_mode', 'OFF') != 'ACTIVE':
+        apply_mode = getattr(self.cfg, 'learning_apply_mode', 'OFF')
+        entry_mode = getattr(
+            self.cfg, 'learning_entry_rules_mode', 'OFF')
+        if apply_mode != 'ACTIVE' and entry_mode != 'ACTIVE':
             return
         try:
             ok = await ldb.f95_aplicado()
@@ -3036,14 +3042,17 @@ class LearningEngine:
             return
         if ok:
             return
-        self.cfg.learning_apply_mode = 'SHADOW'
-        print("  [WARN] learning_apply_mode=ACTIVE sin F9.5 aplicado "
-              "(P1/P2/P3 sin cerrar) -> forzado a SHADOW")
+        if apply_mode == 'ACTIVE':
+            self.cfg.learning_apply_mode = 'SHADOW'
+        if entry_mode == 'ACTIVE':
+            self.cfg.learning_entry_rules_mode = 'SHADOW'
+        print("  [WARN] modo ACTIVE (apply/entry_rules) sin F9.5 aplicado "
+              "(P1/P2/P3 sin cerrar) -> degradado a SHADOW")
         if self.notifier:
             try:
                 await self.notifier.enviar_telegram(
-                    "LEARNING ENGINE\nACTIVE sin F9.5 aplicado -> "
-                    "forzado a SHADOW (P1/P2/P3 sin cerrar).")
+                    "LEARNING ENGINE\nACTIVE (apply/entry_rules) sin F9.5 "
+                    "aplicado -> degradado a SHADOW (P1/P2/P3 sin cerrar).")
             except Exception:
                 pass
 

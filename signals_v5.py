@@ -332,7 +332,7 @@ class SignalGenerator:
             return False, f"Grid neutral rechazado: {'; '.join(rechazos[:2])}"
 
         # -- F8.3: entry_rules NEUTRAL (F7: direction='NEUTRAL', regime=None)
-        _entry_mode = getattr(CONFIG, 'learning_apply_mode', 'OFF')
+        _entry_mode = getattr(CONFIG, 'learning_entry_rules_mode', 'OFF')
         if (self.learning_engine is not None and
                 _entry_mode in ('SHADOW', 'ACTIVE')):
             try:
@@ -2278,7 +2278,7 @@ class SignalGenerator:
                 return
 
         # -- F8.4: entry_rules BREAKOUT (F7: symbol/direction/regime=None) ---
-        _entry_mode = getattr(CONFIG, 'learning_apply_mode', 'OFF')
+        _entry_mode = getattr(CONFIG, 'learning_entry_rules_mode', 'OFF')
         if (self.learning_engine is not None and
                 _entry_mode in ('SHADOW', 'ACTIVE')):
             try:
@@ -2533,8 +2533,8 @@ class SignalGenerator:
             await self.emitir_alerta(symbol, 'RECHAZADO', direction, 0, rechazos, None, price)
             return
 
-        # -- F8.2: entry_rules FIRE (I101 Ruta A: learning_apply_mode) -----
-        _entry_mode = getattr(CONFIG, 'learning_apply_mode', 'OFF')
+        # -- F8.2: entry_rules FIRE (I101/P6: learning_entry_rules_mode) ---
+        _entry_mode = getattr(CONFIG, 'learning_entry_rules_mode', 'OFF')
         if (self.learning_engine is not None and
                 _entry_mode in ('SHADOW', 'ACTIVE')):
             try:
