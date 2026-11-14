@@ -925,6 +925,7 @@
                         <h3 class="text-sm font-bold text-gray-300 mb-2">Modos</h3>
                         <div class="space-y-1 text-xs">
                             <div class="flex justify-between"><span class="text-gray-400">apply</span><span id="ld-mode-apply" class="font-mono">--</span></div>
+                            <div class="flex justify-between"><span class="text-gray-400">entry_rules</span><span id="ld-mode-entry" class="font-mono">--</span></div>
                             <div class="flex justify-between"><span class="text-gray-400">bypass</span><span id="ld-mode-bypass" class="font-mono">--</span></div>
                             <div class="flex justify-between"><span class="text-gray-400">exit</span><span id="ld-mode-exit" class="font-mono">--</span></div>
                             <div class="flex justify-between"><span class="text-gray-400">F9.5</span><span id="ld-f95" class="font-mono">--</span></div>
@@ -3155,6 +3156,7 @@
                 _ldSet('ld-k-regime', r.regime_transitions || 0);
 
                 _ldModo('ld-mode-apply', (d.modo || {}).apply);
+                _ldModo('ld-mode-entry', (d.modo || {}).entry_rules);
                 _ldModo('ld-mode-bypass', (d.modo || {}).bypass);
                 _ldModo('ld-mode-exit', (d.modo || {}).exit);
                 _ldSet('ld-f95', d.f95_aplicado ? 'APLICADO' : 'FALTA');
