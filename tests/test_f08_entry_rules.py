@@ -140,7 +140,51 @@ def test_contexto_entry_rules():
 
 
 def test_neutral_serving_active_y_shadow():
-    mode0 = getattr(sgv.CONFIG, 'learning_apply_mode', 'OFF')
+    mode0 = getattr(sgv.CONFIG, 'learning_entry_rules_mode', 'OFF')
+    try:
+        eng = le.EntryRuleEngine()
+        eng.cargar([_regla(tipo='NEUTRAL', direction='NEUTRAL',
+                           regime=None,
+                           cond='{"adx_15m": {"_max": 20}}')])
+        sg = _nuevo_sg(eng)
+        i15 = {'adx': 15.0, 'rsi': 50.0, 'atr': 0.5, 'close': 100.0,
+               'ema50_15m': 100.0, 'macd_hist': 0.0, 'ema200_15m': 95.0,
+               'timestamp': 1794000000000}
+        sgv.CONFIG.learning_entry_rules_mode = 'ACTIVE'
+        ok, razon = sg.evaluar_grid_neutro(SYM, i15)
+        assert ok is False and 'entry_rule_bloquea' in razon, (ok, razon)
+        sgv.CONFIG.learning_entry_rules_mode = 'SHADOW'
+        ok2, _ = sg.evaluar_grid_neutro(SYM, i15)
+        assert ok2 is True
+    finally:
+        sgv.CONFIG.learning_entry_rules_mode = mode0
+    print('  [OK] F8.3: NEUTRAL ACTIVE bloquea / SHADOW solo observa')
+
+
+def test_learning_entry_rules_mode_off():
+    """A11/P6: entry_rules_mode=OFF -> F8 inerte (aunque apply=ACTIVE)."""
+    mode0 = getattr(sgv.CONFIG, 'learning_entry_rules_mode', 'OFF')
+    try:
+        eng = le.EntryRuleEngine()
+        eng.cargar([_regla(tipo='NEUTRAL', direction='NEUTRAL',
+                           regime=None,
+                           cond='{"adx_15m": {"_max": 20}}')])
+        sg = _nuevo_sg(eng)
+        i15 = {'adx': 15.0, 'rsi': 50.0, 'atr': 0.5, 'close': 100.0,
+               'ema50_15m': 100.0, 'macd_hist': 0.0, 'ema200_15m': 95.0,
+               'timestamp': 1794000000000}
+        sgv.CONFIG.learning_entry_rules_mode = 'OFF'
+        ok, _ = sg.evaluar_grid_neutro(SYM, i15)
+        assert ok is True
+    finally:
+        sgv.CONFIG.learning_entry_rules_mode = mode0
+    print('  [OK] F8-A11/P6: entry_rules_mode=OFF -> F8 inerte')
+
+
+def test_p6_separacion_modos():
+    """P6: apply ACTIVE no activa entry_rules; entry ACTIVE no toca apply."""
+    a0 = getattr(sgv.CONFIG, 'learning_apply_mode', 'OFF')
+    e0 = getattr(sgv.CONFIG, 'learning_entry_rules_mode', 'OFF')
     try:
         eng = le.EntryRuleEngine()
         eng.cargar([_regla(tipo='NEUTRAL', direction='NEUTRAL',
@@ -151,34 +195,17 @@ def test_neutral_serving_active_y_shadow():
                'ema50_15m': 100.0, 'macd_hist': 0.0, 'ema200_15m': 95.0,
                'timestamp': 1794000000000}
         sgv.CONFIG.learning_apply_mode = 'ACTIVE'
-        ok, razon = sg.evaluar_grid_neutro(SYM, i15)
-        assert ok is False and 'entry_rule_bloquea' in razon, (ok, razon)
-        sgv.CONFIG.learning_apply_mode = 'SHADOW'
-        ok2, _ = sg.evaluar_grid_neutro(SYM, i15)
-        assert ok2 is True
-    finally:
-        sgv.CONFIG.learning_apply_mode = mode0
-    print('  [OK] F8.3: NEUTRAL ACTIVE bloquea / SHADOW solo observa')
-
-
-def test_learning_apply_mode_off():
-    """A11: con learning_apply_mode=OFF F8 es inerte (no evalua/bloquea)."""
-    mode0 = getattr(sgv.CONFIG, 'learning_apply_mode', 'OFF')
-    try:
-        eng = le.EntryRuleEngine()
-        eng.cargar([_regla(tipo='NEUTRAL', direction='NEUTRAL',
-                           regime=None,
-                           cond='{"adx_15m": {"_max": 20}}')])
-        sg = _nuevo_sg(eng)
-        i15 = {'adx': 15.0, 'rsi': 50.0, 'atr': 0.5, 'close': 100.0,
-               'ema50_15m': 100.0, 'macd_hist': 0.0, 'ema200_15m': 95.0,
-               'timestamp': 1794000000000}
-        sgv.CONFIG.learning_apply_mode = 'OFF'
+        sgv.CONFIG.learning_entry_rules_mode = 'OFF'
         ok, _ = sg.evaluar_grid_neutro(SYM, i15)
-        assert ok is True
+        assert ok is True, 'apply ACTIVE no debe activar entry_rules'
+        sgv.CONFIG.learning_apply_mode = 'OFF'
+        sgv.CONFIG.learning_entry_rules_mode = 'ACTIVE'
+        ok2, razon = sg.evaluar_grid_neutro(SYM, i15)
+        assert ok2 is False and 'entry_rule_bloquea' in razon, (ok2, razon)
     finally:
-        sgv.CONFIG.learning_apply_mode = mode0
-    print('  [OK] F8-A11: learning_apply_mode=OFF -> F8 inerte')
+        sgv.CONFIG.learning_apply_mode = a0
+        sgv.CONFIG.learning_entry_rules_mode = e0
+    print('  [OK] F11-P6: modos apply/entry_rules independientes')
 
 
 async def main():
@@ -191,7 +218,8 @@ async def main():
     await test_recargar_cache_wiring()
     test_contexto_entry_rules()
     test_neutral_serving_active_y_shadow()
-    test_learning_apply_mode_off()
+    test_learning_entry_rules_mode_off()
+    test_p6_separacion_modos()
     print('RESULTADO F8: PASS')
 
 

@@ -123,6 +123,14 @@ async def test_b1_allow_unchanged():
     print('  [OK] F10-B1: ALLOW conserva criterio wilson>=0.65')
 
 
+async def test_b1_allow_no_invade_block():
+    """D-F10-2: ALLOW con hi bajo pero wilson<0.65 -> NO promueve."""
+    ups = await _promover([_regla(rid=5, accion='ALLOW', n=100,
+                                  wilson=0.13, win_rate=0.20)])
+    assert ups == [], ups
+    print('  [OK] F10-D2: ALLOW hi bajo + wilson<0.65 -> no promueve')
+
+
 async def test_b2_b4_flags():
     eng = object.__new__(le.LearningEngine)
     d = tempfile.mkdtemp()
@@ -226,9 +234,9 @@ def test_b3_squeeze_threshold():
            'ema50_15m': 100.0, 'macd_hist': 0.0,
            'timestamp': 1794000000000}
     t0 = cfg.learning_squeeze_bb_pct_threshold
-    m0 = getattr(cfg, 'learning_apply_mode', 'OFF')
+    m0 = getattr(cfg, 'learning_entry_rules_mode', 'OFF')
     try:
-        cfg.learning_apply_mode = 'OFF'
+        cfg.learning_entry_rules_mode = 'OFF'
         cfg.learning_squeeze_bb_pct_threshold = 30.0
         ok, _ = _nuevo_sg(25.0).evaluar_grid_neutro(SYM, i15)
         assert ok is False
@@ -237,7 +245,7 @@ def test_b3_squeeze_threshold():
         assert ok2 is True
     finally:
         cfg.learning_squeeze_bb_pct_threshold = t0
-        cfg.learning_apply_mode = m0
+        cfg.learning_entry_rules_mode = m0
     print('  [OK] F10-B3: SQUEEZE usa umbral configurable')
 
 
@@ -251,6 +259,7 @@ async def main():
     await test_b1_no_promote_block_hi()
     await test_b1_demote_block()
     await test_b1_allow_unchanged()
+    await test_b1_allow_no_invade_block()
     await test_b2_b4_flags()
     await test_b4_mark_reviewed_db()
     test_b3_regime_thresholds()

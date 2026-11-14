@@ -160,7 +160,7 @@ def _i15():
 
 
 async def test_fire_score_real():
-    mode0 = getattr(sgv.CONFIG, 'learning_apply_mode', 'OFF')
+    mode0 = getattr(sgv.CONFIG, 'learning_entry_rules_mode', 'OFF')
     try:
         eng = le.EntryRuleEngine()
         eng.cargar([{'tipo_entrada': 'FIRE', 'accion': 'REQUIRE_SCORE',
@@ -170,7 +170,7 @@ async def test_fire_score_real():
                      'win_rate': 0.5, 'wilson_lower': 0.5,
                      'lift_vs_baseline': 1.0, 'is_active': 1}])
         sg = _sg_fire(eng)
-        sgv.CONFIG.learning_apply_mode = 'ACTIVE'
+        sgv.CONFIG.learning_entry_rules_mode = 'ACTIVE'
         i15 = _i15()
         i1m_bajo = {'rsi_7': 50.0, 'wick_upper_pct': 0.0, 'volume': 10.0,
                     'volume_sma20': 10.0, 'atr_1m': 0.0, 'close': 100.0}
@@ -199,12 +199,12 @@ async def test_fire_score_real():
         assert captured[-1] == s_alto, captured
         assert sg.states[SYM].estado == 'COOLDOWN'
     finally:
-        sgv.CONFIG.learning_apply_mode = mode0
+        sgv.CONFIG.learning_entry_rules_mode = mode0
     print('  [OK] F9.5-P3: FIRE usa _calcular_score_disparo (score real)')
 
 
 async def test_fire_shadow_observa():
-    mode0 = getattr(sgv.CONFIG, 'learning_apply_mode', 'OFF')
+    mode0 = getattr(sgv.CONFIG, 'learning_entry_rules_mode', 'OFF')
     try:
         eng = le.EntryRuleEngine()
         eng.cargar([{'tipo_entrada': 'FIRE', 'accion': 'BLOCK',
@@ -214,7 +214,7 @@ async def test_fire_shadow_observa():
                      'win_rate': 0.0, 'wilson_lower': 0.0,
                      'lift_vs_baseline': None, 'is_active': 1}])
         sg = _sg_fire(eng)
-        sgv.CONFIG.learning_apply_mode = 'SHADOW'
+        sgv.CONFIG.learning_entry_rules_mode = 'SHADOW'
         await sg._procesar_disparo(SYM, 'SHORT', 100.0,
                                    {'rsi_7': 50.0, 'wick_upper_pct': 0.0,
                                     'volume': 10.0, 'volume_sma20': 10.0,
@@ -223,7 +223,7 @@ async def test_fire_shadow_observa():
         assert not sg.alertas
         assert sg.states[SYM].estado == 'COOLDOWN'
     finally:
-        sgv.CONFIG.learning_apply_mode = mode0
+        sgv.CONFIG.learning_entry_rules_mode = mode0
     print('  [OK] F9.5: SHADOW solo observa (sin bloqueo, sigue el flujo)')
 
 
@@ -256,13 +256,19 @@ async def test_warning_activo_sin_f95():
         ldb.f95_aplicado = _f95_false
         await eng._verificar_f95_activo()
         assert eng.cfg.learning_apply_mode == 'SHADOW'
+        eng.cfg = SimpleNamespace(
+            learning_apply_mode='OFF',
+            learning_entry_rules_mode='ACTIVE')
+        await eng._verificar_f95_activo()
+        assert eng.cfg.learning_entry_rules_mode == 'SHADOW'
+        assert eng.cfg.learning_apply_mode == 'OFF'
         ldb.f95_aplicado = _f95_true
         eng.cfg.learning_apply_mode = 'ACTIVE'
         await eng._verificar_f95_activo()
         assert eng.cfg.learning_apply_mode == 'ACTIVE'
     finally:
         ldb.f95_aplicado = orig
-    print('  [OK] F9.5: ACTIVE sin marker -> SHADOW; con marker -> sin cambio')
+    print('  [OK] F9.5/F11: warning cubre apply y entry_rules')
 
 
 async def main():
