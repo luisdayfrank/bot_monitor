@@ -35,6 +35,7 @@ from database_v5 import (
     _db_lock,
     # CR2: Arquitectura de PnL completa
     guardar_pnl_evento,
+    pnl_evento_existe,   # F12.5 — B23: idempotencia del funnel
     calcular_pnl_acumulado,
     obtener_pnl_por_tipo,
     cargar_grid_ejecuciones_activos,
@@ -1810,8 +1811,10 @@ class GridExecutor:
                 except Exception as e_learn:
                     print(f"  ⚠️ [LEARN] registrar_entrada {pos_id}: {e_learn}")
 
-            gs.fees_totales += fee_d
-            self._registrar_fee(float(fee_d))  # FASE 4: fee diaria
+            # F12.5 (plan v7): fee con propiedad ÚNICA — se registra solo en
+            # _procesar_trade_con_pnl (funnel común de todo fill). Registrarlo
+            # aquí duplicaba el conteo (B1) y los fills parciales no lo hacían
+            # (B19). pos.fee_pagada (por posición) sí se acumula arriba.
 
         # Actualizar posicion_neta del executor (para compatibilidad con código existente)
         if side == 'BUY':
@@ -1879,13 +1882,14 @@ class GridExecutor:
             if candidatas:
                 pos = candidatas[0]
 
-        # 2. Ajustar neta y fees SIEMPRE (el cierre ya ocurrió en Binance)
+        # 2. Ajustar neta SIEMPRE (el cierre ya ocurrió en Binance).
+        # F12.5 (plan v7): el fee se registra SOLO en _procesar_trade_con_pnl.
+        # Antes se registraba únicamente en el lado SELL (B20: asimetría BUY/SELL)
+        # y duplicaba el funnel (B1).
         if side == 'BUY':
             state.posicion_neta += qty_d
         else:
             state.posicion_neta -= qty_d
-            gs.fees_totales += fee_d
-            self._registrar_fee(float(fee_d))  # FASE 4: fee diaria
 
         if pos is None:
             # No hay posición interna que matchear (ej: ya cerrada por emparejamiento).
@@ -2053,8 +2057,10 @@ class GridExecutor:
                 pos.orden_cierre_id = binance_order_id
                 
                 gs.pnl_bruto += Decimal(str(pnl))
-                gs.fees_totales += Decimal(str(fee_cierre))
-                self._registrar_fee(float(fee_cierre))  # FASE 4: fee diaria
+                # F12.5 (plan v7): NO registrar fee aquí. El caller que procesó
+                # los trades reales (kill-switch → _procesar_trade_con_pnl) ya
+                # lo hizo en el funnel único. Registrarlo de nuevo duplicaba el
+                # conteo (B1). fee_cierre se conserva solo como dato de log.
                 gs.pnl_neto = gs.pnl_bruto - gs.fees_totales
                 gs.trades_kill_switch += 1
                 
@@ -3182,6 +3188,26 @@ class GridExecutor:
                 procesado_ok = True
 
                 # ─── PASO 3: Side-effects secundarios (fallan → log, no se repiten) ───
+                # F12.5 (plan v7, I-S1-1): contabilidad PRIMERO y con try propio —
+                # un fallo colocando el TP no debe perder el registro de fee/PnL.
+                try:
+                    tipo_evento = 'FILL_ENTRADA' if orden['tipo_orden'] == 'ENTRY' else 'FILL_SALIDA' if orden['tipo_orden'] in ('TAKE_PROFIT', 'CIERRE') else 'FILL_DESCONOCIDO'
+                    await self._procesar_trade_con_pnl(state, fill, tipo_evento)
+
+                    await actualizar_orden_fill(
+                        orden_id=orden['id'],
+                        binance_trade_id=str(binance_trade_id),
+                        price=price,
+                        qty=qty,
+                        commission=commission,
+                        commission_asset=fill.get('commission_asset', ''),
+                        realized_pnl=float(fill.get('realized_pnl', 0)),
+                        timestamp=datetime.fromtimestamp(ts).isoformat() if ts > 0 else datetime.utcnow().isoformat()
+                    )
+                except Exception as e_contab:
+                    print(f"  ⚠️ [FASE 3] {symbol} Fill {fill_id} contabilidad falló "
+                          f"(PnL/fee/orden): {e_contab}")
+
                 try:
                     if orden['tipo_orden'] == 'ENTRY':
                         # FIX FASE 5: Verificar que la posición sigue ABIERTA antes de colocar TP
@@ -3225,20 +3251,6 @@ class GridExecutor:
                         else:
                             print(f"  [FASE 5] {symbol} Pos {pos_id} ya cerrada, skip TP.")
 
-                    tipo_evento = 'FILL_ENTRADA' if orden['tipo_orden'] == 'ENTRY' else 'FILL_SALIDA' if orden['tipo_orden'] in ('TAKE_PROFIT', 'CIERRE') else 'FILL_DESCONOCIDO'
-                    await self._procesar_trade_con_pnl(state, fill, tipo_evento)
-
-                    await actualizar_orden_fill(
-                        orden_id=orden['id'],
-                        binance_trade_id=str(binance_trade_id),
-                        price=price,
-                        qty=qty,
-                        commission=commission,
-                        commission_asset=fill.get('commission_asset', ''),
-                        realized_pnl=float(fill.get('realized_pnl', 0)),
-                        timestamp=datetime.fromtimestamp(ts).isoformat() if ts > 0 else datetime.utcnow().isoformat()
-                    )
-
                     # V8 FASE 4: reportar fill al engine (observacional — una falla
                     # aquí queda capturada por el except de side-effects, nunca
                     # rompe el pipeline; el fill ya fue marcado como procesado)
@@ -3247,7 +3259,8 @@ class GridExecutor:
                         await self._v8_track_fill_roundtrip(
                             state, symbol, orden, side, price, qty, pos_id)
                 except Exception as e_side:
-                    print(f"  ⚠️ [FASE 3] {symbol} Fill {fill_id} side-effect falló (TP/PnL/orden) pero YA MARCADO como procesado: {e_side}")
+                    print(f"  ⚠️ [FASE 3] {symbol} Fill {fill_id} side-effect falló "
+                          f"(TP/V8) pero YA MARCADO como procesado: {e_side}")
 
                 print(f"  [CR16] {symbol} Fill procesado: {side} @ ${price:.4f} | Modo: {state.grid_mode} | Qty: {qty}")
 
@@ -3372,9 +3385,9 @@ class GridExecutor:
         else:
             state.posicion_neta -= Decimal(str(qty))
 
-        # Actualizar fees y PnL real
-        state.fees_real += Decimal(str(commission))
-        self._registrar_fee(float(commission))  # FASE 4: fee diaria
+        # F12.5 (plan v7): fees NO se registran aquí — este mismo fill pasa
+        # después por _procesar_trade_con_pnl (funnel único). Registrarlas en
+        # ambos puntos duplicaba el conteo (B1).
         if realized_pnl != 0:
             state.pnl_real += Decimal(str(realized_pnl))
 
@@ -3922,10 +3935,10 @@ class GridExecutor:
             self._fees_dia_contador = hoy
             self._fees_pausa_activa = False
 
-        # Calcular capital total (suma de capitales de grids activos)
-        capital_total = sum(float(s.capital) for s in self._grids.values() if s.activa)
-        if capital_total <= 0:
-            capital_total = float(CONFIG.trading_capital_max_usdt)
+        # F12.5 (plan v7) — B9: base de capital FIJA (ver I-S1-5).
+        # Antes: sum(capital de grids activos) — cambiaba cada vez que un grid
+        # abría/cerraba y el umbral de pausa por fees se movía intra-día.
+        capital_total = float(CONFIG.trading_capital_max_usdt)
 
         limite = capital_total * (CONFIG.grid_fees_diarias_max_pct / 100)
 
@@ -4300,10 +4313,26 @@ class GridExecutor:
                   f"(price={price_raw}, qty={qty_raw}, side={side_raw}, comm={commission_raw})")
             return {'realized_pnl': 0, 'commission': 0, 'notional': 0, 'descartado': True}
 
+        # F12.10 (plan v7) — B12: sin IDs reales NO se contabiliza PnL (I-S1-2).
+        # Con trade_id='UNKNOWN' el UNIQUE de pnl_eventos/fills_tracking colapsaría
+        # todos los trades sin id en UNA fila (INSERT IGNORE traga el resto) y el
+        # PnL se perdería en silencio.
         if binance_trade_id == 'UNKNOWN' or binance_order_id == 'UNKNOWN':
-            print(f"  ⚠️ [PnL] {state.symbol} Trade con IDs desconocidos: "
-                  f"trade_id={binance_trade_id}, order_id={binance_order_id}. "
-                  f"Se procesa PnL pero trazabilidad limitada.")
+            print(f"  ❌ [PnL] {state.symbol} ERROR_TRAZABILIDAD: trade_id={binance_trade_id}, "
+                  f"order_id={binance_order_id}. NO se contabiliza PnL/fee. "
+                  f"Origen del dict sin id (la API de Binance siempre trae id/orderId).")
+            return {'realized_pnl': 0, 'commission': 0, 'notional': 0,
+                    'descartado': True, 'error': 'TRAZABILIDAD'}
+
+        # F12.5 (plan v7) — B23: idempotencia. Si el trade ya se contabilizó
+        # (p.ej. la ruta de cierre LIMIT lo procesó y el poll lo trae otra vez),
+        # NO se toca RAM: el fee/pnl se registraría 2× y _fees_diarias (pausa
+        # por fees) no se reconcilia nunca con la DB.
+        if await pnl_evento_existe(binance_trade_id):
+            print(f"  [PnL] {state.symbol} Trade {binance_trade_id} ya contabilizado "
+                  f"(duplicado) — skip RAM.")
+            return {'realized_pnl': 0, 'commission': 0, 'notional': 0,
+                    'descartado': True, 'duplicado': True}
 
         price = float(price_raw)
         qty = float(qty_raw)
@@ -4328,8 +4357,12 @@ class GridExecutor:
         )
 
         # Actualizar estado en RAM (para respuesta rápida)
+        # F12.5 (plan v7): ESTE es el único punto que registra fees
+        # (_registrar_fee + state.fees_real + gs.fees_totales). B1/B19/B20.
         state.fees_real += Decimal(str(commission))
         self._registrar_fee(float(commission))  # FASE 4: fee diaria
+        if state.grid_state:
+            state.grid_state.fees_totales += Decimal(str(commission))
 
         # El realized_pnl solo se suma al estado si es un evento de cierre
         # (Las entradas tienen realized_pnl = 0, los cierres tienen el PnL real)
@@ -4351,9 +4384,8 @@ class GridExecutor:
         CR2 FIX: Reconcilia el PnL en RAM con la base de datos (fuente de verdad).
         Detecta discrepancias y corrige el estado interno.
         """
-        if not state.grid_state:
-            return
-
+        # F12.4 (plan v7) — B5: corre también para grids direccionales (antes se
+        # saltaba sin grid_state y su PnL RAM nunca se contrastaba con la DB).
         # Calcular PnL desde DB (fuente de verdad)
         pnl_db = await calcular_pnl_acumulado(state.grid_id)
 
@@ -4378,12 +4410,13 @@ class GridExecutor:
 
             print(f"  ✅ [PnL RECONCILIACIÓN] {state.symbol} Estado corregido desde DB")
 
-        # Actualizar GridState con PnL reconciliado
+        # Actualizar GridState con PnL reconciliado (solo NEUTRAL)
         # PR-A Fix #A2.1: realizedPnl de Binance es GROSS (excluye commission).
         # neto = gross - fees. Antes se sobrescribía neto con gross cada ciclo.
-        state.grid_state.pnl_bruto = pnl_db_val
-        state.grid_state.pnl_neto = pnl_db_val - fees_db_val
-        state.grid_state.fees_totales = fees_db_val
+        if state.grid_state:
+            state.grid_state.pnl_bruto = pnl_db_val
+            state.grid_state.pnl_neto = pnl_db_val - fees_db_val
+            state.grid_state.fees_totales = fees_db_val
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # FASE 3: TAKE-PROFIT PARA DIRECCIONALES (INTEGRACIÓN COMPLETA)
@@ -5466,8 +5499,9 @@ class GridExecutor:
             pnl_real = float(state.pnl_real)
             pnl_interno = resumen.get('pnl_neto', 0)
             
-            print(f"  [CIERRE] {cierre.symbol} Resumen: PnL Real={pnl_real:+.4f} | "
-                  f"Interno={pnl_interno:+.4f}")
+            # F12.4 (plan v7) — B5: fuente única de verdad explícita.
+            print(f"  [CIERRE] {cierre.symbol} Resumen: PnL Real (FUENTE DE VERDAD)={pnl_real:+.4f} | "
+                  f"Interno (DIAGNÓSTICO)={pnl_interno:+.4f}")
             
             # Notificar
             if self.notifier:

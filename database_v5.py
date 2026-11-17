@@ -2319,6 +2319,22 @@ async def guardar_pnl_evento(grid_ejecucion_id: int, symbol: str, tipo_evento: s
           realized_pnl, notional, timestamp_ms, timestamp_local))
 
 
+async def pnl_evento_existe(binance_trade_id) -> bool:
+    """F12.5 (plan v7) — B23: ¿este trade ya fue contabilizado en pnl_eventos?
+
+    _procesar_trade_con_pnl lo consulta antes de tocar RAM: INSERT IGNORE
+    dedupea en DB pero no avisa, y el funnel no debe registrar fee/pnl 2×
+    (la ruta de cierre LIMIT/ABORTO y el pipeline de fills pueden ver el
+    mismo trade).
+    """
+    async with _conexion() as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM pnl_eventos WHERE binance_trade_id = ? LIMIT 1",
+            (str(binance_trade_id),))
+        row = await cursor.fetchone()
+        return row is not None
+
+
 async def calcular_pnl_acumulado(grid_ejecucion_id: int) -> dict:
     """Calcula PnL acumulado desde la base de datos (fuente de verdad)."""
     async with _conexion() as db:
