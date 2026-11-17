@@ -1263,8 +1263,11 @@ class PatternLearner:
             return []
 
         def _es_exito(o):
+            # F12.2 (plan v7) — B2: éxito NETO de fees. pnl_real de Binance es
+            # GROSS (realizedPnl no incluye commission); antes solo se exigía >0.
             return (o.get('n_roundtrips', 0) >= 3
-                    and (o.get('pnl_real') or 0) > 0)
+                    and ((o.get('pnl_real') or 0)
+                         - (o.get('fees_real') or 0)) > 0)
 
         total_exitos = sum(1 for o in outcomes if _es_exito(o))
         p_base = total_exitos / len(outcomes)
@@ -2165,8 +2168,11 @@ class BreakoutOutcomeLabeler:
     """F6.4: etiqueta rupturas 15m (continuacion vs fakeout) -> breakout_labels."""
 
     def __init__(self, atr_significance_mult: float = 2.0,
-                 horas_atras: int = 24 * 7, madurez_ms: int = 150 * 60_000):
+                 horas_atras: int = 24 * 7, madurez_ms: int = 150 * 60_000,
+                 fee_pct: float = 0.05):
         self.mult = atr_significance_mult
+        # F12.2-bis (plan v7) — B3: fee ida/vuelta (%) para el umbral NETO.
+        self.fee_total_pct = 2.0 * float(fee_pct)
         self.horas_atras = horas_atras
         self.madurez_ms = madurez_ms
         self._last_run = 0.0
@@ -2174,7 +2180,10 @@ class BreakoutOutcomeLabeler:
     def etiquetar(self, snap, velas_15m, nivel_roto, direction):
         ts = int(snap.get('timestamp_15m') or 0)
         atr_pct = snap.get('atr_pct_15m') or 0.5
-        umbral_mfe = atr_pct * self.mult
+        # F12.2-bis (plan v7) — B3: continuación NETA de fees (mismo patrón que
+        # FireOutcomeLabeler, learning_engine.py:2042). El MFE bruto debe cubrir
+        # k·ATR + fees ida/vuelta para contar como continuación rentable.
+        umbral_mfe = atr_pct * self.mult + self.fee_total_pct
         margen_inval = atr_pct * 0.5
         inval = (nivel_roto + margen_inval if direction == 'SHORT'
                  else nivel_roto - margen_inval)
@@ -2328,7 +2337,8 @@ class LearningEngine:
         self.fire_importer = FireOutcomeImporter(self)
         self.breakout_labeler = BreakoutOutcomeLabeler(
             atr_significance_mult=getattr(
-                CONFIG, 'learning_atr_significance_mult', 1.5))
+                CONFIG, 'learning_atr_significance_mult', 1.5),
+            fee_pct=self.fee_pct)   # F12.2-bis — B3: umbral neto de fees
 
         self.learner_hora_local = learner_hora_local
         self.tz_offset = timezone_offset_horas

@@ -3405,7 +3405,53 @@ class GridExecutor:
 
         if not hasattr(state, 'posiciones_direccionales'):
             state.posiciones_direccionales = []
+
+        # F12.11 (plan v7) — B7 / I-S2-1 / I-S2-2: en direccional no existía
+        # NINGÚN registro en exit_outcomes. Se registra entrada/salida aquí
+        # (puntos de creación), no en el funnel, para no duplicar trayectorias
+        # en fills parciales.
+        tipo_orden = orden.get('tipo_orden', '')
+        if tipo_orden in ('TAKE_PROFIT', 'CIERRE'):
+            candidatas = [p for p in state.posiciones_direccionales
+                          if p.estado == 'ABIERTA' and p.tipo != pos.tipo]
+            candidatas.sort(key=lambda p: p.timestamp_apertura)
+            if candidatas:
+                vieja = candidatas[0]
+                resto = vieja.qty - Decimal(str(qty))
+                if resto <= Decimal('0.00000001'):
+                    vieja.qty = Decimal('0')
+                    vieja.estado = 'CERRADA'
+                    if self.learning_engine is not None:
+                        try:
+                            self.learning_engine.registrar_salida(
+                                posicion_id=vieja.id, precio_salida=price,
+                                razon=tipo_orden)
+                        except Exception as e_learn:
+                            print(f"  ⚠️ [LEARN] registrar_salida {vieja.id}: {e_learn}")
+                else:
+                    vieja.qty = resto
+                state.ordenes[fill['binance_order_id']] = {
+                    'side': side, 'price': price, 'qty': qty, 'filled': True,
+                    'realized_pnl': realized_pnl, 'timestamp': ts,
+                    'pos_id': vieja.id,
+                }
+                print(f"  [EXECUTOR] {state.symbol} Cierre {state.grid_mode}: {side} {qty} "
+                      f"@ ${price:.4f} | Cierra pos {vieja.id} "
+                      f"(resta {float(vieja.qty):.8f})")
+                return vieja.id
+
         state.posiciones_direccionales.append(pos)
+
+        # F12.11 — B7: entrada SOLO para fills de ENTRY (los cierres no son
+        # entradas). Mismo contrato que _on_fill_real (executor.py:1806).
+        if tipo_orden == 'ENTRY' and self.learning_engine is not None:
+            try:
+                self.learning_engine.registrar_entrada(
+                    posicion_id=pos.id, symbol=state.symbol,
+                    direccion=pos.tipo, precio=price, qty=qty,
+                    grid_id=getattr(state, 'grid_id', None), tipo='REAL')
+            except Exception as e_learn:
+                print(f"  ⚠️ [LEARN] registrar_entrada {pos.id}: {e_learn}")
 
         # Tracking en memoria para referencia rápida
         state.ordenes[fill['binance_order_id']] = {
