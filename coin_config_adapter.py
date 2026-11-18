@@ -21,8 +21,9 @@ _RANGOS = {
     'mfm_umbral': (0.05, 0.50),
     'grid_timeout': (5, 60),
     'volume_threshold': (0.1, 2.0),
-    # Learning Engine (Fase 5): umbral de refusal por moneda
-    'learning_refusal_threshold': (0.10, 0.80),
+    # Learning Engine (Fase 5): umbral de refusal por moneda.
+    # F12.15 (plan v7) - B10: minimo 0.50 (PASS ">=0.50 todas las monedas").
+    'learning_refusal_threshold': (0.50, 0.80),
 }
 
 
@@ -44,6 +45,38 @@ def _validar(valor, tipo_esperado, rango: Optional[tuple] = None, default=None):
         print(f"  [ADAPTER] Valor {v} fuera de rango {rango}, usando default {default}")
         return default
     return v
+
+
+# F12.15 (plan v7) - B10: minimo duro del umbral de refusal.
+THRESHOLD_REFUSAL_MIN = 0.50
+
+
+def validar_thresholds_registry(registry: Optional[dict] = None) -> list:
+    """F12.15: valida al arranque los overrides de learning_refusal_threshold.
+
+    Devuelve [(symbol, valor)] de overrides fuera de [0.50, 0.80] o no
+    numericos. get_coin_config ya cae al default; esto solo lo hace visible
+    al arrancar (no espera al primer lookup de cada moneda).
+    """
+    reg = CONFIG.coin_registry if registry is None else registry
+    invalidos = []
+    for symbol, raw in (reg or {}).items():
+        if not isinstance(raw, dict):
+            continue
+        valor = raw.get('learning_refusal_threshold')
+        if valor is None:
+            continue
+        try:
+            v = float(valor)
+        except (TypeError, ValueError):
+            v = None
+        lo, hi = _RANGOS['learning_refusal_threshold']
+        if v is None or not (lo <= v <= hi):
+            invalidos.append((symbol, valor))
+            print(f"  [ADAPTER] WARN {symbol} learning_refusal_threshold={valor!r} "
+                  f"fuera de [{lo}, {hi}] -> se usa "
+                  f"{CONFIG.learning_refusal_threshold}")
+    return invalidos
 
 
 def get_coin_config(symbol: str) -> dict:
@@ -122,3 +155,7 @@ def get_category_emoji(category: str) -> str:
         'clasica_privacidad': '🔒',
         'ai_defi_web3': '🤖',
     }.get(category, '❓')
+
+
+# F12.15: validacion de arranque (una sola vez, al importar el adapter).
+validar_thresholds_registry()

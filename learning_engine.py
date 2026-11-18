@@ -2203,6 +2203,21 @@ class BreakoutOutcomeLabeler:
         precio0 = float(snap.get('price') or 0)
         if precio0 <= 0:
             return None
+        # F12.3 (plan v7) - B4: retorno NETO a 2h (horizonte real del labeler:
+        # madurez 150 min + velas hasta ts+2h). Ultimo close <=2h, igual que
+        # fire_labels; se descuenta el fee ida/vuelta.
+        cierre_2h = None
+        for v in futuras:
+            try:
+                c = float(v.get('close'))
+            except (TypeError, ValueError):
+                continue
+            if c > 0:
+                cierre_2h = c
+        if cierre_2h is None:
+            return None
+        sgn = 1.0 if direction == 'LONG' else -1.0
+        ret_neto_2h = sgn * (cierre_2h - precio0) / precio0 * 100.0 - self.fee_total_pct
         mfe = mae = 0.0
         minuto_cont = None
         invalido = False
@@ -2245,9 +2260,11 @@ class BreakoutOutcomeLabeler:
             'fakeout': 1 if (not continuacion and invalido) else 0,
             'mfe_pct_2h': round(mfe, 4),
             'mae_pct_2h': round(mae, 4),
+            'ret_neto_2h_pct': round(ret_neto_2h, 4),
+            'rentable_neto_2h': 1 if ret_neto_2h > 0 else 0,
             'minutos_continuacion': minuto_cont,
             'nivel_invalidacion': inval,
-            'feature_schema_version': 'v1.1',
+            'feature_schema_version': 'v1.2',
         }
 
     async def run(self, ahora: float):

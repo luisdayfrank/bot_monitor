@@ -559,6 +559,10 @@ CREATE TABLE IF NOT EXISTS breakout_labels (
     continuacion BOOLEAN,
     fakeout BOOLEAN,
     mfe_pct_2h REAL, mae_pct_2h REAL,
+    -- F12.3 (plan v7) - B4: retorno NETO de fees a 2h (ventana real del labeler).
+    -- Sin columna 4h: la madurez es 2.5h y run() solo carga velas hasta ts+2h.
+    ret_neto_2h_pct REAL,
+    rentable_neto_2h INTEGER,
     minutos_continuacion INTEGER,
     nivel_invalidacion REAL,
     feature_schema_version TEXT DEFAULT 'v1.1',

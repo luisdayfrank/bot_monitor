@@ -1591,9 +1591,19 @@ class SignalGenerator:
                           f"patrón top: {_top.get('feature', '—')} {_top.get('bucket', '')} "
                           f"→ {_top.get('label_objetivo', '—')} "
                           f"(lift {_top.get('lift', '—')}, n={_top.get('n', '—')})")
+                    # F12.15 (plan v7) - B10: el preview SHADOW debe usar el
+                    # MISMO umbral que ACTIVE (adapter/config), no 0.35 fijo.
+                    try:
+                        from coin_config_adapter import get_coin_config as _gcc_sh
+                        _umbral_sh = _gcc_sh(symbol).get(
+                            'learning_refusal_threshold',
+                            CONFIG.learning_refusal_threshold)
+                    except Exception:
+                        _umbral_sh = CONFIG.learning_refusal_threshold
                     self.learning_engine.log_prediccion(
                         symbol=symbol, timestamp_15m=i15.get('timestamp', 0),
-                        prob=_prob, decision_sugerida='RECHAZAR' if _prob < 0.35 else 'FIRE',
+                        prob=_prob,
+                        decision_sugerida='RECHAZAR' if _prob < _umbral_sh else 'FIRE',
                         decision_tomada='IGNORADA',
                         modo=getattr(CONFIG, 'learning_apply_mode', 'SHADOW'),
                         direction=direction, score_macro=score_ajustado, regime=_feats['regime'])

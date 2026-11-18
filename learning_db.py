@@ -96,6 +96,25 @@ async def init_learning_db(db_path: str = "crypto_learning.db"):
         except Exception:
             pass
     await _run(_add_features_v11_cols)
+    # F12.3 (plan v7) - B4: retorno neto en breakout_labels (idempotente).
+    # Sin ret_neto_4h_pct: el labeler madura a 2.5h y solo ve 2h.
+    def _add_breakout_net_cols():
+        for col in ('ret_neto_2h_pct REAL', 'rentable_neto_2h INTEGER'):
+            try:
+                _conn.execute(f"ALTER TABLE breakout_labels ADD COLUMN {col}")
+            except Exception:
+                pass  # columna ya existe
+        try:
+            _conn.commit()
+        except Exception:
+            pass
+    await _run(_add_breakout_net_cols)
+    try:
+        await registrar_schema_version(
+            'LABELER', 'v1.2',
+            'F12.3: ret_neto_2h_pct/rentable_neto_2h en breakout_labels (2h, sin 4h)')
+    except Exception as e:
+        print(f"  [LEARN-DB] F12.3 registro LABELER v1.2: {e}")
     # F1.3 (I44): version activa del componente FEATURES
     try:
         await registrar_schema_version(
@@ -717,7 +736,8 @@ _BREAKOUT_LABEL_COLS = [
     'donchian_high_20', 'donchian_low_20', 'er_15m', 'bb_width_pct_pct',
     'pct_b', 'atr_ratio_1m_15m', 'roc_4v_pct', 'volume_ratio_1m',
     'volume_ratio_15m', 'mfm_sma5', 'vwap_24h', 'continuacion', 'fakeout',
-    'mfe_pct_2h', 'mae_pct_2h', 'minutos_continuacion', 'nivel_invalidacion',
+    'mfe_pct_2h', 'mae_pct_2h', 'ret_neto_2h_pct', 'rentable_neto_2h',
+    'minutos_continuacion', 'nivel_invalidacion',
     'feature_schema_version',
 ]
 
@@ -741,12 +761,17 @@ async def guardar_breakout_labels_batch(rows: list):
 
 
 async def cargar_breakout_labels(horas: int = 24 * 90):
-    """F7.4: breakout_labels recientes para minar_breakouts."""
+    """F7.4: breakout_labels recientes para minar_breakouts.
+
+    F12.3 (plan v7) - B4: solo filas con retorno NETO (v1.2+). Las legacy
+    (ret_neto_2h_pct NULL) se excluyen del minado.
+    """
     def _op():
         conn = _get_conn()
         ts_corte = int(time.time() * 1000) - horas * 3600_000
         rows = conn.execute(
             "SELECT * FROM breakout_labels WHERE timestamp_15m >= ? "
+            "AND ret_neto_2h_pct IS NOT NULL "
             "ORDER BY timestamp_15m DESC", (ts_corte,)).fetchall()
         return [dict(r) for r in rows]
 

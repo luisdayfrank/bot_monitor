@@ -1,0 +1,7 @@
+Prioridad	Acción	Fase
+P0	Añadir al diff de Semana 4 el fix de signals_v5.py:1596 para usar el mismo umbral del adapter/config en SHADOW	F12.15 / Semana 4
+P0.5	Decidir el caso neutral 0.5 vs 0.52 antes de F14.11 ACTIVE. Recomiendo: si no hay patrón coincidente ? ABSTAIN (no rechazar), o documentar el rechazo conservador y medirlo	F14.9/F14.11 (blocker)
+P1	Arreglar el monitor NMI stale (1 línea)	F13a o F14.1
+P2	Decidir qué hacer con el near-miss ? bypass inerte: (A) usarlo solo para diagnóstico/calibración y retirar la expectativa de bypass automático; (B) reactivar minar_bypasses con pooling jerárquico/umbral Wilson ~0.45 y medir 2-4 semanas en SHADOW; (C) retirar minar_bypasses/compute_confidence_v2 como código muerto. Recomiendo A, con B solo como experimento data-gated	F13a/F14
+P3	Medir FN real de M1 desde predictions_log tras 2-4 semanas de ACTIVE. Solo si el volumen o el retorno 4h no alcanzan, añadir rechazos M1 a near_miss_labels (2h, muestreado/capado) y excluir LEARNING_REFUSAL de minar_bypasses	F14.11+
+P4	Documentar precedencia: filtros estáticos ? bypass (solo estáticos) ? entry_rules BLOCK ? M1 refusal final. Nunca bypass de M1/M2	F14 (documentación + guardrail)

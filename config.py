@@ -93,7 +93,9 @@ class Config(BaseModel):
     learning_decay_half_life_dias: int = 125    # peso = 0.5 ** (edad/half_life) Â§3G
     learning_min_snapshots_perfil: int = 300
     learning_min_labels_para_ml: int = 5000
-    learning_refusal_threshold: float = 0.35    # override por moneda vÃ­a registry
+    # F12.15 (plan v7) - B10: 0.52 es PLACEHOLDER hasta la calibracion por
+    # regimen de F14.9 (semanas 1-9); el valor final lo fija F14.9.
+    learning_refusal_threshold: float = 0.52    # override por moneda vÃ­a registry
 
     # Rigor estadÃ­stico de la minerÃ­a (correcciÃ³n Â§3A)
     learning_min_lift: float = 1.5
