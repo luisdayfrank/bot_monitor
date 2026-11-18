@@ -86,7 +86,7 @@ CREATE TABLE IF NOT EXISTS feature_snapshots (
     symbol TEXT NOT NULL,
     timestamp_15m INTEGER NOT NULL,
     price REAL NOT NULL,
-    regime TEXT,                          -- RANGE|TREND_UP|TREND_DOWN|VOLATILE|UNKNOWN
+    regime TEXT,                          -- RANGE|TREND_UP|TREND_DOWN|VOLATILE|TRAP|UNKNOWN
     regime_confirmado TEXT,               -- tras histéresis (>=N velas iguales)
 
     -- Features 15m crudas
@@ -119,6 +119,12 @@ CREATE TABLE IF NOT EXISTS feature_snapshots (
     atr_ratio_1m_15m REAL,
     roc_4v_pct REAL,
     vwap_24h REAL,
+
+    -- Features v1.2 (F13a): microestructura
+    funding_rate_8h REAL,
+    funding_rate_1h_interp REAL,
+    oi_delta_5m_pct REAL,
+    oi_delta_1h_pct REAL,
 
     -- Contexto micro 1m
     rsi_7_1m REAL,

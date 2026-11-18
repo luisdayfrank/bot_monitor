@@ -122,6 +122,28 @@ async def init_learning_db(db_path: str = "crypto_learning.db"):
             'F1: BB/%b/ER/Donchian/ATR-ratio/ROC/VWAP + backfill')
     except Exception as e:
         print(f"  [LEARN-DB] F1.2 registro FEATURES v1.1: {e}")
+    # F13a (plan v7) - F13a.1/2: features de microestructura (idempotente)
+    def _add_features_v12_cols():
+        cols = [
+            'funding_rate_8h REAL', 'funding_rate_1h_interp REAL',
+            'oi_delta_5m_pct REAL', 'oi_delta_1h_pct REAL',
+        ]
+        for col in cols:
+            try:
+                _conn.execute(f"ALTER TABLE feature_snapshots ADD COLUMN {col}")
+            except Exception:
+                pass  # columna ya existe
+        try:
+            _conn.commit()
+        except Exception:
+            pass
+    await _run(_add_features_v12_cols)
+    try:
+        await registrar_schema_version(
+            'FEATURES', 'v1.2',
+            'F13a: funding_rate_8h/1h_interp + oi_delta_5m/1h')
+    except Exception as e:
+        print(f"  [LEARN-DB] F13a registro FEATURES v1.2: {e}")
     # 3.2 (convención schema_versions §2.1): registrar el cambio de esquema
     def _register_direction_version():
         try:
@@ -408,6 +430,9 @@ _SNAPSHOT_COLS = [
     'bb_width_pct', 'bb_width_pct_pct', 'pct_b', 'er_15m',
     'donchian_high_20', 'donchian_low_20', 'atr_ratio_1m_15m',
     'roc_4v_pct', 'vwap_24h',
+    # F13a v1.2
+    'funding_rate_8h', 'funding_rate_1h_interp',
+    'oi_delta_5m_pct', 'oi_delta_1h_pct',
     'rsi_7_1m', 'wick_upper_pct_1m', 'wick_lower_pct_1m',
     'body_direction_1m', 'mecha_short_1m', 'mecha_long_1m',
     'ema200_4h', 'close_4h', 'hora_sin', 'hora_cos', 'dia_semana',
@@ -588,6 +613,28 @@ async def guardar_regime_transitions_batch(rows: list):
         conn.commit()
         return len(filas)
 
+    return await _run(_op)
+
+
+async def calcular_regime_changes_per_month(horas: int = 24 * 90):
+    """F13a.5: cambios de regimen/mes y ventana walk-forward recomendada."""
+    def _op():
+        conn = _get_conn()
+        ts_corte = int(time.time() * 1000) - horas * 3600_000
+        row = conn.execute(
+            "SELECT COUNT(*), MIN(timestamp_15m), MAX(timestamp_15m) "
+            "FROM regime_transitions WHERE timestamp_15m >= ? "
+            "AND from_regime != to_regime", (ts_corte,)).fetchone()
+        n = int(row[0] or 0)
+        if n <= 0:
+            return {'changes': 0, 'months': 0.0, 'per_month': 0.0,
+                    'walk_forward': '30/10'}
+        span_ms = max(0, int(row[2] or 0) - int(row[1] or 0))
+        meses = max(1.0, span_ms / (30 * 86400_000))
+        por_mes = n / meses
+        return {'changes': n, 'months': round(meses, 2),
+                'per_month': round(por_mes, 2),
+                'walk_forward': '15/5' if por_mes > 3 else '30/10'}
     return await _run(_op)
 
 

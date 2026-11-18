@@ -41,6 +41,55 @@ def extraer_precio_combinado(data: dict) -> tuple[Optional[float], Optional[str]
     return None, None
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# F13a.1/F13a.2 (plan v7) — microestructura: funding y open interest
+# ═══════════════════════════════════════════════════════════════════════════════
+def calcular_funding_features(last_funding_rate, next_funding_time_ms, ahora_ms):
+    """Devuelve (funding_rate_8h, funding_rate_1h_interp) en % (decimal->%).
+
+    F13a.1: `funding_rate_1h_interp` = devengo desde el ultimo settlement:
+        rate_8h * horas_desde_ultimo / 8   (acotado a [0, 8] horas)
+    Binance entrega `lastFundingRate` en decimal; se convierte a %.
+    """
+    if last_funding_rate is None:
+        return None, None
+    try:
+        rate = float(last_funding_rate) * 100.0
+        ahora_ms = int(ahora_ms)
+    except (TypeError, ValueError):
+        return None, None
+    try:
+        next_ms = int(next_funding_time_ms)
+    except (TypeError, ValueError):
+        return round(rate, 6), None
+    if next_ms <= 0:
+        # Sin nextFundingTime no se puede devengar; el rate 8h sigue siendo valido
+        return round(rate, 6), None
+    horas_hasta = (next_ms - ahora_ms) / 3600_000.0
+    horas_hasta = max(0.0, min(8.0, horas_hasta))
+    horas_desde = 8.0 - horas_hasta
+    return round(rate, 6), round(rate * (horas_desde / 8.0), 6)
+
+
+def calcular_oi_delta_pct(hist, ahora_ms, ventana_ms, tolerancia_ms=5 * 60_000):
+    """F13a.2: % de cambio de OI contra la muestra <= (ahora - ventana).
+
+    `hist` es un deque de (timestamp_ms, open_interest) ordenado. Si no hay
+    muestra suficientemente antigua (o el hueco supera la tolerancia), None.
+    """
+    if len(hist) < 2:
+        return None
+    objetivo = int(ahora_ms) - int(ventana_ms)
+    candidatos = [x for x in hist if x[0] <= objetivo]
+    if not candidatos:
+        return None
+    ts_prev, oi_prev = candidatos[-1]
+    ts_actual, oi_actual = hist[-1]
+    if ts_actual <= ts_prev or objetivo - ts_prev > tolerancia_ms or oi_prev <= 0:
+        return None
+    return round((oi_actual - oi_prev) / oi_prev * 100.0, 4)
+
+
 class DataCollector:
     def __init__(self, queue_velas: asyncio.Queue, precios_vivo: Dict[str, float]):
         self.queue = queue_velas
@@ -83,6 +132,17 @@ class DataCollector:
         self._precio_flush_task: Optional[asyncio.Task] = None
         self._precio_buffer_max_size = 100
         self._precio_flush_interval = 5.0  # segundos
+
+        # F13a.1/F13a.2: microestructura (funding 5 min / OI 1 min)
+        self.micro_features: Dict[str, dict] = {
+            s: {'funding_rate_8h': None, 'funding_rate_1h_interp': None,
+                'oi_delta_5m_pct': None, 'oi_delta_1h_pct': None}
+            for s in CONFIG.symbols
+        }
+        self._oi_hist: Dict[str, deque] = {
+            s: deque(maxlen=70) for s in CONFIG.symbols
+        }
+        self._micro_tasks: list = []
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # F1.1: Helpers del buffer batch de precios
@@ -262,6 +322,67 @@ class DataCollector:
         self._sync_buffers_to_engine()
         print("🧊 Cold Start completado.")
 
+    # ── F13a.1/F13a.2: polling de microestructura ─────────────────────────
+    async def _poll_funding_rate(self):
+        """F13a.1: funding rate cada 5 min (todas las monedas)."""
+        ahora_ms = int(time.time() * 1000)
+        for symbol in CONFIG.symbols:
+            try:
+                info = await asyncio.to_thread(
+                    self.client.futures_mark_price, symbol=symbol)
+                rate, interp = calcular_funding_features(
+                    info.get('lastFundingRate'),
+                    info.get('nextFundingTime'), ahora_ms)
+                if rate is None:
+                    continue
+                self.micro_features[symbol]['funding_rate_8h'] = rate
+                self.micro_features[symbol]['funding_rate_1h_interp'] = interp
+            except Exception as e:
+                print(f"  ⚠️ [F13a] funding {symbol}: {e}")
+
+    async def _poll_open_interest(self):
+        """F13a.2: open interest cada 1 min (todas las monedas)."""
+        ahora_ms = int(time.time() * 1000)
+        for symbol in CONFIG.symbols:
+            try:
+                info = await asyncio.to_thread(
+                    self.client.futures_open_interest, symbol=symbol)
+                oi = float(info.get('openInterest') or 0)
+                if oi <= 0:
+                    continue
+                hist = self._oi_hist[symbol]
+                hist.append((ahora_ms, oi))
+                self.micro_features[symbol]['oi_delta_5m_pct'] = (
+                    calcular_oi_delta_pct(hist, ahora_ms, 5 * 60_000))
+                self.micro_features[symbol]['oi_delta_1h_pct'] = (
+                    calcular_oi_delta_pct(hist, ahora_ms, 60 * 60_000))
+            except Exception as e:
+                print(f"  ⚠️ [F13a] OI {symbol}: {e}")
+
+    async def _loop_funding(self):
+        while not self._shutdown.is_set():
+            t0 = time.perf_counter()
+            await self._poll_funding_rate()
+            dur_ms = (time.perf_counter() - t0) * 1000.0
+            if dur_ms > 1000:
+                print(f"  ⚠️ [F13a] funding poll lento: {dur_ms:.0f}ms")
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=300)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _loop_open_interest(self):
+        while not self._shutdown.is_set():
+            t0 = time.perf_counter()
+            await self._poll_open_interest()
+            dur_ms = (time.perf_counter() - t0) * 1000.0
+            if dur_ms > 1000:
+                print(f"  ⚠️ [F13a] OI poll lento: {dur_ms:.0f}ms")
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=60)
+            except asyncio.TimeoutError:
+                pass
+
     def build_ws_url(self) -> str:
         streams = []
         for s in CONFIG.symbols:
@@ -278,6 +399,12 @@ class DataCollector:
 
         # F1.1: Iniciar loop de flush de precios en background
         self._precio_flush_task = asyncio.create_task(self._flush_precios_loop())
+
+        # F13a: polling de microestructura (no bloquea el WS)
+        self._micro_tasks = [
+            asyncio.create_task(self._loop_funding()),
+            asyncio.create_task(self._loop_open_interest()),
+        ]
 
         while not self._shutdown.is_set():
             print(f"📡 Conectando a: {url[:90]}...")
@@ -424,3 +551,7 @@ class DataCollector:
         # F1.1: Cancelar flush loop de forma segura
         if self._precio_flush_task and not self._precio_flush_task.done():
             self._precio_flush_task.cancel()
+        # F13a: cancelar polling de microestructura
+        for t in getattr(self, '_micro_tasks', []):
+            if t and not t.done():
+                t.cancel()

@@ -78,6 +78,9 @@ class Config(BaseModel):
     # F10/B3: umbrales configurables (defaults = literales previos)
     learning_panic_atr_ratio_threshold: float = 1.5
     learning_panic_roc_threshold: float = -3.0
+    # F13a.4 (plan v7) - regimen TRAP (crowding)
+    learning_trap_funding_abs_pct: float = 0.05   # |funding_rate_8h| > 0.05%
+    learning_trap_oi_delta_1h_pct: float = 15.0   # oi_delta_1h_pct > 15%
     learning_squeeze_bb_pct_threshold: float = 30.0
     learning_breakout_min_er: float = 0.40
     learning_exit_mode: str = "OFF"             # OFF | SHADOW | ACTIVE (Fase 8) - OFF = no ajusta salidas

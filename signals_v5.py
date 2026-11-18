@@ -122,6 +122,8 @@ class SignalGenerator:
         self.audit_logger = None
         # LEARNING ENGINE (Fase 1): inyectado desde main.py si CONFIG.learning_enabled
         self.learning_engine = None
+        # F13a (plan v7): funding/OI compartidos por main.py (por referencia)
+        self.micro_features: dict = {}
         # V7.1 FASE 4: Debounce de CREAR_GRID para evitar spam al executor
         self._grid_pending_creation: Dict[str, float] = {}
         # FASE 4: Grid neutral ahora es manejado 100% por el executor
@@ -834,13 +836,8 @@ class SignalGenerator:
         _regime_4h = self._determinar_regimen_4h(symbol)
         # F3.1 (I61): regimen 5-estado para el bypass HARDCODEADO por regimen.
         # El alias _regime_4h se conserva solo para el bypass aprendido.
-        _regimen_actual = 'RANGE'
-        if self.learning_engine is not None:
-            try:
-                _regimen_actual = self.learning_engine.regime_cls.regimen_actual.get(
-                    symbol, 'RANGE')
-            except Exception:
-                _regimen_actual = 'RANGE'
+        # F13a.4: TRAP se trata como RANGE en logica 5-estado
+        _regimen_actual = self._regimen_para_senales(symbol, 'RANGE')
         _i15_ctx = self.indicadores_15m.get(symbol, {})
         _ema200_15m = _i15_ctx.get('ema200_15m')
         _ema200_dist_pct = ((price - _ema200_15m) / _ema200_15m) * 100.0 if _ema200_15m and price else 0.0
@@ -1318,6 +1315,20 @@ class SignalGenerator:
 
         return 'NEUTRAL', 'NINGUNA'
 
+    def _regimen_para_senales(self, symbol: str, default: str = 'RANGE') -> str:
+        """F13a.4: TRAP es diagnostico; en 5-estado se trata como RANGE.
+
+        Para alias (bypass/near_miss) `to_alias` ya mapea TRAP->NEUTRAL.
+        """
+        if self.learning_engine is None:
+            return default
+        try:
+            reg = self.learning_engine.regime_cls.regimen_actual.get(
+                symbol, default)
+        except Exception:
+            return default
+        return 'RANGE' if reg == 'TRAP' else reg
+
     def _determinar_regimen_4h(self, symbol: str) -> str:
         """F2.2 (I49): wrapper -> alias del RegimeClassifier unificado.
 
@@ -1579,7 +1590,7 @@ class SignalGenerator:
             try:
                 _perfil = await self.learning_engine.get_perfil(symbol)
                 if _perfil:
-                    _feats = {'regime': self.learning_engine.regime_cls.regimen_actual.get(symbol, 'RANGE'),
+                    _feats = {'regime': self._regimen_para_senales(symbol, 'RANGE'),
                               'rsi_15m': i15.get('rsi'), 'adx_15m': i15.get('adx'),
                               'mfm_15m': i15.get('mfm_15m'), 'mfm_sma5': i15.get('mfm_sma5'),
                               'macd_hist': i15.get('macd_hist')}
@@ -1927,13 +1938,8 @@ class SignalGenerator:
         if state.ultimo_disparo_precio > 0 and not state.ultimo_disparo_evaluado:
             price_actual = self.indicadores_1m.get(symbol, {}).get('close', 0)
             # F3.2 (I61): regimen 5-estado para el CB
-            _regimen_cb = 'RANGE'
-            if self.learning_engine is not None:
-                try:
-                    _regimen_cb = self.learning_engine.regime_cls.regimen_actual.get(
-                        symbol, 'RANGE')
-                except Exception:
-                    _regimen_cb = 'RANGE'
+            # F13a.4: TRAP se trata como RANGE en logica 5-estado
+            _regimen_cb = self._regimen_para_senales(symbol, 'RANGE')
             _atr15 = i15.get('atr') or 0          # I65: guard > 0 antes de multiplicar
 
             _inval = None
@@ -2202,13 +2208,8 @@ class SignalGenerator:
             return
         if state.grid_pausa_hasta > time.time():
             return
-        _reg = 'RANGE'
-        if self.learning_engine is not None:
-            try:
-                _reg = self.learning_engine.regime_cls.regimen_actual.get(
-                    symbol, 'RANGE')
-            except Exception:
-                _reg = 'RANGE'
+        # F13a.4: TRAP se trata como RANGE en logica 5-estado
+        _reg = self._regimen_para_senales(symbol, 'RANGE')
         if _reg in ('TREND_UP', 'TREND_DOWN', 'PANIC'):
             await self.evaluar_gatillo_breakout(symbol)
         else:
@@ -2229,13 +2230,8 @@ class SignalGenerator:
         if state.moneda_pausada or state.moneda_pausada_manual:
             return
 
-        _reg = 'RANGE'
-        if self.learning_engine is not None:
-            try:
-                _reg = self.learning_engine.regime_cls.regimen_actual.get(
-                    symbol, 'RANGE')
-            except Exception:
-                _reg = 'RANGE'
+        # F13a.4: TRAP se trata como RANGE en logica 5-estado
+        _reg = self._regimen_para_senales(symbol, 'RANGE')
         if _reg not in ('TREND_UP', 'TREND_DOWN', 'PANIC'):
             return
 
@@ -2548,8 +2544,7 @@ class SignalGenerator:
         if (self.learning_engine is not None and
                 _entry_mode in ('SHADOW', 'ACTIVE')):
             try:
-                _reg_entry = (self.learning_engine.regime_cls
-                              .regimen_actual.get(symbol, 'RANGE'))  # I96
+                _reg_entry = self._regimen_para_senales(symbol, 'RANGE')  # F13a.4
                 _score_macro = self._calcular_score_macro(i15)
                 _block, _motivo, _delta = (
                     self.learning_engine.entry_engine.evaluar(
@@ -2587,8 +2582,7 @@ class SignalGenerator:
         # un rechazo aquí deja la máquina de estados intacta y registra
         # RECHAZADO (no FIRE+RECHAZADO contradictorios).
         _prob = None
-        _feats = {'regime': (self.learning_engine.regime_cls.regimen_actual.get(symbol, 'RANGE')
-                             if self.learning_engine is not None else 'RANGE')}
+        _feats = {'regime': self._regimen_para_senales(symbol, 'RANGE')}
         if (self.learning_engine is not None and
                 getattr(CONFIG, 'learning_apply_mode', 'OFF') == 'ACTIVE'):
             try:
@@ -2596,7 +2590,7 @@ class SignalGenerator:
                 _umbral = _gcc(symbol).get('learning_refusal_threshold',
                                           CONFIG.learning_refusal_threshold)
                 _perfil = await self.learning_engine.get_perfil(symbol)
-                _feats = {'regime': self.learning_engine.regime_cls.regimen_actual.get(symbol, 'RANGE'),
+                _feats = {'regime': self._regimen_para_senales(symbol, 'RANGE'),
                           'rsi_15m': i15.get('rsi'), 'adx_15m': i15.get('adx'),
                           'mfm_15m': i15.get('mfm_15m'), 'mfm_sma5': i15.get('mfm_sma5'),
                           'macd_hist': i15.get('macd_hist')}

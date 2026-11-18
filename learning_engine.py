@@ -212,10 +212,11 @@ def _bh_fdr(pares: list, q: float = 0.10) -> list:
 # ═══════════════════════════════════════════════════════════════════════════
 class RegimeClassifier:
     """
-    Clasificador UNICO de regimen (5 estados) — Plan Blindado F2.
+    Clasificador UNICO de regimen (6 estados) — Plan Blindado F2 + F13a.4.
 
-    Estados:
+    Estados (prioridad: PANIC > TRAP > TREND > VOLATILE > RANGE):
       PANIC      := atr_ratio_1m_15m > 1.5 OR roc_4v_pct < -3.0 (prioridad)
+      TRAP       := |funding_rate_8h| > 0.05% AND oi_delta_1h_pct > 15%
       TREND_UP   := ema7>ema25 AND close>ema50 AND ADX>=25 AND ER(10)>=0.40
       TREND_DOWN := ema7<ema25 AND close<ema50 AND ADX>=25 AND ER(10)>=0.40
       VOLATILE   := atr_pct >= p80(atr_hist)
@@ -267,7 +268,19 @@ class RegimeClassifier:
         if _atr_ratio_norm > _panic_atr or roc_4v < _panic_roc:
             return 'PANIC'
 
-        # 2. TREND (ADX + ER; ER es el discriminador clave)
+        # 2. TRAP (F13a.4): crowding — funding alto + OI sube >15%/1h
+        _funding = f.get('funding_rate_8h')
+        _oi_1h = f.get('oi_delta_1h_pct')
+        if _funding is not None and _oi_1h is not None:
+            _trap_funding = getattr(
+                CONFIG, 'learning_trap_funding_abs_pct', 0.05)
+            _trap_oi = getattr(
+                CONFIG, 'learning_trap_oi_delta_1h_pct', 15.0)
+            if (abs(float(_funding)) > _trap_funding
+                    and float(_oi_1h) > _trap_oi):
+                return 'TRAP'
+
+        # 3. TREND (ADX + ER; ER es el discriminador clave)
         _er_min = getattr(CONFIG, 'learning_breakout_min_er', 0.40)
         trend_up = (ema7 is not None and ema7 > 0 and rel50 > 0
                     and adx >= 25 and er >= _er_min)
@@ -278,12 +291,12 @@ class RegimeClassifier:
         if trend_dn:
             return 'TREND_DOWN'
 
-        # 3. VOLATILE
+        # 4. VOLATILE
         p80 = self._p80(f.get('symbol'), atr_pct)
         if p80 and atr_pct >= p80:
             return 'VOLATILE'
 
-        # 4. RANGE
+        # 5. RANGE
         return 'RANGE'
 
     def actualizar(self, symbol: str, f: dict) -> dict:
@@ -347,7 +360,7 @@ class RegimeClassifier:
         """Compat con bypass_rules/near_miss_labels (BULLISH/BEARISH/NEUTRAL)."""
         return {'TREND_UP': 'BULLISH', 'TREND_DOWN': 'BEARISH',
                 'RANGE': 'NEUTRAL', 'VOLATILE': 'NEUTRAL',
-                'PANIC': 'PANIC'}.get(regimen, 'NEUTRAL')
+                'TRAP': 'NEUTRAL', 'PANIC': 'PANIC'}.get(regimen, 'NEUTRAL')
 
     @staticmethod
     def _percentil(vals: list, q: float):
@@ -445,6 +458,7 @@ class SnapshotCollector:
         i1m = sg.indicadores_1m.get(symbol, {}) or {}
         i4h = sg.indicadores_4h.get(symbol, {}) or {}
         state = sg.states.get(symbol)
+        micro = (getattr(sg, 'micro_features', {}) or {}).get(symbol, {}) or {}
 
         price = float(i15.get('close') or 0)
         if price <= 0:
@@ -533,6 +547,9 @@ class SnapshotCollector:
             'er_15m': er_15m,
             'atr_ratio_1m_15m': atr_ratio,
             'roc_4v_pct': roc_4v,
+            'funding_rate_8h': micro.get('funding_rate_8h'),
+            'oi_delta_5m_pct': micro.get('oi_delta_5m_pct'),
+            'oi_delta_1h_pct': micro.get('oi_delta_1h_pct'),
         }
         reg = self.regime_cls.actualizar(symbol, pre_features)
 
@@ -574,6 +591,12 @@ class SnapshotCollector:
             'roc_4v_pct': roc_4v,
             'vwap_24h': vwap_24h,
 
+            # F13a v1.2 — microestructura funding/OI
+            'funding_rate_8h': micro.get('funding_rate_8h'),
+            'funding_rate_1h_interp': micro.get('funding_rate_1h_interp'),
+            'oi_delta_5m_pct': micro.get('oi_delta_5m_pct'),
+            'oi_delta_1h_pct': micro.get('oi_delta_1h_pct'),
+
             'rsi_7_1m': i1m.get('rsi_7'),
             'wick_upper_pct_1m': i1m.get('wick_upper_pct'),
             'wick_lower_pct_1m': i1m.get('wick_lower_pct'),
@@ -593,7 +616,7 @@ class SnapshotCollector:
             'estado_maquina': getattr(state, 'estado', None),
             'evento_asociado': None,
             'evento_id': None,
-            'feature_schema_version': 'v1.1',   # F1 (ANEXO A §2.2)
+            'feature_schema_version': 'v1.2',   # F13a: funding/OI (ANEXO A §2.2)
         }
 
         # Transición de régimen confirmada → fila para regime_transitions
@@ -2780,6 +2803,13 @@ class LearningEngine:
         if self._es_hora_learner() and (ahora - self._last_learner_run > 20 * 3600):
             self._last_learner_run = ahora
             await self.entrenar_todo()
+            try:
+                rf = await ldb.calcular_regime_changes_per_month()
+                print(f"  🧠 [F13a.5] cambios/mes={rf['per_month']} "
+                      f"(n={rf['changes']}, meses={rf['months']}) "
+                      f"-> walk_forward={rf['walk_forward']}")
+            except Exception as e:
+                print(f"  ⚠️ [F13a.5] {e}")
 
     def _es_hora_learner(self) -> bool:
         hora = (datetime.now(timezone.utc).hour + int(self.tz_offset)) % 24

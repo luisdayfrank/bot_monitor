@@ -41,6 +41,8 @@ async def lifespan(fastapi_app):
     collector = DataCollector(queue_velas, precios_vivo)
     engine = IndicatorEngine(queue_velas, queue_indicadores)
     signals = SignalGenerator(queue_indicadores, queue_eventos)
+    # F13a (plan v7): microestructura funding/OI compartida con el learning
+    signals.micro_features = collector.micro_features
     notifier = Notifier()
 
     # V4.2: Guardar referencia para comandos Telegram
