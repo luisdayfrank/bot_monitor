@@ -1697,6 +1697,15 @@ class ExitOutcomeLabeler:
             self._pending_exits.append(fila)
         return fila
 
+    def descartar_trayectoria(self, posicion_id: str) -> bool:
+        """F12.8 — B22: descarta una trayectoria SIN persistir un exit label.
+
+        Se usa cuando el cierre ocurrió a un precio desconocido (precio 0):
+        registrar_salida fabricaría un pnl del -100% y contaminaría F14/F15.
+        """
+        with self._lock:
+            return self._trayectorias.pop(posicion_id, None) is not None
+
     def drenar_exits(self) -> list:
         with self._lock:
             filas, self._pending_exits = self._pending_exits, []
@@ -2395,6 +2404,10 @@ class LearningEngine:
                          razon: str = 'DESCONOCIDA', **kw):
         return self.exit_labeler.registrar_salida(posicion_id, precio_salida,
                                                   razon=razon, **kw)
+
+    def descartar_trayectoria(self, posicion_id: str):
+        """F12.8 — B22: descarta trayectoria de un cierre sin precio válido."""
+        return self.exit_labeler.descartar_trayectoria(posicion_id)
 
     def compute_exit_policy(self, symbol: str, posicion_id: str,
                             precio_actual: float, features: dict = None) -> dict:

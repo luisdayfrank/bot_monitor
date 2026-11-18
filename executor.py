@@ -54,6 +54,43 @@ from grid_engine import GridEngine, LevelMap, LevelState, CoverageAction, GapMan
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# F12 SEMANA 3 (plan v7) — helpers de bajo nivel
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _precio_orden_binance(order_info: dict) -> float:
+    """F12.8-bis (B13): precio real de una orden sincronizada desde Binance.
+
+    Las órdenes MARKET (y algunas LIMIT ya ejecutadas) llegan con price=0;
+    el precio ejecutado real está en avgPrice. Sin este fallback la adopción
+    escribía price=0 en grid_ejecucion_ordenes.
+    """
+    for clave in ('avgPrice', 'price'):
+        try:
+            px = float(order_info.get(clave) or 0)
+        except (TypeError, ValueError):
+            px = 0.0
+        if px > 0:
+            return px
+    return 0.0
+
+
+def _tipo_orden_desde_cid(client_order_id: str) -> str:
+    """F12.6 (B14): deriva tipo_orden del clientOrderId propio (prefijo CM).
+
+    Formatos vivos:
+      CM{id}_BUY_/SELL_..., CM{id}_REPL_..., CM{id}_{n:06d}  -> ENTRY
+      CM{id}_TP_...                                          -> TAKE_PROFIT
+      CM{id}_KS_..., CM{id}_CLOSE_..., CM{id}_PC_...         -> CIERRE
+    """
+    cid = str(client_order_id or '')
+    if '_TP_' in cid:
+        return 'TAKE_PROFIT'
+    if '_KS_' in cid or '_CLOSE_' in cid or '_PC_' in cid:
+        return 'CIERRE'
+    return 'ENTRY'
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # FASE 1 PLAN 6.3: POSICION REAL Y GRID STATE (Lógica heredada del helper)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -83,6 +120,7 @@ class PosicionReal:
         self.original_qty = Decimal(str(original_qty)) if original_qty is not None else self.qty
         self.estado = 'ABIERTA'
         self.pnl_cierre = Decimal('0')
+        self.precio_desconocido = False  # F12.8 — B22 (flag RAM, no se persiste)
 
     def to_dict(self) -> dict:
         return {
@@ -1596,6 +1634,14 @@ class GridExecutor:
                     orderId=pos.orden_cierre_id
                 ))
                 print(f"  [EXECUTOR] {state.symbol} TP {pos.orden_cierre_id} cancelado")
+            except BinanceAPIException as e:
+                # F12.7 — I-S3-2: -2011 = la orden ya no existe (p.ej. cancel_all
+                # previo del kill switch). El estado deseado ya se cumplió.
+                if e.code == -2011:
+                    print(f"  [EXECUTOR] {state.symbol} TP {pos.orden_cierre_id} "
+                          f"ya no existe (cancelado antes)")
+                else:
+                    print(f"  ⚠️ [EXECUTOR] Error cancelando TP {pos.orden_cierre_id}: {e}")
             except Exception as e:
                 print(f"  ⚠️ [EXECUTOR] Error cancelando TP {pos.orden_cierre_id}: {e}")
             finally:
@@ -2031,63 +2077,93 @@ class GridExecutor:
         
         return acciones
 
-    def _cerrar_posicion_por_id(self, state: GridExecutionState, pos_id: str,
-                                precio_cierre: float, fee_cierre: float = 0.0,
-                                binance_order_id: str = None,
-                                razon: str = 'DESCONOCIDA') -> bool:
+    async def _cerrar_posicion_por_id(self, state: GridExecutionState, pos_id: str,
+                                      precio_cierre: float, fee_cierre: float = 0.0,
+                                      binance_order_id: str = None,
+                                      razon: str = 'DESCONOCIDA') -> bool:
         """
         FASE 2.4: El executor cierra una posición por ID usando precio real.
         Reemplaza a GridSimulator.close_position_by_id().
+
+        F12.7 (B6): cancela el TP vivo en exchange ANTES de cerrar; antes solo
+        se borraba de RAM y el TP podía llenarse después (posición fantasma).
+        F12.8 (B22): con precio_cierre<=0 NO se calcula PnL (evita la pérdida
+        fantasma (0-entrada)*qty); se marca CERRADA con precio_desconocido=True.
         """
         if not state.grid_state:
             return False
-        
+
         gs = state.grid_state
-        
+
         for pos in gs.posiciones:
             if pos.id == pos_id and pos.estado in ('ABIERTA', 'PENDIENTE_CIERRE'):
-                # Calcular PnL
-                if pos.tipo == 'LONG':
-                    pnl = (precio_cierre - float(pos.precio_ejecucion)) * float(pos.qty)
+                # F12.7 — B6: cancelar el TP ANTES de tocar estado/PnL
+                await self._cancelar_tp_si_existe(state, pos)
+
+                precio_valido = False
+                try:
+                    precio_valido = float(precio_cierre) > 0
+                except (TypeError, ValueError):
+                    precio_valido = False
+
+                if precio_valido:
+                    if pos.tipo == 'LONG':
+                        pnl = (precio_cierre - float(pos.precio_ejecucion)) * float(pos.qty)
+                    else:
+                        pnl = (float(pos.precio_ejecucion) - precio_cierre) * float(pos.qty)
+                    pos.pnl_cierre = Decimal(str(pnl))
                 else:
-                    pnl = (float(pos.precio_ejecucion) - precio_cierre) * float(pos.qty)
-                
+                    # F12.8 — B22: PnL NO computado (precio desconocido)
+                    pnl = None
+                    pos.pnl_cierre = Decimal('0')
+                    pos.precio_desconocido = True
+
                 pos.estado = 'CERRADA'
-                pos.pnl_cierre = Decimal(str(pnl))
                 pos.orden_cierre_id = binance_order_id
-                
-                gs.pnl_bruto += Decimal(str(pnl))
+
+                if pnl is not None:
+                    gs.pnl_bruto += Decimal(str(pnl))
                 # F12.5 (plan v7): NO registrar fee aquí. El caller que procesó
                 # los trades reales (kill-switch → _procesar_trade_con_pnl) ya
                 # lo hizo en el funnel único. Registrarlo de nuevo duplicaba el
                 # conteo (B1). fee_cierre se conserva solo como dato de log.
                 gs.pnl_neto = gs.pnl_bruto - gs.fees_totales
                 gs.trades_kill_switch += 1
-                
+
                 # Actualizar posicion_neta del executor
                 if pos.tipo == 'LONG':
                     state.posicion_neta -= pos.qty
                 else:
                     state.posicion_neta += pos.qty
-                
-                # Limpiar de órdenes pendientes
+
+                # Limpiar de órdenes pendientes (ya cancelado arriba si existía)
                 if pos.id in gs.ordenes_tp_pendientes:
                     del gs.ordenes_tp_pendientes[pos.id]
-                
-                print(f"  [EXECUTOR] {state.symbol} Pos {pos_id} cerrada real "
-                      f"@ ${precio_cierre:.4f} | PnL:{pnl:+.4f} | "
-                      f"Fee cierre: ${fee_cierre:.4f}")
+
+                if pnl is not None:
+                    print(f"  [EXECUTOR] {state.symbol} Pos {pos_id} cerrada real "
+                          f"@ ${precio_cierre:.4f} | PnL:{pnl:+.4f} | "
+                          f"Fee cierre: ${fee_cierre:.4f}")
+                else:
+                    print(f"  ⚠️ [EXECUTOR] {state.symbol} Pos {pos_id} cerrada SIN "
+                          f"precio de cierre (precio_desconocido) | PnL no computado")
+
                 # LEARNING ENGINE Fase 7/8: persistir salida con razón
                 # (sync + RAM-only; el flush lo hace el loop de background)
                 if self.learning_engine is not None:
                     try:
-                        self.learning_engine.registrar_salida(
-                            posicion_id=pos_id, precio_salida=float(precio_cierre),
-                            razon=razon)
+                        if pnl is not None:
+                            self.learning_engine.registrar_salida(
+                                posicion_id=pos_id, precio_salida=float(precio_cierre),
+                                razon=razon)
+                        else:
+                            # F12.8 — B22/I-S3-3: no fabricar un exit label con
+                            # precio 0 (daría pnl=-100%); se descarta la trayectoria.
+                            self.learning_engine.descartar_trayectoria(pos_id)
                     except Exception as e_learn:
                         print(f"  ⚠️ [LEARN] registrar_salida {pos_id}: {e_learn}")
                 return True
-        
+
         print(f"  [EXECUTOR] {state.symbol} Pos {pos_id} no encontrada para cierre")
         return False
 
@@ -2928,6 +3004,46 @@ class GridExecutor:
     # CR16 FASE 2: POLLING PROACTIVO DE FILLS REALES
     # ═══════════════════════════════════════════════════════════════════════════════
 
+    _MAX_TRADES_POR_POLL = 10000   # F12.14: cota defensiva anti-bucle
+
+    async def _traer_trades_paginado(self, symbol: str,
+                                     start_time: int = None) -> List[dict]:
+        """F12.14 (plan v7) — B8: pagina futures_account_trades hasta cubrir
+        todo el rango. Antes, limit=100 plano perdía fills en picos (>100
+        trades entre polls).
+
+        Primera página: startTime (o sin filtro). Siguientes: fromId =
+        max(id de la página)+1 — exacto incluso con timestamps repetidos
+        (startTime+1 podría saltarse trades del mismo ms).
+        """
+        todos: List[dict] = []
+        desde_id = None
+        while True:
+            kwargs = {'symbol': symbol, 'limit': 1000}
+            if desde_id is not None:
+                kwargs['fromId'] = desde_id
+            elif start_time:
+                kwargs['startTime'] = int(start_time)
+            lote = await self._api_call(asyncio.to_thread(
+                self.client.futures_account_trades, **kwargs))
+            if not lote:
+                break
+            todos.extend(lote)
+            if len(lote) < 1000:
+                break
+            ultimo_id = max(int(t.get('id', 0) or 0) for t in lote)
+            nuevo_desde = ultimo_id + 1
+            if desde_id is not None and nuevo_desde <= desde_id:
+                print(f"  ⚠️ [CR16] {symbol} Paginación sin avance "
+                      f"(fromId={desde_id}), corte")
+                break
+            desde_id = nuevo_desde
+            if len(todos) >= self._MAX_TRADES_POR_POLL:
+                print(f"  ⚠️ [CR16] {symbol} Corte de paginación en "
+                      f"{len(todos)} trades (cota defensiva)")
+                break
+        return todos
+
     async def _poll_fills_proactivo(self, symbol: str, state: GridExecutionState) -> List[dict]:
         """
         Consulta PROACTIVAMENTE futures_account_trades() para descubrir fills
@@ -2964,27 +3080,15 @@ class GridExecutor:
             if ultimo_ts > 0:
                 # +1ms para no repetir; nunca por debajo del nacimiento del grid
                 start_time = max(ultimo_ts + 1, grid_inicio_ms)
-                trades = await self._api_call(asyncio.to_thread(
-                    self.client.futures_account_trades,
-                    symbol=symbol,
-                    startTime=start_time,
-                    limit=100
-                ))
+                trades = await self._traer_trades_paginado(
+                    symbol, start_time=start_time)
             elif grid_inicio_ms > 0:
                 # P2-A: sin watermark previo → arrancar desde el nacimiento del grid,
                 # no desde el historial completo de la cuenta
-                trades = await self._api_call(asyncio.to_thread(
-                    self.client.futures_account_trades,
-                    symbol=symbol,
-                    startTime=grid_inicio_ms,
-                    limit=100
-                ))
+                trades = await self._traer_trades_paginado(
+                    symbol, start_time=grid_inicio_ms)
             else:
-                trades = await self._api_call(asyncio.to_thread(
-                    self.client.futures_account_trades,
-                    symbol=symbol,
-                    limit=100
-                ))
+                trades = await self._traer_trades_paginado(symbol)
         except Exception as e:
             print(f"  ⚠️ [CR16] {symbol} Error consultando trades: {e}")
             return []
@@ -3050,8 +3154,8 @@ class GridExecutor:
                                 client_order_id=sync_coid,
                                 symbol=symbol,
                                 side=order_info['side'],
-                                tipo_orden='ENTRY',
-                                price=float(order_info.get('price', 0)),
+                                tipo_orden=_tipo_orden_desde_cid(sync_coid),
+                                price=_precio_orden_binance(order_info),
                                 quantity=float(order_info.get('origQty', 0))
                             )
                             # FIX FASE 2: Agregar al set para que fills parciales de la misma orden no re-intenten
@@ -3615,8 +3719,8 @@ class GridExecutor:
                             client_order_id=sync_coid,
                             symbol=symbol,
                             side=o['side'],
-                            tipo_orden='ENTRY',
-                            price=float(o.get('price', 0)),
+                            tipo_orden=_tipo_orden_desde_cid(sync_coid),
+                            price=_precio_orden_binance(o),
                             quantity=float(o.get('origQty', 0))
                         )
                         # FIX FASE 4: Registrar en el dict para no re-sincronizar en este ciclo
@@ -3726,7 +3830,7 @@ class GridExecutor:
                             self.learning_engine.log_exit_shadow(_pos.id, _pol, symbol=symbol)
                             continue
                         if _pol['accion'] == 'CERRAR_AHORA':
-                            _ok = self._cerrar_posicion_por_id(
+                            _ok = await self._cerrar_posicion_por_id(
                                 state, _pos.id, float(_px), razon='TREND_END')
                             if _ok:
                                 print(f"  🧠 [LEARN-EXIT] {symbol} {_pos.id} CERRADO "
@@ -4854,7 +4958,7 @@ class GridExecutor:
                 if qty_binance < 0.0001:
                     print(f"  ✅ [CIERRE] Kill Switch: posición ya es 0 en Binance, skip cierre")
                     if state.grid_state:
-                        self._cerrar_posicion_por_id(
+                        await self._cerrar_posicion_por_id(
                             state=state, pos_id=pos_id,
                             precio_cierre=0, fee_cierre=0, binance_order_id=None
                         )
@@ -4932,7 +5036,7 @@ class GridExecutor:
                     total_realized_pnl = sum(float(t.get('realizedPnl', 0)) for t in trades)
 
                     # FASE 3: Cerrar posición en el estado propio del executor
-                    self._cerrar_posicion_por_id(
+                    await self._cerrar_posicion_por_id(
                         state=state,
                         pos_id=pos_id,
                         precio_cierre=avg_price,
