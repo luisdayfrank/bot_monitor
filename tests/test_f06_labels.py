@@ -107,14 +107,15 @@ def test_breakout_labeler():
             'atr_pct_15m': 1.0, 'regime_confirmado': 'TREND_DOWN'}
 
     def v(off, hi, lo):
-        return {'timestamp': TS + off, 'high': hi, 'low': lo}
+        return {'timestamp': TS + off, 'high': hi, 'low': lo,
+                'close': (hi + lo) / 2.0}
 
     velas = [v(900000, 99.4, 99.0), v(1800000, 99.3, 98.0),
              v(2700000, 99.4, 97.0), v(3600000, 99.2, 97.5)]
     fila = lb.etiquetar(snap, velas, 99.0, 'SHORT')
     assert fila is not None
     assert fila['continuacion'] == 1 and fila['fakeout'] == 0
-    assert fila['minutos_continuacion'] == 30
+    assert fila['minutos_continuacion'] == 45
     velas_f = [v(900000, 100.0, 98.0), v(1800000, 99.0, 97.0),
                v(2700000, 99.0, 97.0), v(3600000, 99.0, 97.0)]
     fila_f = lb.etiquetar(snap, velas_f, 99.0, 'SHORT')

@@ -53,7 +53,8 @@ def _test_continuacion_neta():
             'symbol': 'TESTUSDT', 'regime_confirmado': 'TREND_UP',
             'donchian_high_20': 99.9, 'donchian_low_20': 98.0}
     # MFE bruto 0.55% -> supera 1.0*0.5=0.5 (viejo) pero NO 0.5+0.1=0.6 (nuevo)
-    velas = [{'timestamp': ts + i * 900_000, 'high': 100.55, 'low': 99.90}
+    velas = [{'timestamp': ts + i * 900_000, 'high': 100.55, 'low': 99.90,
+              'close': 100.22}
              for i in range(1, 5)]
     fila = lab.etiquetar(snap, velas, nivel_roto=100.0, direction='LONG')
     assert fila is not None
